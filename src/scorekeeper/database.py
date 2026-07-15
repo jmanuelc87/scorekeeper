@@ -12,6 +12,7 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     Uuid,
     create_engine,
 )
@@ -21,6 +22,7 @@ from sqlalchemy.orm import (
     Mapped,
     mapped_column,
     relationship,
+    sessionmaker,
 )
 
 from scorekeeper.config import get_settings
@@ -29,6 +31,7 @@ from scorekeeper.config import get_settings
 JsonColumn = JSON().with_variant(JSONB, "postgresql")
 
 engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
 
 
 def _now() -> datetime:
@@ -163,6 +166,25 @@ class MetricScore(Base):
     rubric_version: Mapped[str | None] = mapped_column(String(64), default=None)
 
     turn: Mapped[Turn] = relationship(back_populates="metric_scores")
+
+
+class ScenarioMetric(Base):
+    """Which metric applies to which scenario ``use_case``.
+
+    The metric taxonomy lives in code (see ``scorekeeper.metrics``); this table is
+    the queryable projection of each metric's decorator-declared scenarios,
+    materialized by ``scorekeeper.metrics.selection.sync_selection``. The scoring
+    runner reads it to pick the metric subset for a scenario. ``metric_name`` is a
+    plain string validated against the code registry (no FK, since there is no
+    metric-definitions table). ``use_case == "default"`` is the fallback set.
+    """
+
+    __tablename__ = "scenario_metrics"
+    __table_args__ = (UniqueConstraint("use_case", "metric_name", name="uq_scenario_metric"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    use_case: Mapped[str] = mapped_column(String(128), index=True)
+    metric_name: Mapped[str] = mapped_column(String(128))
 
 
 def create_schema() -> None:

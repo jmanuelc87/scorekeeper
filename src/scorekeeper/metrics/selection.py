@@ -1,0 +1,85 @@
+"""Per-scenario metric selection, stored in the database.
+
+The taxonomy lives in code: each metric declares the scenarios it applies to via
+the ``@register`` decorator. ``sync_selection`` *queries those registered classes
+at runtime* and materializes the ``use_case → metric`` mapping into the
+``scenario_metrics`` table, which the scoring runner then reads. Keeping the
+mapping in the DB makes selection queryable and editable alongside results, while
+the decorator on each class stays the authoring source of truth.
+"""
+
+from __future__ import annotations
+
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
+
+from scorekeeper.database import ScenarioMetric
+from scorekeeper.metrics import catalog as _catalog  # noqa: F401  (populate registry)
+from scorekeeper.metrics.base import Metric
+from scorekeeper.metrics.registry import MetricRegistry
+
+# Reserved use_case that applies when a scenario has no explicit metric rows.
+DEFAULT_USE_CASE = "default"
+
+
+def declared_selection() -> set[tuple[str, str]]:
+    """Derive the desired ``(use_case, metric_name)`` pairs from the registry.
+
+    A metric with no declared scenarios belongs to the ``default`` set.
+    """
+    pairs: set[tuple[str, str]] = set()
+    for metric_cls in MetricRegistry.all():
+        use_cases = metric_cls.scenarios or (DEFAULT_USE_CASE,)
+        for use_case in use_cases:
+            pairs.add((use_case, metric_cls.name))
+    return pairs
+
+
+def sync_selection(session: Session) -> None:
+    """Reconcile ``scenario_metrics`` with the metrics' declared scenarios.
+
+    Idempotent: inserts missing rows and removes rows no longer declared, so the
+    table always reflects the current code taxonomy. Caller commits.
+    """
+    desired = declared_selection()
+    existing = {
+        (row.use_case, row.metric_name)
+        for row in session.execute(select(ScenarioMetric)).scalars()
+    }
+
+    for use_case, metric_name in desired - existing:
+        session.add(ScenarioMetric(use_case=use_case, metric_name=metric_name))
+
+    for use_case, metric_name in existing - desired:
+        session.execute(
+            delete(ScenarioMetric).where(
+                ScenarioMetric.use_case == use_case,
+                ScenarioMetric.metric_name == metric_name,
+            )
+        )
+
+
+def metrics_for(session: Session, use_case: str) -> list[str]:
+    """Metric names selected for ``use_case``, falling back to the default set."""
+    names = _query_names(session, use_case)
+    if not names:
+        names = _query_names(session, DEFAULT_USE_CASE)
+    return names
+
+
+def resolve(session: Session, use_case: str) -> list[Metric]:
+    """Instantiate the metrics selected for ``use_case``.
+
+    Raises ``KeyError`` (Spanish message) if a stored ``metric_name`` is not in
+    the code registry.
+    """
+    return [MetricRegistry.create(name) for name in metrics_for(session, use_case)]
+
+
+def _query_names(session: Session, use_case: str) -> list[str]:
+    stmt = (
+        select(ScenarioMetric.metric_name)
+        .where(ScenarioMetric.use_case == use_case)
+        .order_by(ScenarioMetric.metric_name)
+    )
+    return list(session.execute(stmt).scalars())
