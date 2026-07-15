@@ -16,10 +16,11 @@ class _Score:
 
 
 def test_turn_score_is_weighted_mean_of_normalized(registered_metrics) -> None:
-    # correccion: Likert score 4 -> norm 0.75, weight 2.0
-    # utilidad:   Likert score 5 -> norm 1.0,  weight 1.0
-    scores = [_Score("correccion", 4), _Score("utilidad", 5)]
-    expected = (0.75 * 2.0 + 1.0 * 1.0) / (2.0 + 1.0)
+    # Both catalog metrics use the Unit scale (identity normalization) with weight 1.0.
+    # fidelidad_ragas:    score 0.5 -> norm 0.5, weight 1.0
+    # fidelidad_deepeval: score 1.0 -> norm 1.0, weight 1.0
+    scores = [_Score("fidelidad_ragas", 0.5), _Score("fidelidad_deepeval", 1.0)]
+    expected = (0.5 * 1.0 + 1.0 * 1.0) / (1.0 + 1.0)
     assert turn_score(scores) == pytest.approx(expected)
 
 

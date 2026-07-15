@@ -93,7 +93,7 @@ the rest.
 @register(scenarios=["soporte_tecnico", "ventas"])
 class Correccion(SingleRubricMetric):
     name = "correccion"
-    category = MetricCategory.CALIDAD
+    category = MetricCategory.RAG
     scale = Likert()          # 1-5
     weight = 2.0
     rubric = RUBRICA_CORRECCION   # Spanish prompt template
@@ -110,7 +110,7 @@ and flatten them into the single Spanish `justification` with
 @register(scenarios=["soporte_tecnico"])
 class SeguridadFactual(MultiStepMetric):
     name = "seguridad_factual"
-    category = MetricCategory.SEGURIDAD
+    category = MetricCategory.RAG
     scale = Unit()            # 0-1
     weight = 3.0
 
@@ -155,8 +155,8 @@ at rollup, so the stored value stays interpretable in the rubric's own terms.
 ### Categories
 
 `MetricCategory` (`scorekeeper.metrics.category`) is a data-only `StrEnum`
-(`CALIDAD`, `COMUNICACION`, `SEGURIDAD`) used for grouping and dashboards. Add
-categories here as needed; they carry no behavior.
+used for grouping and dashboards. It currently defines a single value, `RAG`;
+add categories here as needed — they carry no behavior.
 
 ### The Judge seam
 
@@ -271,7 +271,7 @@ Devuelve la puntuación y una justificación breve en español.
 @register(scenarios=["soporte_tecnico"])
 class Claridad(SingleRubricMetric):
     name = "claridad"
-    category = MetricCategory.COMUNICACION
+    category = MetricCategory.RAG
     scale = Likert()
     weight = 1.0
     rubric = RUBRICA_CLARIDAD
