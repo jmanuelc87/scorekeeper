@@ -9,7 +9,8 @@ LLM-free**: metrics run against a plain projection of a turn and call the judge
 through a swappable seam, so the whole package is unit-testable without a
 database or a live model. The concrete metrics themselves are project-specific,
 so the `catalog/` package ships **empty** — you add metrics there (see
-[Adding a metric](#adding-a-metric)).
+[Adding a metric](#adding-a-metric)). The concrete metrics that have been added
+are documented in the [Metrics catalog](metrics-catalog.md).
 
 ## The big picture
 
