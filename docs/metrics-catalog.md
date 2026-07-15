@@ -11,7 +11,7 @@ All rubrics, prompts and justifications are in Spanish.
 
 | Metric (`name`) | Category | Scale | Weight | Higher means | Applies to |
 | --- | --- | --- | --- | --- | --- |
-| [`hallucination`](#hallucination) | `seguridad` | `Unit()` 0–1 | 1.0 | more hallucination (worse) | `document_retrieval` |
+| [`hallucination`](#hallucination) | `seguridad` | `Unit()` 0–1 | 1.0 | more hallucination (worse) | `document_retrieval`, `web_search` |
 
 ## `hallucination`
 
@@ -71,12 +71,12 @@ the Spanish wording to taste; the metric's mechanics do not depend on it.
 
 ### Scenarios
 
-Registered for the `document_retrieval` use case, since hallucination is a
-RAG-specific concern. To target additional use cases, add them to the decorator
-and re-sync:
+Registered for the `document_retrieval` and `web_search` use cases, since
+hallucination is a grounding concern wherever an answer cites retrieved sources.
+To target additional use cases, add them to the decorator and re-sync:
 
 ```python
-@register(scenarios=["document_retrieval", ...])
+@register(scenarios=["document_retrieval", "web_search", ...])
 class Hallucination(MultiStepMetric): ...
 ```
 
