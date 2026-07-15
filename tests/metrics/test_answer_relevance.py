@@ -1,4 +1,4 @@
-"""RelevanciaRespuesta: reverse-generate questions, embed, average cosine.
+"""AnswerRelevance: reverse-generate questions, embed, average cosine.
 
 Tested with no LLM and no DB: the StubJudge scripts the generated questions and a
 text->vector embedding table. The metric is imported directly from the catalog so
@@ -10,17 +10,17 @@ from __future__ import annotations
 import pytest
 
 from scorekeeper.metrics.base import TurnView
-from scorekeeper.metrics.catalog.relevancia_respuesta import (
-    RelevanciaRespuesta,
+from scorekeeper.metrics.catalog.answer_relevance import (
+    AnswerRelevance,
     cosine_similarity,
 )
 
 
-def _questions(*preguntas: str):
-    """Scripted PreguntaGenerada extractions for the stub judge."""
-    from scorekeeper.metrics.catalog.relevancia_respuesta import PreguntaGenerada
+def _questions(*questions: str):
+    """Scripted GeneratedQuestion extractions for the stub judge."""
+    from scorekeeper.metrics.catalog.answer_relevance import GeneratedQuestion
 
-    return [PreguntaGenerada(pregunta=p) for p in preguntas]
+    return [GeneratedQuestion(question=q) for q in questions]
 
 
 def test_cosine_similarity_basic() -> None:
@@ -43,12 +43,12 @@ def test_perfect_relevance_when_questions_match_original(make_judge) -> None:
         },
         model="claude-x",
     )
-    metric = RelevanciaRespuesta()
+    metric = AnswerRelevance()
     metric.n_questions = 2  # instance override keeps the test small
 
     result = metric.evaluate(turn, judge)
 
-    assert result.metric_name == "relevancia_respuesta"
+    assert result.metric_name == "answer_relevance"
     assert result.raw_score == pytest.approx(1.0)
     assert result.normalized_score == pytest.approx(1.0)  # Unit scale: identity
     assert result.judge_model == "claude-x"
@@ -71,7 +71,7 @@ def test_partial_relevance_is_averaged(make_judge) -> None:
             "ortogonal": [0.0, 1.0],  # cosine 0.0 with q
         },
     )
-    metric = RelevanciaRespuesta()
+    metric = AnswerRelevance()
     metric.n_questions = 2
 
     result = metric.evaluate(turn, judge)
@@ -88,7 +88,7 @@ def test_negative_cosine_is_clamped_to_zero(make_judge) -> None:
         extractions=_questions("opuesta"),
         embeddings={"q": [1.0, 0.0], "opuesta": [-1.0, 0.0]},  # cosine -1.0
     )
-    metric = RelevanciaRespuesta()
+    metric = AnswerRelevance()
     metric.n_questions = 1
 
     result = metric.evaluate(turn, judge)
@@ -101,7 +101,7 @@ def test_no_questions_generated_is_safe(make_judge) -> None:
     turn = TurnView(prompt="q", response="respuesta")
     # The model returns only blank questions, which are filtered out.
     judge = make_judge(extractions=_questions("", "   "))
-    metric = RelevanciaRespuesta()
+    metric = AnswerRelevance()
     metric.n_questions = 2
 
     result = metric.evaluate(turn, judge)
@@ -127,7 +127,7 @@ def test_generation_step_does_not_leak_original_question(make_judge) -> None:
         return original_structured(instruction=instruction, turn=turn, schema=schema)
 
     judge.structured = _spy
-    metric = RelevanciaRespuesta()
+    metric = AnswerRelevance()
     metric.n_questions = 1
     metric.evaluate(turn, judge)
 
