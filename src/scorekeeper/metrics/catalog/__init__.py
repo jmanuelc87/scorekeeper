@@ -7,3 +7,5 @@ package registers every metric::
 
     from scorekeeper.metrics.catalog import correccion, utilidad  # noqa: F401
 """
+
+from scorekeeper.metrics.catalog import relevancia_respuesta  # noqa: F401

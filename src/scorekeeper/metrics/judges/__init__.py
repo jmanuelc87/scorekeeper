@@ -35,11 +35,22 @@ def make_judge(settings: Settings | None = None) -> Judge:
             raise ValueError(
                 "Falta ANTHROPIC_API_KEY para el juez de Anthropic."
             )
+        # Anthropic has no embeddings endpoint: attach an OpenAI-backed embedder
+        # when a key is available so similarity metrics still work; otherwise leave
+        # it unset (embed() will raise only if a metric actually needs it).
+        embedder = None
+        if settings.openai_api_key:
+            embedder = OpenAIJudge(
+                model=settings.openai_judge_model,
+                api_key=settings.openai_api_key,
+                embedding_model=settings.openai_embedding_model,
+            )
         return AnthropicJudge(
             model=settings.anthropic_judge_model,
             api_key=settings.anthropic_api_key,
             max_tokens=settings.judge_max_tokens,
             system_prompt=settings.judge_system_prompt,
+            embedder=embedder,
         )
 
     if provider == "openai":
@@ -49,6 +60,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
             model=settings.openai_judge_model,
             api_key=settings.openai_api_key,
             system_prompt=settings.judge_system_prompt,
+            embedding_model=settings.openai_embedding_model,
         )
 
     raise ValueError(

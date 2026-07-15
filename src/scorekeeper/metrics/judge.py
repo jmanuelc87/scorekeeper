@@ -46,3 +46,12 @@ class Judge(Protocol):
     def structured(self, *, instruction: str, turn: TurnView, schema: type[T]) -> T:
         """Run a non-scoring step (extraction/classification) returning ``schema``."""
         ...
+
+    def embed(self, *, texts: list[str]) -> list[list[float]]:
+        """Embed each text, returning one vector per input in the same order.
+
+        Used by similarity-based metrics (e.g. answer relevance). Kept on the same
+        seam so metrics stay SDK-free; a judge whose provider offers no embedding
+        endpoint may delegate to a configured backend or raise.
+        """
+        ...

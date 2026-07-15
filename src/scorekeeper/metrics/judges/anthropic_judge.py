@@ -46,10 +46,14 @@ class AnthropicJudge:
         client: Any | None = None,
         max_tokens: int = 8192,
         system_prompt: str | None = None,
+        embedder: Any | None = None,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
+        # Anthropic offers no embeddings endpoint; embedding metrics delegate to
+        # this backend (any object with an ``embed()`` method, e.g. an OpenAIJudge).
+        self._embedder = embedder
         if client is None:
             import anthropic  # lazy: only needed when building a real client
 
@@ -91,3 +95,18 @@ class AnthropicJudge:
             output_format=schema,
         )
         return message.parsed_output
+
+    def embed(self, *, texts: list[str]) -> list[list[float]]:
+        """Embed ``texts`` via the configured embeddings backend.
+
+        Anthropic exposes no embeddings endpoint, so this delegates to the
+        ``embedder`` injected at construction (e.g. an ``OpenAIJudge``). Raises a
+        Spanish error when no backend is configured.
+        """
+        if self._embedder is None:
+            raise NotImplementedError(
+                "Anthropic no ofrece un endpoint de embeddings. Configura un "
+                "proveedor de embeddings (p. ej. OPENAI_API_KEY) para las métricas "
+                "que los requieran, como la relevancia de la respuesta."
+            )
+        return self._embedder.embed(texts=texts)

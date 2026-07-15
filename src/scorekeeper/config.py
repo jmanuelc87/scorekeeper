@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     anthropic_judge_model: str = "claude-opus-4-8"
     openai_judge_model: str = "gpt-5.6-sol"
     judge_max_tokens: int = 16384
+    # Embeddings for similarity-based metrics (e.g. answer relevance). Anthropic
+    # offers no embedding endpoint, so embeddings always run through OpenAI; when
+    # the judge provider is Anthropic, an OpenAI-backed embedder is attached iff
+    # openai_api_key is set (see scorekeeper.metrics.judges.make_judge).
+    openai_embedding_model: str = "text-embedding-3-small"
     # Override the judge system prompt at runtime; None uses the built-in default.
     judge_system_prompt: str | None = None
 
