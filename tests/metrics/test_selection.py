@@ -1,4 +1,9 @@
-"""DB-backed per-scenario selection, synced from the decorator-declared classes."""
+"""DB-backed per-scenario selection, synced from the decorator-declared classes.
+
+The catalog metrics (``faithfulness_ragas``/``faithfulness_deepeval``) declare no
+scenarios, so they belong to the reserved ``"default"`` set and every scenario
+resolves to them via the fallback.
+"""
 
 from __future__ import annotations
 
@@ -14,17 +19,15 @@ from scorekeeper.metrics.selection import (
     sync_selection,
 )
 
+DEFAULT_METRICS = {"faithfulness_ragas", "faithfulness_deepeval"}
+
 
 def test_sync_materializes_declared_scenarios(db_session: Session, registered_metrics) -> None:
     sync_selection(db_session)
     db_session.commit()
 
-    assert set(metrics_for(db_session, "soporte_tecnico")) == {
-        "correccion",
-        "utilidad",
-        "seguridad_factual",
-    }
-    assert set(metrics_for(db_session, "ventas")) == {"correccion", "utilidad", "tono"}
+    # Both metrics declare no scenarios → they land in the "default" set.
+    assert set(metrics_for(db_session, "default")) == DEFAULT_METRICS
 
 
 def test_sync_is_idempotent(db_session: Session, registered_metrics) -> None:
@@ -40,29 +43,29 @@ def test_sync_is_idempotent(db_session: Session, registered_metrics) -> None:
 
 
 def test_sync_removes_stale_rows(db_session: Session, registered_metrics) -> None:
-    db_session.add(ScenarioMetric(use_case="ventas", metric_name="metrica_retirada"))
+    db_session.add(ScenarioMetric(use_case="default", metric_name="metrica_retirada"))
     db_session.commit()
 
     sync_selection(db_session)
     db_session.commit()
 
-    assert "metrica_retirada" not in metrics_for(db_session, "ventas")
+    assert "metrica_retirada" not in metrics_for(db_session, "default")
 
 
 def test_unknown_use_case_falls_back_to_default(db_session: Session, registered_metrics) -> None:
     sync_selection(db_session)
     db_session.commit()
-    # No catalog metric targets "default", so the fallback is empty.
-    assert metrics_for(db_session, "escenario_inexistente") == []
+    # A scenario with no rows of its own falls back to the "default" set.
+    assert set(metrics_for(db_session, "escenario_inexistente")) == DEFAULT_METRICS
 
 
 def test_resolve_returns_metric_instances(db_session: Session, registered_metrics) -> None:
     sync_selection(db_session)
     db_session.commit()
 
-    metrics = resolve(db_session, "ventas")
+    metrics = resolve(db_session, "default")
     assert all(isinstance(m, Metric) for m in metrics)
-    assert {m.name for m in metrics} == {"correccion", "utilidad", "tono"}
+    assert {m.name for m in metrics} == DEFAULT_METRICS
 
 
 def test_resolve_raises_on_unknown_stored_metric(db_session: Session, registered_metrics) -> None:

@@ -8,6 +8,5 @@ from enum import StrEnum
 class MetricCategory(StrEnum):
     """Groups metrics for aggregation/filtering. Carries no behavior."""
 
-    CALIDAD = "calidad"
-    COMUNICACION = "comunicacion"
+    RAG = "rag"
     SEGURIDAD = "seguridad"
