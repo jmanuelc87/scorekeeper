@@ -43,3 +43,20 @@ class Boolean(Scale):
 
     def normalize(self, raw: float) -> float:
         return 1.0 if raw >= 0.5 else 0.0
+
+
+class Inverted(Scale):
+    """Flips a scale's polarity for lower-is-better metrics.
+
+    Rollup averages normalized scores as higher-is-better, but some metrics store
+    a raw score where *higher is worse* (e.g. a hallucination rate). Wrapping the
+    metric's natural scale here keeps the raw score in its intuitive direction
+    while mapping it to a higher-is-better value at normalization, so it composes
+    correctly with the other metrics.
+    """
+
+    def __init__(self, inner: Scale) -> None:
+        self.inner = inner
+
+    def normalize(self, raw: float) -> float:
+        return 1.0 - self.inner.normalize(raw)
