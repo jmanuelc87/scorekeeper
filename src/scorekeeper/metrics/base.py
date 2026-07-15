@@ -34,6 +34,8 @@ class TurnView(BaseModel):
     turn_number: int = 1
     # Prior (prompt, response) exchanges, for metrics that need conversation context.
     history: list[tuple[str, str]] = []
+    # Retrieved context a RAG answer was grounded on, for groundedness-style metrics.
+    retrieved_context: str = ""
 
 
 class StepTrace(BaseModel):

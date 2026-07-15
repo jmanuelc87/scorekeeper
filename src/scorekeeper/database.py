@@ -140,6 +140,9 @@ class Turn(Base):
     turn_number: Mapped[int] = mapped_column(Integer)
     prompt: Mapped[str] = mapped_column(Text)
     response: Mapped[str] = mapped_column(Text)
+    # Retrieved context a RAG answer was grounded on, for groundedness-style
+    # metrics. Free-form text blob; None = not applicable to this turn.
+    retrieved_context: Mapped[str | None] = mapped_column(Text, default=None)
     response_time_ms: Mapped[int | None] = mapped_column(Integer, default=None)
     turn_score: Mapped[float | None] = mapped_column(Float, default=None)
 
