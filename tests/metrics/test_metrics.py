@@ -12,7 +12,7 @@ from scorekeeper.metrics.base import Metric, SingleRubricMetric, TurnView
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry, register
-from scorekeeper.metrics.scale import Boolean, Likert, Unit
+from scorekeeper.metrics.scale import Boolean, Inverted, Likert, Unit
 
 
 class _EjemploLikert(SingleRubricMetric):
@@ -47,6 +47,11 @@ def test_normalization_boundaries() -> None:
     assert Boolean().normalize(1) == 1.0
     assert Boolean().normalize(0) == 0.0
     assert Boolean().normalize(0.4) == 0.0
+    # Inverted flips polarity: higher raw (worse) → lower normalized.
+    assert Inverted(Unit()).normalize(0.0) == 1.0
+    assert Inverted(Unit()).normalize(1.0) == 0.0
+    assert Inverted(Likert()).normalize(1) == 1.0
+    assert Inverted(Likert()).normalize(5) == 0.0
 
 
 def test_registry_lookup_and_errors(registered_metrics) -> None:

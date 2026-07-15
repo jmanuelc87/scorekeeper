@@ -18,6 +18,7 @@ from scorekeeper.metrics.catalog.faithfulness import (
     FaithfulnessDeepeval,
     FaithfulnessRagas,
 )
+from scorekeeper.metrics.catalog.hallucination import Hallucination
 from scorekeeper.metrics.judge import JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry
 
@@ -44,7 +45,7 @@ class StubJudge:
 
 
 # The concrete catalog metrics under test.
-CATALOG_METRICS = [FaithfulnessRagas, FaithfulnessDeepeval]
+CATALOG_METRICS = [FaithfulnessRagas, FaithfulnessDeepeval, Hallucination]
 
 
 # --- Fixtures -----------------------------------------------------------------

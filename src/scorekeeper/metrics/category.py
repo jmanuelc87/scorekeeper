@@ -9,3 +9,4 @@ class MetricCategory(StrEnum):
     """Groups metrics for aggregation/filtering. Carries no behavior."""
 
     RAG = "rag"
+    SEGURIDAD = "seguridad"
