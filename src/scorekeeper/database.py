@@ -1,50 +1,169 @@
-from datetime import datetime
+from __future__ import annotations
 
-from sqlalchemy import DateTime, Integer, String, create_engine, select
-from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+import uuid
+from datetime import datetime, timezone
+from typing import Any
+
+from sqlalchemy import (
+    JSON,
+    DateTime,
+    Float,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    Uuid,
+    create_engine,
+)
+from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    mapped_column,
+    relationship,
+)
 
 from scorekeeper.config import get_settings
+
+# JSONB on PostgreSQL, plain JSON on the SQLite fallback.
+JsonColumn = JSON().with_variant(JSONB, "postgresql")
+
+engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+
+
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class Base(DeclarativeBase):
     pass
 
 
-class Score(Base):
-    __tablename__ = "scores"
+class SourceFile(Base):
+    """An imported .xlsx file of interactions — the source of one or more runs."""
 
-    id: Mapped[int] = mapped_column(primary_key=True)
-    player: Mapped[str] = mapped_column(String(100), index=True)
-    points: Mapped[int] = mapped_column(Integer)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=datetime.now)
+    __tablename__ = "source_files"
 
-    def as_dict(self) -> dict[str, int | str]:
-        return {
-            "id": self.id,
-            "player": self.player,
-            "points": self.points,
-            "created_at": self.created_at.isoformat(),
-        }
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    filename: Mapped[str] = mapped_column(String(512))
+    file_hash: Mapped[str] = mapped_column(String(128), index=True)
+    imported_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # Sheet names, row counts, column mapping, etc. — whatever the importer records.
+    sheet_metadata: Mapped[dict[str, Any] | None] = mapped_column(JsonColumn, default=None)
+
+    runs: Mapped[list[BenchmarkRun]] = relationship(back_populates="source_file")
 
 
-engine = create_engine(get_settings().database_url, pool_pre_ping=True)
+class BenchmarkRun(Base):
+    """A single benchmark invocation across one or more platforms."""
+
+    __tablename__ = "benchmark_runs"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    source_file_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("source_files.id", ondelete="SET NULL"), index=True, default=None
+    )
+
+    source_file: Mapped[SourceFile | None] = relationship(back_populates="runs")
+    platform_executions: Mapped[list[PlatformExecution]] = relationship(
+        back_populates="run",
+        cascade="all, delete-orphan",
+        order_by="PlatformExecution.started_at",
+    )
+
+
+class PlatformExecution(Base):
+    """Results for one platform (Copilot, Gemini, Claude) within a run."""
+
+    __tablename__ = "platform_executions"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("benchmark_runs.id", ondelete="CASCADE"), index=True
+    )
+    platform: Mapped[str] = mapped_column(String(64))
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    average_score: Mapped[float | None] = mapped_column(Float, default=None)
+
+    run: Mapped[BenchmarkRun] = relationship(back_populates="platform_executions")
+    scenario_results: Mapped[list[ScenarioResult]] = relationship(
+        back_populates="platform_execution",
+        cascade="all, delete-orphan",
+    )
+
+
+class ScenarioResult(Base):
+    """A single conversation (use case) loaded from the source file and scored."""
+
+    __tablename__ = "scenario_results"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    platform_execution_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("platform_executions.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(String(128))
+    use_case: Mapped[str] = mapped_column(String(128))
+    # Reference into the source file: sheet name, conversation key, or row range.
+    source_ref: Mapped[str | None] = mapped_column(String(256), default=None)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+    screenshot_path: Mapped[str | None] = mapped_column(String(512), default=None)
+    average_score: Mapped[float | None] = mapped_column(Float, default=None)
+    # Parsed rows for this conversation from the source file; Turn rows are the
+    # evaluation projection derived from it.
+    raw_conversation: Mapped[dict[str, Any] | None] = mapped_column(JsonColumn, default=None)
+
+    platform_execution: Mapped[PlatformExecution] = relationship(
+        back_populates="scenario_results"
+    )
+    turns: Mapped[list[Turn]] = relationship(
+        back_populates="scenario_result",
+        cascade="all, delete-orphan",
+        order_by="Turn.turn_number",
+    )
+
+
+class Turn(Base):
+    """One user/model exchange in a conversation, evaluated on its own."""
+
+    __tablename__ = "turns"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    scenario_result_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("scenario_results.id", ondelete="CASCADE"), index=True
+    )
+    turn_number: Mapped[int] = mapped_column(Integer)
+    prompt: Mapped[str] = mapped_column(Text)
+    response: Mapped[str] = mapped_column(Text)
+    response_time_ms: Mapped[int | None] = mapped_column(Integer, default=None)
+    turn_score: Mapped[float | None] = mapped_column(Float, default=None)
+
+    scenario_result: Mapped[ScenarioResult] = relationship(back_populates="turns")
+    metric_scores: Mapped[list[MetricScore]] = relationship(
+        back_populates="turn",
+        cascade="all, delete-orphan",
+    )
+
+
+class MetricScore(Base):
+    """An LLM-as-a-judge score for a single metric on a single turn."""
+
+    __tablename__ = "metric_scores"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    turn_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("turns.id", ondelete="CASCADE"), index=True
+    )
+    metric_name: Mapped[str] = mapped_column(String(128))
+    score: Mapped[float] = mapped_column(Float)
+    justification: Mapped[str | None] = mapped_column(Text, default=None)
+    judge_model: Mapped[str | None] = mapped_column(String(128), default=None)
+    rubric_version: Mapped[str | None] = mapped_column(String(64), default=None)
+
+    turn: Mapped[Turn] = relationship(back_populates="metric_scores")
 
 
 def create_schema() -> None:
     Base.metadata.create_all(engine)
-
-
-def add_score(player: str, points: int) -> dict[str, int | str]:
-    with Session(engine) as session:
-        score = Score(player=player, points=points)
-        session.add(score)
-        session.commit()
-        session.refresh(score)
-        return score.as_dict()
-
-
-def get_scores(limit: int = 50) -> list[dict[str, int | str]]:
-    with Session(engine) as session:
-        query = select(Score).order_by(Score.created_at.desc()).limit(limit)
-        return [score.as_dict() for score in session.scalars(query)]
-

@@ -15,14 +15,22 @@ services:
     volumes:
       - postgres_data:/var/lib/postgresql/data
 
-  mcp:
+  migrate:
     build: .
+    command: ["alembic", "upgrade", "head"]
     environment: &backend-environment
       DATABASE_URL: postgresql+psycopg://scorekeeper:scorekeeper@database:5432/scorekeeper
       MCP_TRANSPORT: http
     depends_on:
       database:
         condition: service_healthy
+
+  mcp:
+    build: .
+    environment: *backend-environment
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8000:8000"
 
@@ -31,8 +39,8 @@ services:
     command: ["scorekeeper-api"]
     environment: *backend-environment
     depends_on:
-      database:
-        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
     ports:
       - "8001:8001"
 
