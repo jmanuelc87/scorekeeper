@@ -12,6 +12,16 @@ class Settings(BaseSettings):
     api_port: int = 8001
     cors_origins: str = "http://localhost:5173,http://localhost:8080"
 
+    # LLM-as-a-judge configuration (see scorekeeper.metrics.judges).
+    judge_provider: str = "anthropic"  # "anthropic" | "openai"
+    anthropic_api_key: str | None = None
+    openai_api_key: str | None = None
+    anthropic_judge_model: str = "claude-opus-4-8"
+    openai_judge_model: str = "gpt-5.6-sol"
+    judge_max_tokens: int = 16384
+    # Override the judge system prompt at runtime; None uses the built-in default.
+    judge_system_prompt: str | None = None
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
