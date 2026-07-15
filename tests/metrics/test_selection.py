@@ -1,6 +1,6 @@
 """DB-backed per-scenario selection, synced from the decorator-declared classes.
 
-The catalog metrics (``fidelidad_ragas``/``fidelidad_deepeval``) declare no
+The catalog metrics (``faithfulness_ragas``/``faithfulness_deepeval``) declare no
 scenarios, so they belong to the reserved ``"default"`` set and every scenario
 resolves to them via the fallback.
 """
@@ -19,7 +19,7 @@ from scorekeeper.metrics.selection import (
     sync_selection,
 )
 
-DEFAULT_METRICS = {"fidelidad_ragas", "fidelidad_deepeval"}
+DEFAULT_METRICS = {"faithfulness_ragas", "faithfulness_deepeval"}
 
 
 def test_sync_materializes_declared_scenarios(db_session: Session, registered_metrics) -> None:

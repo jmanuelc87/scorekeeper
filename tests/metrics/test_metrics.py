@@ -1,7 +1,7 @@
 """Metric-class behavior: single-rubric, normalization, registry.
 
 ``MultiStepMetric`` orchestration/trace behavior is covered against the real
-catalog metrics in ``test_fidelidad.py``.
+catalog metrics in ``test_faithfulness.py``.
 """
 
 from __future__ import annotations
@@ -50,24 +50,24 @@ def test_normalization_boundaries() -> None:
 
 
 def test_registry_lookup_and_errors(registered_metrics) -> None:
-    assert isinstance(MetricRegistry.create("fidelidad_ragas"), Metric)
+    assert isinstance(MetricRegistry.create("faithfulness_ragas"), Metric)
 
     with pytest.raises(KeyError, match="Métrica desconocida"):
         MetricRegistry.get("no_existe")
 
-    class Duplicada(SingleRubricMetric):
-        name = "fidelidad_ragas"  # already taken
+    class DuplicateMetric(SingleRubricMetric):
+        name = "faithfulness_ragas"  # already taken
 
     with pytest.raises(ValueError, match="Métrica duplicada"):
-        register(Duplicada)
+        register(DuplicateMetric)
 
 
 def test_decorator_declares_scenarios(registered_metrics) -> None:
     @register(scenarios=["soporte_tecnico", "ventas"])
-    class Nueva(SingleRubricMetric):
-        name = "nueva_metrica"
+    class NewMetric(SingleRubricMetric):
+        name = "new_metric"
         scale = Likert()
         rubric = "..."
 
-    assert Nueva.scenarios == ("soporte_tecnico", "ventas")
-    assert MetricRegistry.get("nueva_metrica") is Nueva
+    assert NewMetric.scenarios == ("soporte_tecnico", "ventas")
+    assert MetricRegistry.get("new_metric") is NewMetric

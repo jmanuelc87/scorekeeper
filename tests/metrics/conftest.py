@@ -14,7 +14,10 @@ from sqlalchemy.orm import Session
 
 from scorekeeper.database import Base
 from scorekeeper.metrics.base import TurnView
-from scorekeeper.metrics.catalog.fidelidad import FidelidadDeepeval, FidelidadRagas
+from scorekeeper.metrics.catalog.faithfulness import (
+    FaithfulnessDeepeval,
+    FaithfulnessRagas,
+)
 from scorekeeper.metrics.judge import JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry
 
@@ -41,7 +44,7 @@ class StubJudge:
 
 
 # The concrete catalog metrics under test.
-CATALOG_METRICS = [FidelidadRagas, FidelidadDeepeval]
+CATALOG_METRICS = [FaithfulnessRagas, FaithfulnessDeepeval]
 
 
 # --- Fixtures -----------------------------------------------------------------

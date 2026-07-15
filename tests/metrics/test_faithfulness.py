@@ -8,11 +8,11 @@ instantiated directly rather than through the registry.
 from __future__ import annotations
 
 from scorekeeper.metrics.base import TurnView
-from scorekeeper.metrics.catalog.fidelidad import (
-    Afirmaciones,
-    FidelidadDeepeval,
-    FidelidadRagas,
-    Verdades,
+from scorekeeper.metrics.catalog.faithfulness import (
+    Claims,
+    FaithfulnessDeepeval,
+    FaithfulnessRagas,
+    Truths,
 )
 from scorekeeper.metrics.judge import JudgeVerdict
 
@@ -23,8 +23,8 @@ from scorekeeper.metrics.judge import JudgeVerdict
 def test_ragas_all_supported_is_one(turn: TurnView, make_judge) -> None:
     judge = make_judge(
         extractions=[
-            Afirmaciones(
-                afirmaciones=["El router se reinicia en 10s", "El LED parpadea"],
+            Claims(
+                claims=["El router se reinicia en 10s", "El LED parpadea"],
                 summary="Dos afirmaciones",
             )
         ],
@@ -33,9 +33,9 @@ def test_ragas_all_supported_is_one(turn: TurnView, make_judge) -> None:
             JudgeVerdict(score=1, justification="Se deduce", model="m"),
         ],
     )
-    result = FidelidadRagas().evaluate(turn, judge)
+    result = FaithfulnessRagas().evaluate(turn, judge)
 
-    assert result.metric_name == "fidelidad_ragas"
+    assert result.metric_name == "faithfulness_ragas"
     assert result.raw_score == 1.0
     assert result.normalized_score == 1.0
     assert result.judge_model == "m"
@@ -44,8 +44,8 @@ def test_ragas_all_supported_is_one(turn: TurnView, make_judge) -> None:
 def test_ragas_mixed_is_fraction_supported(turn: TurnView, make_judge) -> None:
     judge = make_judge(
         extractions=[
-            Afirmaciones(
-                afirmaciones=["Afirmación fundada", "Afirmación inventada"],
+            Claims(
+                claims=["Afirmación fundada", "Afirmación inventada"],
                 summary="Una fundada, una no",
             )
         ],
@@ -54,7 +54,7 @@ def test_ragas_mixed_is_fraction_supported(turn: TurnView, make_judge) -> None:
             JudgeVerdict(score=0, justification="No aparece en el contexto", model="m"),
         ],
     )
-    result = FidelidadRagas().evaluate(turn, judge)
+    result = FaithfulnessRagas().evaluate(turn, judge)
 
     # supported / n = 1 / 2
     assert result.raw_score == 0.5
@@ -69,9 +69,9 @@ def test_ragas_mixed_is_fraction_supported(turn: TurnView, make_judge) -> None:
 
 def test_ragas_no_statements_is_one(turn: TurnView, make_judge) -> None:
     judge = make_judge(
-        extractions=[Afirmaciones(afirmaciones=[], summary="Sin afirmaciones")]
+        extractions=[Claims(claims=[], summary="Sin afirmaciones")]
     )
-    result = FidelidadRagas().evaluate(turn, judge)
+    result = FaithfulnessRagas().evaluate(turn, judge)
 
     assert result.raw_score == 1.0  # nothing to verify
     assert result.judge_model is None
@@ -85,14 +85,14 @@ def test_ragas_no_statements_is_one(turn: TurnView, make_judge) -> None:
 def test_deepeval_no_contradiction_is_one(turn: TurnView, make_judge) -> None:
     judge = make_judge(
         extractions=[
-            Afirmaciones(afirmaciones=["Afirmación A"], summary="Una afirmación"),
-            Verdades(verdades=["Verdad 1", "Verdad 2"], summary="Dos verdades"),
+            Claims(claims=["Afirmación A"], summary="Una afirmación"),
+            Truths(truths=["Verdad 1", "Verdad 2"], summary="Dos verdades"),
         ],
         verdicts=[JudgeVerdict(score=1, justification="Concuerda", model="m")],
     )
-    result = FidelidadDeepeval().evaluate(turn, judge)
+    result = FaithfulnessDeepeval().evaluate(turn, judge)
 
-    assert result.metric_name == "fidelidad_deepeval"
+    assert result.metric_name == "faithfulness_deepeval"
     assert result.raw_score == 1.0
     # Claims extracted first, then truths, then one verdict per claim.
     assert [kind for kind, _ in judge.calls] == ["structured", "structured", "score"]
@@ -101,11 +101,11 @@ def test_deepeval_no_contradiction_is_one(turn: TurnView, make_judge) -> None:
 def test_deepeval_one_contradicted_lowers_score(turn: TurnView, make_judge) -> None:
     judge = make_judge(
         extractions=[
-            Afirmaciones(
-                afirmaciones=["Concuerda", "Contradice", "No mencionada"],
+            Claims(
+                claims=["Concuerda", "Contradice", "No mencionada"],
                 summary="Tres afirmaciones",
             ),
-            Verdades(verdades=["Verdad 1"], summary="Una verdad"),
+            Truths(truths=["Verdad 1"], summary="Una verdad"),
         ],
         verdicts=[
             JudgeVerdict(score=1, justification="Concuerda", model="m"),
@@ -114,9 +114,9 @@ def test_deepeval_one_contradicted_lowers_score(turn: TurnView, make_judge) -> N
             JudgeVerdict(score=1, justification="No se menciona", model="m"),
         ],
     )
-    result = FidelidadDeepeval().evaluate(turn, judge)
+    result = FaithfulnessDeepeval().evaluate(turn, judge)
 
-    # not_contradicted / n = 2 / 3 (yes and idk both pass; only the direct
+    # not_contradicted / n = 2 / 3 (agreement and idk both pass; only the direct
     # contradiction fails).
     assert result.raw_score == 2 / 3
     assert "### Veredicto: Contradice" in result.justification
@@ -125,9 +125,9 @@ def test_deepeval_one_contradicted_lowers_score(turn: TurnView, make_judge) -> N
 
 def test_deepeval_no_claims_skips_truths(turn: TurnView, make_judge) -> None:
     judge = make_judge(
-        extractions=[Afirmaciones(afirmaciones=[], summary="Sin afirmaciones")]
+        extractions=[Claims(claims=[], summary="Sin afirmaciones")]
     )
-    result = FidelidadDeepeval().evaluate(turn, judge)
+    result = FaithfulnessDeepeval().evaluate(turn, judge)
 
     assert result.raw_score == 1.0
     assert result.judge_model is None

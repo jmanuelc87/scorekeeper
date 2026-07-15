@@ -17,9 +17,9 @@ class _Score:
 
 def test_turn_score_is_weighted_mean_of_normalized(registered_metrics) -> None:
     # Both catalog metrics use the Unit scale (identity normalization) with weight 1.0.
-    # fidelidad_ragas:    score 0.5 -> norm 0.5, weight 1.0
-    # fidelidad_deepeval: score 1.0 -> norm 1.0, weight 1.0
-    scores = [_Score("fidelidad_ragas", 0.5), _Score("fidelidad_deepeval", 1.0)]
+    # faithfulness_ragas:    score 0.5 -> norm 0.5, weight 1.0
+    # faithfulness_deepeval: score 1.0 -> norm 1.0, weight 1.0
+    scores = [_Score("faithfulness_ragas", 0.5), _Score("faithfulness_deepeval", 1.0)]
     expected = (0.5 * 1.0 + 1.0 * 1.0) / (1.0 + 1.0)
     assert turn_score(scores) == pytest.approx(expected)
 
