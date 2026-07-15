@@ -14,8 +14,7 @@ generate and ``embed`` to vectorize), so it imports no SDK.
 
 from __future__ import annotations
 
-import math
-
+import numpy as np
 from pydantic import BaseModel
 
 from scorekeeper.metrics.base import MetricResult, MultiStepMetric, StepTrace, TurnView
@@ -44,12 +43,13 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     """Cosine similarity between two vectors; 0.0 if either is empty or zero."""
     if not a or not b:
         return 0.0
-    dot = sum(x * y for x, y in zip(a, b, strict=True))
-    norm_a = math.sqrt(sum(x * x for x in a))
-    norm_b = math.sqrt(sum(y * y for y in b))
+    va = np.asarray(a, dtype=float)
+    vb = np.asarray(b, dtype=float)
+    norm_a = np.linalg.norm(va)
+    norm_b = np.linalg.norm(vb)
     if norm_a == 0.0 or norm_b == 0.0:
         return 0.0
-    return dot / (norm_a * norm_b)
+    return float(np.dot(va, vb) / (norm_a * norm_b))
 
 
 @register
