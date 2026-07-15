@@ -1,0 +1,50 @@
+services:
+  database:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: scorekeeper
+      POSTGRES_USER: scorekeeper
+      POSTGRES_PASSWORD: scorekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U scorekeeper -d scorekeeper"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  mcp:
+    build: .
+    environment: &backend-environment
+      DATABASE_URL: postgresql+psycopg://scorekeeper:scorekeeper@database:5432/scorekeeper
+      MCP_TRANSPORT: http
+    depends_on:
+      database:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  api:
+    build: .
+    command: ["scorekeeper-api"]
+    environment: *backend-environment
+    depends_on:
+      database:
+        condition: service_healthy
+    ports:
+      - "8001:8001"
+
+  frontend:
+    build:
+      context: frontend
+      args:
+        VITE_API_URL: http://localhost:8001
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
+
+volumes:
+  postgres_data:
