@@ -9,9 +9,13 @@ many documents the answer contradicts.
 
     hallucination = contradicted / len(context_docs)   # 0 faithful … 1 fully hallucinated
 
-We store the hallucination rate as the raw score (higher = worse). When a turn
-has no retrieved context there is nothing to contradict, so the answer is treated
-as non-hallucinated (score ``0.0``) with no judge calls.
+We store the hallucination rate as the raw score (higher = worse). Rollup averages
+*normalized* scores as higher-is-better, so the metric uses an ``Inverted(Unit())``
+scale: the raw score keeps its intuitive direction while normalization maps it to
+the faithfulness complement (``1 - rate``), which composes correctly with the other
+metrics. When a turn has no retrieved context there is nothing to contradict, so
+the answer is treated as non-hallucinated (``raw_score`` ``0.0``, fully faithful)
+with no judge calls.
 
 The NLI judgment is a *classification* step, so it goes through the judge's
 ``structured()`` seam rather than ``score()``.
@@ -33,7 +37,7 @@ from scorekeeper.metrics.base import (
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.registry import register
-from scorekeeper.metrics.scale import Unit
+from scorekeeper.metrics.scale import Inverted, Unit
 
 
 class NLILabel(StrEnum):
@@ -91,7 +95,10 @@ class Hallucination(MultiStepMetric):
 
     name = "hallucination"
     category = MetricCategory.SEGURIDAD
-    scale = Unit()  # 0-1, higher = more hallucinated
+    # Raw score is the hallucination rate (0-1, higher = worse). Inverted() flips
+    # it to a higher-is-better faithfulness value at normalization so it rolls up
+    # correctly alongside the other metrics.
+    scale = Inverted(Unit())
     weight = 1.0
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:

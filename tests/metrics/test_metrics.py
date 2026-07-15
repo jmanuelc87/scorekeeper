@@ -7,7 +7,7 @@ import pytest
 from scorekeeper.metrics.base import Metric, SingleRubricMetric, TurnView
 from scorekeeper.metrics.judge import JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry, register
-from scorekeeper.metrics.scale import Boolean, Likert, Unit
+from scorekeeper.metrics.scale import Boolean, Inverted, Likert, Unit
 
 
 def test_single_rubric_maps_verdict_to_result(turn: TurnView, make_judge, registered_metrics) -> None:
@@ -32,6 +32,11 @@ def test_normalization_boundaries() -> None:
     assert Boolean().normalize(1) == 1.0
     assert Boolean().normalize(0) == 0.0
     assert Boolean().normalize(0.4) == 0.0
+    # Inverted flips polarity: higher raw (worse) → lower normalized.
+    assert Inverted(Unit()).normalize(0.0) == 1.0
+    assert Inverted(Unit()).normalize(1.0) == 0.0
+    assert Inverted(Likert()).normalize(1) == 1.0
+    assert Inverted(Likert()).normalize(5) == 0.0
 
 
 def test_multistep_orchestration_and_trace(

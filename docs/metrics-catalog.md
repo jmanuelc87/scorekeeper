@@ -11,7 +11,7 @@ All rubrics, prompts and justifications are in Spanish.
 
 | Metric (`name`) | Category | Scale | Weight | Higher means | Applies to |
 | --- | --- | --- | --- | --- | --- |
-| [`hallucination`](#hallucination) | `seguridad` | `Unit()` 0–1 | 1.0 | more hallucination (worse) | `document_retrieval`, `web_search` |
+| [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination (worse) | `document_retrieval`, `web_search` |
 
 ## `hallucination`
 
@@ -33,9 +33,12 @@ hallucination = contradicted / len(context_docs)
                 # 1 = fully hallucinated (every document contradicted)
 ```
 
-The raw score is the **hallucination rate** itself, on a `Unit()` (0–1) scale, so
-**higher is worse** — a hallucinating turn pulls the weighted turn-score down.
-The complementary *faithfulness* reading is simply `1 - hallucination`.
+The raw score is the **hallucination rate** itself (0–1), so **higher is worse**.
+Rollup, however, averages *normalized* scores as higher-is-better, so the metric
+uses an `Inverted(Unit())` scale: the raw score keeps its intuitive direction
+while normalization maps it to the **faithfulness** complement (`1 - rate`), which
+is higher-is-better and composes correctly with the other metrics. A hallucinating
+turn therefore pulls the weighted turn-score down, as intended.
 
 ### Inputs
 
@@ -89,10 +92,10 @@ selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
 - `judge_model` is `None` on the result: the `Judge.structured()` seam does not
   surface the model name (unlike `score()`), so there is no model to record
   without extending the protocol.
-- Because higher = worse, this metric contributes to the rollup in the opposite
-  direction from "higher is better" metrics like `correccion`/`utilidad`. That
-  mixed direction is deliberate; flip to the faithfulness framing (`1 - rate`) if
-  you want every metric to point the same way.
+- The raw score is higher-is-worse, but the `Inverted(Unit())` scale normalizes
+  it to the faithfulness complement, so at rollup it points the same way as the
+  "higher is better" metrics like `correccion`/`utilidad`. The stored `raw_score`
+  stays the hallucination rate; only the normalized value is flipped.
 
 ### Tests
 
