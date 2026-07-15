@@ -1,8 +1,8 @@
 """Shared test fixtures for the metric taxonomy — no live LLM, no real DB.
 
-The catalog ships empty (concrete metrics are project-specific), so these tests
-define their own demo metrics and register them into an isolated registry via the
-``registered_metrics`` fixture, which restores global state afterward.
+Tests exercise the taxonomy machinery (base classes, registry, selection,
+rollup) through the real catalog metrics. The ``registered_metrics`` fixture
+loads those into an isolated registry and restores global state afterward.
 """
 
 from __future__ import annotations
@@ -13,17 +13,14 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session
 
 from scorekeeper.database import Base
-from scorekeeper.metrics.base import (
-    MetricResult,
-    MultiStepMetric,
-    SingleRubricMetric,
-    StepTrace,
-    TurnView,
+from scorekeeper.metrics.base import TurnView
+from scorekeeper.metrics.catalog.faithfulness import (
+    FaithfulnessDeepeval,
+    FaithfulnessRagas,
 )
-from scorekeeper.metrics.category import MetricCategory
-from scorekeeper.metrics.judge import Judge, JudgeVerdict
+from scorekeeper.metrics.catalog.hallucination import Hallucination
+from scorekeeper.metrics.judge import JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry
-from scorekeeper.metrics.scale import Boolean, Likert, Unit
 
 
 class StubJudge:
@@ -57,76 +54,8 @@ class StubJudge:
         return [self._embeddings.get(text, [0.0, 0.0]) for text in texts]
 
 
-# --- Demo metrics (test-only; the real catalog is intentionally empty) --------
-
-
-class Claims(BaseModel):
-    afirmaciones: list[str] = []
-    summary: str = ""
-
-
-class DemoCorreccion(SingleRubricMetric):
-    name = "correccion"
-    category = MetricCategory.CALIDAD
-    scale = Likert()  # 1-5
-    weight = 2.0
-    scenarios = ("soporte_tecnico", "ventas")
-    rubric = "Evalúa la corrección (1-5): {prompt} {response}"
-
-
-class DemoUtilidad(SingleRubricMetric):
-    name = "utilidad"
-    category = MetricCategory.CALIDAD
-    scale = Likert()
-    weight = 1.0
-    scenarios = ("soporte_tecnico", "ventas")
-    rubric = "Evalúa la utilidad (1-5): {prompt} {response}"
-
-
-class DemoTono(SingleRubricMetric):
-    name = "tono"
-    category = MetricCategory.COMUNICACION
-    scale = Likert()
-    weight = 1.0
-    scenarios = ("ventas",)
-    rubric = "Evalúa el tono (1-5): {prompt} {response}"
-
-
-class DemoSeguridad(MultiStepMetric):
-    name = "seguridad_factual"
-    category = MetricCategory.SEGURIDAD
-    scale = Unit()  # 0-1
-    weight = 3.0
-    scenarios = ("soporte_tecnico",)
-
-    def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
-        trace: list[StepTrace] = []
-        extraction = judge.structured(instruction="extrae", turn=turn, schema=Claims)
-        trace.append(StepTrace(label="Extracción de afirmaciones", detail=extraction.summary))
-        verdicts = [
-            judge.score(
-                rubric=f"verifica: {afirmacion}",
-                turn=turn,
-                scale=Boolean(),
-                rubric_version=self.rubric_version,
-            )
-            for afirmacion in extraction.afirmaciones
-        ]
-        for afirmacion, verdict in zip(extraction.afirmaciones, verdicts, strict=True):
-            trace.append(StepTrace(label=f"Verificación: {afirmacion}", detail=verdict.justification))
-        raw = sum(v.score for v in verdicts) / len(verdicts) if verdicts else 1.0
-        return MetricResult(
-            metric_name=self.name,
-            raw_score=raw,
-            normalized_score=self.normalize(raw),
-            justification=self.render_justification(trace),
-            judge_model=verdicts[0].model if verdicts else None,
-            rubric_version=self.rubric_version,
-            trace=trace,
-        )
-
-
-DEMO_METRICS = [DemoCorreccion, DemoUtilidad, DemoTono, DemoSeguridad]
+# The concrete catalog metrics under test.
+CATALOG_METRICS = [FaithfulnessRagas, FaithfulnessDeepeval, Hallucination]
 
 
 # --- Fixtures -----------------------------------------------------------------
@@ -134,10 +63,10 @@ DEMO_METRICS = [DemoCorreccion, DemoUtilidad, DemoTono, DemoSeguridad]
 
 @pytest.fixture
 def registered_metrics():
-    """Register the demo metrics into an isolated registry, then restore."""
+    """Register the catalog metrics into an isolated registry, then restore."""
     saved = MetricRegistry.all()
     MetricRegistry.clear()
-    for metric_cls in DEMO_METRICS:
+    for metric_cls in CATALOG_METRICS:
         MetricRegistry.add(metric_cls)
     try:
         yield
@@ -160,16 +89,6 @@ def make_judge():
         return StubJudge(
             verdicts=verdicts, extractions=extractions, embeddings=embeddings, model=model
         )
-
-    return _make
-
-
-@pytest.fixture
-def make_extraction():
-    """Factory for a Claims extraction result used by the multi-step demo metric."""
-
-    def _make(afirmaciones: list[str], summary: str = "resumen") -> Claims:
-        return Claims(afirmaciones=list(afirmaciones), summary=summary)
 
     return _make
 

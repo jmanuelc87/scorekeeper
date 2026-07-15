@@ -27,7 +27,7 @@ from scorekeeper.metrics.scale import Boolean, Likert, Unit
 
 
 class Claims(BaseModel):
-    afirmaciones: list[str] = []
+    claims: list[str] = []
     summary: str = ""
 
 
@@ -200,13 +200,13 @@ def test_openai_custom_system_prompt(turn: TurnView) -> None:
 
 
 def test_anthropic_structured_returns_schema(turn: TurnView) -> None:
-    extraction = Claims(afirmaciones=["a", "b"], summary="resumen")
+    extraction = Claims(claims=["a", "b"], summary="resumen")
     client = FakeAnthropicClient(extraction)
     judge = AnthropicJudge(model="claude-test", client=client)
 
     result = judge.structured(instruction="extrae afirmaciones", turn=turn, schema=Claims)
     assert isinstance(result, Claims)
-    assert result.afirmaciones == ["a", "b"]
+    assert result.claims == ["a", "b"]
     assert client.messages.calls[0]["output_format"] is Claims
 
 
@@ -225,12 +225,12 @@ def test_openai_score_returns_verdict_and_clamps(turn: TurnView) -> None:
 
 
 def test_openai_structured_returns_schema(turn: TurnView) -> None:
-    client = FakeOpenAIClient(Claims(afirmaciones=["x"], summary="s"))
+    client = FakeOpenAIClient(Claims(claims=["x"], summary="s"))
     judge = OpenAIJudge(model="gpt-test", client=client)
 
     result = judge.structured(instruction="extrae", turn=turn, schema=Claims)
     assert isinstance(result, Claims)
-    assert result.afirmaciones == ["x"]
+    assert result.claims == ["x"]
 
 
 def test_openai_embed_returns_vectors_in_order() -> None:

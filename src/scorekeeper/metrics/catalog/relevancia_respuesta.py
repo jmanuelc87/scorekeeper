@@ -52,10 +52,10 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return dot / (norm_a * norm_b)
 
 
-@register(scenarios=["soporte_tecnico", "ventas"])
+@register
 class RelevanciaRespuesta(MultiStepMetric):
     name = "relevancia_respuesta"
-    category = MetricCategory.CALIDAD
+    category = MetricCategory.RAG
     scale = Unit()  # 0-1 (coseno medio, acotado a [0, 1])
     weight = 1.0
     # Número de preguntas a generar de forma inversa (paso 1 del algoritmo).
