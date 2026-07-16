@@ -76,6 +76,40 @@ def resolve(session: Session, use_case: str) -> list[Metric]:
     return [MetricRegistry.create(name) for name in metrics_for(session, use_case)]
 
 
+def parse_use_cases(raw: str) -> list[str]:
+    """Split a scenario's comma-separated ``use_case`` into clean, non-empty tokens."""
+    return [token.strip() for token in raw.split(",") if token.strip()]
+
+
+def metrics_for_scenario(session: Session, use_case: str) -> list[str]:
+    """Union of metric names across a scenario's comma-separated ``use_case`` tokens.
+
+    Each token is resolved independently (no per-token default); the results are
+    unioned, deduplicated, and kept in a deterministic order (token order, then
+    metric name). Falls back to the default set only when *no* token matched any
+    rows.
+    """
+    names: list[str] = []
+    seen: set[str] = set()
+    for token in parse_use_cases(use_case):
+        for name in _query_names(session, token):
+            if name not in seen:
+                seen.add(name)
+                names.append(name)
+    if not names:
+        names = _query_names(session, DEFAULT_USE_CASE)
+    return names
+
+
+def resolve_scenario(session: Session, use_case: str) -> list[Metric]:
+    """Instantiate the metrics for a comma-separated scenario ``use_case``.
+
+    Raises ``KeyError`` (Spanish message) if a stored ``metric_name`` is not in
+    the code registry.
+    """
+    return [MetricRegistry.create(name) for name in metrics_for_scenario(session, use_case)]
+
+
 def _query_names(session: Session, use_case: str) -> list[str]:
     stmt = (
         select(ScenarioMetric.metric_name)
