@@ -59,21 +59,63 @@ class NLIJudgment(BaseModel):
 # document); the hypothesis is the model's answer, which the judge also receives
 # as the turn's ``{response}``. Placeholder to be refined manually.
 NLI_PROMPT = """\
-Actúa como un clasificador de inferencia de lenguaje natural (NLI).
+Eres un juez estricto de inferencia de lenguaje natural (NLI). Se te
+proporciona una PREMISA y una HIPÓTESIS. Determina la relación lógica de la
+HIPÓTESIS con la PREMISA y devuelve exactamente una etiqueta.
+
+ETIQUETAS
+- "entailment":    Una persona que leyera únicamente la PREMISA concluiría
+                   que la HIPÓTESIS es definitivamente verdadera.
+- "contradiction": Una persona que leyera únicamente la PREMISA concluiría
+                   que la HIPÓTESIS es definitivamente falsa.
+- "neutral":       La HIPÓTESIS podría ser verdadera o falsa — la PREMISA no
+                   aporta información suficiente para decidir en ningún
+                   sentido.
+
+REGLAS DE JUICIO
+1. Juzga ÚNICAMENTE con base en la PREMISA. No uses conocimiento del mundo
+   externo, suposiciones ni hechos que no estén enunciados en la PREMISA.
+2. Trata la PREMISA como la descripción de una única escena/evento concreto.
+   Las dos oraciones pueden describir la misma escena.
+3. La falta de un detalle NO es contradicción. Si la HIPÓTESIS añade
+   información que la PREMISA ni confirma ni niega, la etiqueta es "neutral".
+4. Un conflicto directo en cualquier atributo, acción, cantidad o actor
+   enunciado (p. ej. color, ubicación, quién hace qué) es "contradiction".
+5. No te dejes influir por la fluidez ni la verosimilitud — solo por la
+   relación lógica.
+6. Sé decisivo. Elige la única etiqueta que mejor se ajuste.
+
+SALIDA
+Devuelve ÚNICAMENTE un objeto JSON, sin markdown, sin texto adicional:
+{
+  "label": "entailment" | "neutral" | "contradiction",
+  "reason": "<una oración que cite el detalle específico de la premisa que lo decidió>"
+}
+
+EJEMPLOS
+
+PREMISA: Un hombre de cabello rubio y camisa marrón está bebiendo de una
+fuente de agua pública.
+HIPÓTESIS: Una persona rubia está bebiendo agua en público.
+{"label": "entailment", "reason": "La premisa indica que un hombre rubio bebe de una fuente pública, lo cual la hipótesis reformula de manera más general."}
+
+PREMISA: Un hombre de cabello rubio y camisa marrón está bebiendo de una
+fuente de agua pública.
+HIPÓTESIS: El hombre lleva una camisa roja.
+{"label": "contradiction", "reason": "La premisa especifica una camisa marrón, lo cual entra en conflicto con la camisa roja de la hipótesis."}
+
+PREMISA: Un hombre de cabello rubio y camisa marrón está bebiendo de una
+fuente de agua pública.
+HIPÓTESIS: El hombre tiene sed después de una larga carrera.
+{"label": "neutral", "reason": "La premisa menciona que bebe, pero no dice nada sobre correr ni sobre la causa, por lo que no puede confirmarse ni negarse."}
+
+AHORA JUZGA
 
 PREMISA (documento de contexto recuperado):
 {documento}
 
 HIPÓTESIS (respuesta del asistente):
 {response}
-
-Clasifica la relación de la HIPÓTESIS respecto a la PREMISA en una de estas
-etiquetas:
-- "entailment": la premisa respalda o implica la hipótesis.
-- "neutral": la premisa no la respalda ni la contradice.
-- "contradiction": la premisa contradice la hipótesis.
-
-Devuelve la etiqueta y una justificación breve en español.
 """
 
 
