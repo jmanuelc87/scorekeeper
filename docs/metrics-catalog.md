@@ -11,7 +11,191 @@ All rubrics, prompts and justifications are in Spanish.
 
 | Metric (`name`) | Category | Scale | Weight | Higher means | Applies to |
 | --- | --- | --- | --- | --- | --- |
-| [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination (worse) | `document_retrieval`, `web_search` |
+| [`answer_relevance`](#answer_relevance) | `rag` | `Unit()` 0–1 | 1.0 | answer sticks closer to the question (better) | `default` |
+| [`faithfulness_ragas`](#faithfulness_ragas) | `rag` | `Unit()` 0–1 | 1.0 | more answer statements entailed by context (better) | `document_retrieval`, `web_search` |
+| [`faithfulness_deepeval`](#faithfulness_deepeval) | `rag` | `Unit()` 0–1 | 1.0 | fewer answer claims contradicted by context (better) | `document_retrieval`, `web_search` |
+| [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination — worse raw score, but `Inverted` normalizes it to higher-is-better faithfulness | `default` |
+
+Every metric here is a `MultiStepMetric` — it orchestrates several `Judge` calls
+and flattens their per-step `StepTrace`s into a single Spanish `justification`.
+None import an LLM SDK: they depend only on the `Judge` seam.
+
+`answer_relevance` and `hallucination` register with a bare `@register` (no
+`scenarios=`), so they belong to the reserved **`default`** selection — the set
+applied to any scenario that has no explicit metric rows of its own. Both
+`faithfulness_*` metrics declare `scenarios=["document_retrieval", "web_search"]`,
+since their statement/truth extraction only makes sense where the answer cites
+retrieved sources (see [Evaluation metrics → Per-scenario
+selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
+
+## `answer_relevance`
+
+**How directly the answer addresses the original question.**
+
+`AnswerRelevance` — `src/scorekeeper/metrics/catalog/answer_relevance.py`
+
+Follows the **reverse-question generation** method (RAGAS): if an answer is on
+topic, questions generated *from the answer alone* should look like the question
+that was actually asked. The metric generates `n` candidate questions from the
+answer, embeds them alongside the original question, and averages the cosine
+similarity between the original and each generated question. Higher means the
+answer stays closer to what was asked.
+
+```
+answer_relevance = mean( cosine(q_original, q_generated_i) for i in 1..n )
+                   # clamped to [0, 1]
+                   # 1 = the answer is squarely about the question
+                   # 0 = the answer is off topic (or no question could be generated)
+```
+
+The raw score is already in `[0, 1]`, so the scale is `Unit()` (raw ==
+normalized) and **higher is better**.
+
+### Inputs
+
+- **Original question:** `TurnView.prompt`.
+- **Answer:** `TurnView.response` — reverse-generation runs against the answer
+  *in isolation* (see below).
+
+### Scoring steps
+
+1. **Generate** `n_questions` (default **3**) candidate questions. Each call goes
+   through `judge.structured(..., schema=GeneratedQuestion)`. The answer is
+   wrapped in its own `TurnView(prompt="", response=turn.response)` so the judge
+   never sees the original question and cannot copy it — generation stays
+   unbiased. Blank generations are dropped.
+2. **Embed** the original question and all generated questions in a single
+   `judge.embed([turn.prompt, *questions])` call.
+3. **Average** the cosine similarity between the original question and each
+   generated question. Cosine lives in `[-1, 1]`; the mean is clamped to `[0, 1]`
+   for the `Unit` scale and rollup.
+
+`cosine_similarity()` returns `0.0` for empty or zero-norm vectors, so degenerate
+embeddings never raise.
+
+**No-question turns.** If every generation is blank there is nothing to compare,
+so the metric short-circuits to `raw_score = 0.0` (no relevance) with **no embed
+call**.
+
+### Notes
+
+- `n_questions` is a plain class attribute, so it can be overridden per instance
+  to trade cost for stability (more questions → steadier mean).
+- `judge_model` is read best-effort via `getattr(judge, "model", None)`.
+
+### Tests
+
+`tests/metrics/test_answer_relevance.py` — `cosine_similarity` (including
+degenerate inputs), the generate → embed → average happy path, and the
+no-question short-circuit. No database and no live LLM: a stub judge scripts the
+generated questions and a text→vector embedding table.
+
+## `faithfulness_ragas`
+
+**Fraction of the answer's statements that the context supports.**
+
+`FaithfulnessRagas` — `src/scorekeeper/metrics/catalog/faithfulness.py`
+
+The **RAGAS** groundedness algorithm: extract the discrete statements the answer
+makes, then verify each *against the context* by positive entailment. The score
+is the fraction of statements that can be inferred from the retrieved context.
+
+```
+faithfulness_ragas = supported / len(claims)
+                     # 1 = every statement is entailed by the context
+                     # 0 = none are
+```
+
+Raw score is already in `[0, 1]` (`Unit()`), **higher is better**.
+
+### Inputs
+
+- **Answer:** `TurnView.response` — the source of the extracted statements.
+- **Retrieved context:** consumed indirectly. The metric never touches
+  `retrieved_context`; the judge layer renders it into every prompt (via the
+  `{context}` placeholder and an appended "Contexto recuperado" section), so the
+  metric stays agnostic to context shape.
+
+### Scoring steps
+
+1. **Extract claims** from the answer via `judge.structured(EXTRACT_CLAIMS,
+   schema=Claims)`.
+2. If **no claims** were extracted, nothing can be unfaithful → short-circuit to
+   `raw_score = 1.0` with no verification calls.
+3. **Verify** each claim with `judge.score(VERIFY_RAGAS.format(claim=...),
+   scale=Boolean())`: `1` if the claim is entailed by the context, `0` if it is
+   not entailed or is contradicted.
+4. `raw_score = mean(verdicts)` — on the `Boolean` scale each verdict is `0`/`1`,
+   so the mean is exactly `supported / n`.
+
+### The prompts
+
+- `EXTRACT_CLAIMS` turns each sentence of the answer into verifiable, independent
+  statements (may reference `{prompt}`/`{response}`).
+- `VERIFY_RAGAS` asks whether a single `{claim}` can be inferred from the context.
+  It must **not** contain `{prompt}`/`{response}`/`{context}` — the judge appends
+  the full turn (including retrieved context) automatically.
+
+### Tests
+
+`tests/metrics/test_faithfulness.py` — the all-supported, partially-supported,
+and no-claims cases. No database and no live LLM: a `StubJudge` returns scripted
+extractions/verdicts and records call order.
+
+## `faithfulness_deepeval`
+
+**Fraction of the answer's claims the context does not contradict.**
+
+`FaithfulnessDeepeval` — `src/scorekeeper/metrics/catalog/faithfulness.py`
+
+The **DeepEval** groundedness algorithm. It differs from RAGAS in polarity: it
+extracts *truths from the context* and *claims from the answer*, then per claim
+asks whether the truths **contradict** it. The score is the fraction **not**
+contradicted, so an unverifiable claim (one the truths simply don't mention)
+*passes* — only a direct contradiction fails. This is more lenient than RAGAS,
+which requires positive entailment.
+
+```
+faithfulness_deepeval = not_contradicted / len(claims)
+                        # 1 = no claim is contradicted by the context
+                        # 0 = every claim is contradicted
+```
+
+Raw score is already in `[0, 1]` (`Unit()`), **higher is better**.
+
+### Inputs
+
+Same as `faithfulness_ragas`: `TurnView.response` for the claims, and
+`retrieved_context` consumed indirectly through the judge's `{context}`
+rendering.
+
+### Scoring steps
+
+1. **Extract claims** from the answer (`EXTRACT_CLAIMS` → `Claims`). Claims are
+   extracted *first* so the no-claims case short-circuits before paying for
+   truths extraction; the reference pseudocode runs the two extractions
+   concurrently, so leading with claims is equivalent.
+2. If **no claims**, short-circuit to `raw_score = 1.0`.
+3. **Extract truths** from the context (`GENERATE_TRUTHS` → `Truths`).
+4. **Verify** each claim against the joined truths with
+   `judge.score(VERIFY_DEEPEVAL.format(truths=..., claim=...), scale=Boolean())`:
+   `0` **only** if the truths directly contradict the claim, else `1` (agrees or
+   not mentioned).
+5. `raw_score = mean(verdicts) = not_contradicted / n`.
+
+### The prompts
+
+- `EXTRACT_CLAIMS` — shared with the RAGAS variant.
+- `GENERATE_TRUTHS` extracts atomic, verifiable facts from the retrieved context
+  (references `{context}`).
+- `VERIFY_DEEPEVAL` asks whether the `{truths}` contradict the `{claim}`; it too
+  must not contain the turn placeholders.
+
+### Tests
+
+`tests/metrics/test_faithfulness.py` — shared with the RAGAS metric; covers the
+contradiction, not-mentioned-passes, and no-claims cases with the scripted
+`StubJudge`.
 
 ## `hallucination`
 
@@ -68,18 +252,21 @@ with **no judge calls**.
 
 ### The NLI prompt
 
-`NLI_PROMPT` frames the judge as an NLI classifier. `{documento}` is the premise
-(one document); `{response}` is the hypothesis. It is a **placeholder** — refine
-the Spanish wording to taste; the metric's mechanics do not depend on it.
+`NLI_PROMPT` frames the judge as a strict NLI classifier. It spells out the three
+labels, six judging rules (judge only from the premise, a missing detail is not a
+contradiction, a direct conflict in any stated attribute is a contradiction, be
+decisive, …), a JSON output shape, and three worked examples. `{documento}` is the
+premise (one document); `{response}` is the hypothesis.
 
 ### Scenarios
 
-Registered for the `document_retrieval` and `web_search` use cases, since
-hallucination is a grounding concern wherever an answer cites retrieved sources.
-To target additional use cases, add them to the decorator and re-sync:
+Registered with a bare `@register` (no `scenarios=`), so it belongs to the
+reserved `default` set and applies to any scenario without explicit metric rows
+of its own. To restrict it to specific use cases instead, add them to the
+decorator and re-sync:
 
 ```python
-@register(scenarios=["document_retrieval", "web_search", ...])
+@register(scenarios=["document_retrieval", "web_search"])
 class Hallucination(MultiStepMetric): ...
 ```
 

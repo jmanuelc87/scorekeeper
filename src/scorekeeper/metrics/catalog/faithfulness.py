@@ -92,7 +92,7 @@ VERIFY_DEEPEVAL = (
 # --- Metrics ------------------------------------------------------------------
 
 
-@register
+@register(scenarios=["document_retrieval", "web_search"])
 class FaithfulnessRagas(MultiStepMetric):
     """RAGAS faithfulness: fraction of answer statements entailed by the context."""
 
@@ -153,7 +153,7 @@ class FaithfulnessRagas(MultiStepMetric):
         )
 
 
-@register
+@register(scenarios=["document_retrieval", "web_search"])
 class FaithfulnessDeepeval(MultiStepMetric):
     """DeepEval faithfulness: fraction of answer claims not contradicted by context."""
 
