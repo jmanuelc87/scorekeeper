@@ -108,7 +108,9 @@ class ScenarioResult(Base):
         ForeignKey("platform_executions.id", ondelete="CASCADE"), index=True
     )
     scenario_id: Mapped[str] = mapped_column(String(128))
-    use_case: Mapped[str] = mapped_column(String(128))
+    use_case: Mapped[str] = mapped_column(
+        String(128), default="default", server_default="default"
+    )
     # Reference into the source file: sheet name, conversation key, or row range.
     source_ref: Mapped[str | None] = mapped_column(String(256), default=None)
     status: Mapped[str] = mapped_column(String(32), default="pending")
