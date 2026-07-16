@@ -143,6 +143,9 @@ class Turn(Base):
     # Retrieved context a RAG answer was grounded on, for groundedness-style
     # metrics. Free-form text blob; None = not applicable to this turn.
     retrieved_context: Mapped[str | None] = mapped_column(Text, default=None)
+    # Ground-truth answer for the turn, for reference-based metrics (e.g. contextual
+    # precision). Free-form text; None = no reference available for this turn.
+    expected_output: Mapped[str | None] = mapped_column(Text, default=None)
     response_time_ms: Mapped[int | None] = mapped_column(Integer, default=None)
     turn_score: Mapped[float | None] = mapped_column(Float, default=None)
 

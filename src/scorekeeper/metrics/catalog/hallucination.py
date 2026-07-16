@@ -87,27 +87,27 @@ REGLAS DE JUICIO
 
 SALIDA
 Devuelve ÚNICAMENTE un objeto JSON, sin markdown, sin texto adicional:
-{
+{{
   "label": "entailment" | "neutral" | "contradiction",
   "reason": "<una oración que cite el detalle específico de la premisa que lo decidió>"
-}
+}}
 
 EJEMPLOS
 
 PREMISA: Un hombre de cabello rubio y camisa marrón está bebiendo de una
 fuente de agua pública.
 HIPÓTESIS: Una persona rubia está bebiendo agua en público.
-{"label": "entailment", "reason": "La premisa indica que un hombre rubio bebe de una fuente pública, lo cual la hipótesis reformula de manera más general."}
+{{"label": "entailment", "reason": "La premisa indica que un hombre rubio bebe de una fuente pública, lo cual la hipótesis reformula de manera más general."}}
 
 PREMISA: Un hombre de cabello rubio y camisa marrón está bebiendo de una
 fuente de agua pública.
 HIPÓTESIS: El hombre lleva una camisa roja.
-{"label": "contradiction", "reason": "La premisa especifica una camisa marrón, lo cual entra en conflicto con la camisa roja de la hipótesis."}
+{{"label": "contradiction", "reason": "La premisa especifica una camisa marrón, lo cual entra en conflicto con la camisa roja de la hipótesis."}}
 
 PREMISA: Un hombre de cabello rubio y camisa marrón está bebiendo de una
 fuente de agua pública.
 HIPÓTESIS: El hombre tiene sed después de una larga carrera.
-{"label": "neutral", "reason": "La premisa menciona que bebe, pero no dice nada sobre correr ni sobre la causa, por lo que no puede confirmarse ni negarse."}
+{{"label": "neutral", "reason": "La premisa menciona que bebe, pero no dice nada sobre correr ni sobre la causa, por lo que no puede confirmarse ni negarse."}}
 
 AHORA JUZGA
 
