@@ -135,6 +135,89 @@ def test_columns_override(tmp_path: Path) -> None:
     assert [m["content"] for m in result] == ["Hola", "Adiós"]
 
 
+def test_retrieved_context_column_is_parsed(tmp_path: Path) -> None:
+    path = _write_xlsx(
+        tmp_path / "with_context.xlsx",
+        ["turn", "role", "content", "contexto recuperado"],
+        [
+            [1, "user", "¿Política de devoluciones?", ""],
+            [1, "model", "30 días con recibo.", "Devoluciones en 30 días. Requiere recibo."],
+        ],
+    )
+
+    result = parse_conversation(path)
+
+    assert result == [
+        {"turn": 1, "role": "user", "content": "¿Política de devoluciones?", "retrieved_context": ""},
+        {
+            "turn": 1,
+            "role": "model",
+            "content": "30 días con recibo.",
+            "retrieved_context": "Devoluciones en 30 días. Requiere recibo.",
+        },
+    ]
+
+
+def test_retrieved_context_absent_omits_key(tmp_path: Path) -> None:
+    path = _write_xlsx(
+        tmp_path / "no_context.xlsx",
+        ["role", "content"],
+        [["user", "Hola"]],
+    )
+
+    result = parse_conversation(path)
+
+    assert "retrieved_context" not in result[0]
+
+
+def test_expected_output_column_is_parsed(tmp_path: Path) -> None:
+    path = _write_xlsx(
+        tmp_path / "with_expected.xlsx",
+        ["turn", "role", "content", "respuesta esperada"],
+        [
+            [1, "user", "¿Política de devoluciones?", ""],
+            [1, "model", "30 días.", "Se aceptan devoluciones dentro de 30 días con recibo."],
+        ],
+    )
+
+    result = parse_conversation(path)
+
+    assert result == [
+        {"turn": 1, "role": "user", "content": "¿Política de devoluciones?", "expected_output": ""},
+        {
+            "turn": 1,
+            "role": "model",
+            "content": "30 días.",
+            "expected_output": "Se aceptan devoluciones dentro de 30 días con recibo.",
+        },
+    ]
+
+
+def test_retrieved_context_and_expected_output_together(tmp_path: Path) -> None:
+    path = _write_xlsx(
+        tmp_path / "both.xlsx",
+        ["role", "content", "contexto recuperado", "expected output"],
+        [["model", "R", "ctx", "ref"]],
+    )
+
+    result = parse_conversation(path)
+
+    assert result[0]["retrieved_context"] == "ctx"
+    assert result[0]["expected_output"] == "ref"
+
+
+def test_expected_output_absent_omits_key(tmp_path: Path) -> None:
+    path = _write_xlsx(
+        tmp_path / "no_expected.xlsx",
+        ["role", "content"],
+        [["user", "Hola"]],
+    )
+
+    result = parse_conversation(path)
+
+    assert "expected_output" not in result[0]
+
+
 def test_missing_required_column_raises(tmp_path: Path) -> None:
     path = _write_xlsx(
         tmp_path / "bad.xlsx",

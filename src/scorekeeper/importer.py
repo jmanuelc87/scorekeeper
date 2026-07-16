@@ -3,8 +3,10 @@
 The source spreadsheet stores a conversation as **one message per row** (a user
 or model message with, optionally, a turn number). This module reads such a
 file with ``openpyxl`` and projects it into a JSON-serializable list of message
-dicts with the keys ``turn``, ``role`` and ``content`` — the raw conversation
-shape that ``ScenarioResult.raw_conversation`` is documented to hold. Turn rows
+dicts with the keys ``turn``, ``role`` and ``content`` (plus an optional
+``retrieved_context`` and/or ``expected_output`` when the sheet carries those
+columns) — the raw conversation shape that ``ScenarioResult.raw_conversation``
+is documented to hold. Turn rows
 for evaluation are derived from this projection in a later step; this module
 only parses.
 
@@ -34,6 +36,20 @@ _HEADER_ALIASES: dict[str, str] = {
     "contenido": "content",
     "mensaje": "content",
     "texto": "content",
+    "retrieved context": "retrieved_context",
+    "retrieved_context": "retrieved_context",
+    "retrieval context": "retrieved_context",
+    "retrieval_context": "retrieved_context",
+    "contexto recuperado": "retrieved_context",
+    "contexto": "retrieved_context",
+    "expected output": "expected_output",
+    "expected_output": "expected_output",
+    "expected": "expected_output",
+    "reference": "expected_output",
+    "respuesta esperada": "expected_output",
+    "salida esperada": "expected_output",
+    "referencia": "expected_output",
+    "esperado": "expected_output",
 }
 
 # Role value aliases (normalized) -> canonical role.
@@ -94,13 +110,17 @@ def parse_conversation(
     """Parse an ``.xlsx`` conversation file into raw message dicts.
 
     Returns a list of ``{"turn": int, "role": str, "content": str}`` in sheet
-    order. Roles are normalized to canonical values (``user``/``model``) when
-    recognized, otherwise passed through normalized. When the sheet has no turn
-    column, turn numbers are derived: each ``user`` message that follows a
-    non-user message starts a new turn, so a user+model pair shares one number.
+    order; each dict also carries ``retrieved_context`` and/or ``expected_output``
+    (strings) when the sheet has those columns. Roles are normalized to canonical
+    values
+    (``user``/``model``) when recognized, otherwise passed through normalized.
+    When the sheet has no turn column, turn numbers are derived: each ``user``
+    message that follows a non-user message starts a new turn, so a user+model
+    pair shares one number.
 
-    ``columns`` optionally maps a canonical field (``turn``/``role``/``content``)
-    to the exact header label in the sheet, overriding alias detection.
+    ``columns`` optionally maps a canonical field (``turn``/``role``/``content``/
+    ``retrieved_context``/``expected_output``) to the exact header label in the
+    sheet, overriding alias detection.
 
     Raises ``FileNotFoundError`` if ``path`` does not exist and ``ValueError``
     if the required ``role``/``content`` columns cannot be found.
@@ -122,6 +142,8 @@ def parse_conversation(
 
         col = _map_columns(header, columns)
         has_turn_col = "turn" in col
+        has_context_col = "retrieved_context" in col
+        has_expected_col = "expected_output" in col
 
         messages: list[dict[str, Any]] = []
         derived_turn = 0
@@ -145,7 +167,16 @@ def parse_conversation(
                     derived_turn = 1
                 turn = derived_turn
 
-            messages.append({"turn": turn, "role": role, "content": content})
+            message: dict[str, Any] = {"turn": turn, "role": role, "content": content}
+            if has_context_col:
+                message["retrieved_context"] = _cell(
+                    row, col["retrieved_context"]
+                ).strip()
+            if has_expected_col:
+                message["expected_output"] = _cell(
+                    row, col["expected_output"]
+                ).strip()
+            messages.append(message)
             prev_role = role
 
         return messages
