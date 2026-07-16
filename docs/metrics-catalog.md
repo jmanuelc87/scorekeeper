@@ -11,23 +11,25 @@ All rubrics, prompts and justifications are in Spanish.
 
 | Metric (`name`) | Category | Scale | Weight | Higher means | Applies to |
 | --- | --- | --- | --- | --- | --- |
-| [`answer_relevance`](#answer_relevance) | `rag` | `Unit()` 0–1 | 1.0 | answer sticks closer to the question (better) | `default` |
-| [`contextual_precision`](#contextual_precision) | `rag` | `Unit()` 0–1 | 1.0 | retriever ranks relevant nodes ahead of irrelevant ones (better) | `default` |
+| [`answer_relevance`](#answer_relevance) | `rag` | `Unit()` 0–1 | 1.0 | answer sticks closer to the question (better) | `answer_relevance` |
+| [`contextual_precision`](#contextual_precision) | `rag` | `Unit()` 0–1 | 1.0 | retriever ranks relevant nodes ahead of irrelevant ones (better) | `contextual_precision` |
 | [`faithfulness_ragas`](#faithfulness_ragas) | `rag` | `Unit()` 0–1 | 1.0 | more answer statements entailed by context (better) | `document_retrieval`, `web_search` |
 | [`faithfulness_deepeval`](#faithfulness_deepeval) | `rag` | `Unit()` 0–1 | 1.0 | fewer answer claims contradicted by context (better) | `document_retrieval`, `web_search` |
-| [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination — worse raw score, but `Inverted` normalizes it to higher-is-better faithfulness | `default` |
+| [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination — worse raw score, but `Inverted` normalizes it to higher-is-better faithfulness | `hallucination` |
 
 Every metric here is a `MultiStepMetric` — it orchestrates several `Judge` calls
 and flattens their per-step `StepTrace`s into a single Spanish `justification`.
 None import an LLM SDK: they depend only on the `Judge` seam.
 
-`answer_relevance`, `contextual_precision` and `hallucination` register with a
-bare `@register` (no `scenarios=`), so they belong to the reserved **`default`**
-selection — the set applied to any scenario that has no explicit metric rows of
-its own. Both `faithfulness_*` metrics declare
-`scenarios=["document_retrieval", "web_search"]`,
-since their statement/truth extraction only makes sense where the answer cites
-retrieved sources (see [Evaluation metrics → Per-scenario
+Every metric declares the `use_case`(s) it applies to via `@register(scenarios=…)`.
+`answer_relevance`, `contextual_precision`, and `hallucination` each apply to a use
+case named after themselves (`scenarios=["answer_relevance"]`,
+`["contextual_precision"]`, `["hallucination"]`), while both `faithfulness_*` metrics
+declare `scenarios=["document_retrieval", "web_search"]` since their statement/truth
+extraction only makes sense where the answer cites retrieved sources. None of these
+catalog metrics belong to the reserved **`default`** set, so a scenario is scored by a
+metric only when its comma-separated `use_case` names that metric's use case (see
+[Evaluation metrics → Per-scenario
 selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
 
 ## `answer_relevance`
@@ -78,6 +80,14 @@ embeddings never raise.
 **No-question turns.** If every generation is blank there is nothing to compare,
 so the metric short-circuits to `raw_score = 0.0` (no relevance) with **no embed
 call**.
+
+### Scenarios
+
+Registered with `@register(scenarios=["answer_relevance"])`, so it materializes under
+the `answer_relevance` use case (not the reserved `default` set). To change the use
+cases it applies to, edit the decorator and run `sync_selection(session)` once to
+re-materialize the mapping (see [Evaluation metrics → Per-scenario
+selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
 
 ### Notes
 
@@ -159,11 +169,10 @@ appended automatically by the judge.
 
 ### Scenarios
 
-Registered with a bare `@register` (no `scenarios=`), so it belongs to the
-reserved `default` set and applies to any scenario without explicit metric rows of
-its own. To restrict it to specific use cases, add them to the decorator and run
-`sync_selection(session)` once to re-materialize the mapping (see [Evaluation
-metrics → Per-scenario
+Registered with `@register(scenarios=["contextual_precision"])`, so it materializes
+under the `contextual_precision` use case (not the reserved `default` set). To change
+the use cases it applies to, edit the decorator and run `sync_selection(session)` once
+to re-materialize the mapping (see [Evaluation metrics → Per-scenario
 selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
 
 ### Notes
@@ -352,13 +361,12 @@ premise (one document); `{response}` is the hypothesis.
 
 ### Scenarios
 
-Registered with a bare `@register` (no `scenarios=`), so it belongs to the
-reserved `default` set and applies to any scenario without explicit metric rows
-of its own. To restrict it to specific use cases instead, add them to the
-decorator and re-sync:
+Registered with `@register(scenarios=["hallucination"])`, so it materializes under the
+`hallucination` use case rather than the reserved `default` set. To change the use
+cases it applies to, edit the decorator and re-sync:
 
 ```python
-@register(scenarios=["document_retrieval", "web_search"])
+@register(scenarios=["hallucination"])
 class Hallucination(MultiStepMetric): ...
 ```
 

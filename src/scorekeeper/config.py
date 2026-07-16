@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     api_port: int = 8001
     cors_origins: str = "http://localhost:5173,http://localhost:8080"
 
+    # Celery broker for the evaluation worker. Defaults to the app's own Postgres
+    # via kombu's SQLAlchemy transport (see the ``broker_url`` property); set
+    # CELERY_BROKER_URL to point at a dedicated broker (e.g. Redis) instead.
+    celery_broker_url: str | None = None
+
     # LLM-as-a-judge configuration (see scorekeeper.metrics.judges).
     judge_provider: str = "anthropic"  # "anthropic" | "openai"
     anthropic_api_key: str | None = None
@@ -27,11 +32,23 @@ class Settings(BaseSettings):
     # Override the judge system prompt at runtime; None uses the built-in default.
     judge_system_prompt: str | None = None
 
+    # Pace scoring by pausing a random interval (seconds) between consecutive turns
+    # of a scenario, to spread judge calls out over time. The pause is drawn
+    # uniformly from [turn_delay_min_seconds, turn_delay_max_seconds]; set both to 0
+    # to disable.
+    turn_delay_min_seconds: float = 0.5
+    turn_delay_max_seconds: float = 2.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @property
     def allowed_origins(self) -> list[str]:
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
+
+    @property
+    def broker_url(self) -> str:
+        # kombu's SQLAlchemy transport is the app's DB URL with an "sqla+" prefix.
+        return self.celery_broker_url or f"sqla+{self.database_url}"
 
 
 @lru_cache

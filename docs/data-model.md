@@ -127,7 +127,7 @@ An imported `.xlsx` file of interactions — the source of one or more runs.
 
 ### BenchmarkRun
 
-One benchmark invocation across one or more platforms.
+One benchmark invocation, scored under a single platform (one `PlatformExecution`).
 
 | Column | Type | Notes |
 | --- | --- | --- |

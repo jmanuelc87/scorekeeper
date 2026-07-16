@@ -58,7 +58,12 @@ class SourceFile(Base):
 
 
 class BenchmarkRun(Base):
-    """A single benchmark invocation across one or more platforms."""
+    """A single benchmark invocation, scored under one platform.
+
+    The ``platform_executions`` relationship is a list for historical reasons, but the
+    orchestrator now creates exactly one ``PlatformExecution`` per run — one platform
+    per set of files.
+    """
 
     __tablename__ = "benchmark_runs"
 

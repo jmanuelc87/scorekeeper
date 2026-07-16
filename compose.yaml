@@ -18,6 +18,9 @@ services:
   migrate:
     build: .
     command: ["alembic", "upgrade", "head"]
+    # Base settings (judge keys, etc.) come from .env; the values below override
+    # the ones that must differ inside the Docker network (env wins over env_file).
+    env_file: .env
     environment: &backend-environment
       DATABASE_URL: postgresql+psycopg://scorekeeper:scorekeeper@database:5432/scorekeeper
       MCP_TRANSPORT: http
@@ -27,6 +30,7 @@ services:
 
   mcp:
     build: .
+    env_file: .env
     environment: *backend-environment
     depends_on:
       migrate:
@@ -37,22 +41,50 @@ services:
   api:
     build: .
     command: ["scorekeeper-api"]
+    env_file: .env
     environment: *backend-environment
+    healthcheck:
+      # curl/wget aren't in the python:slim image, but Python always is.
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health').status == 200 else 1)",
+        ]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     depends_on:
       migrate:
         condition: service_completed_successfully
     ports:
       - "8001:8001"
 
-  frontend:
-    build:
-      context: frontend
-      args:
-        VITE_API_URL: http://localhost:8001
+  worker:
+    build: .
+    # Consumes the evaluation queue and runs the LLM scoring off the API's request
+    # path. Broker is Postgres (kombu SQLAlchemy transport); no ports to expose.
+    command:
+      ["celery", "-A", "scorekeeper.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    env_file: .env
+    environment: *backend-environment
     depends_on:
-      - api
-    ports:
-      - "8080:80"
+      database:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+
+  # frontend:
+  #   build:
+  #     context: frontend
+  #     args:
+  #       VITE_API_URL: http://localhost:8001
+  #   depends_on:
+  #     - api
+  #   ports:
+  #     - "8080:80"
 
 volumes:
   postgres_data:

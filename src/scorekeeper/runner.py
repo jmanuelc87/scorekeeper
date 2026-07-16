@@ -15,19 +15,31 @@ Design:
 * **Skip-metric-continue** — a metric that raises is logged and skipped; the turn still
   scores from the metrics that succeeded, and scenario ``status`` records whether the
   scoring was complete, partial, or a total failure.
-* **Synchronous** — a sequential loop, matching the fully-synchronous codebase.
+* **Metrics evaluate concurrently within a turn** — each metric's judge calls run on
+  their own thread (one thread per metric), since they are independent I/O-bound HTTP
+  requests. Turns stay **sequential** (the running ``history`` is fed forward, so a
+  turn depends on the ones before it), and all session writes stay on the owning
+  thread — only the ORM-free ``metric.evaluate`` calls are threaded.
 
-Commit boundary: the inner methods only ``flush()``; the top-level method the caller
-invokes commits. Callers entering at a lower level (e.g. ``run_scenario``) commit
-themselves, mirroring how ``selection.sync_selection`` documents "caller commits".
+Commit boundary: the **turn is the atomic unit of durability** — a turn's metric
+judge calls all run before its scores are written, then ``run_turn`` commits each
+``MetricScore`` followed by the ``turn_score`` roll-up. An interruption mid-turn
+loses that turn's in-flight scores, but every earlier turn/scenario stays committed.
+The roll-ups commit at their own level as they are computed: the ``turn_score`` in
+``run_turn``, the scenario ``average_score`` / ``status`` in ``run_scenario``, the
+platform ``average_score`` in ``run_platform``.
 """
 
 from __future__ import annotations
 
 import logging
+import random
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from sqlalchemy.orm import Session
 
+from scorekeeper.config import get_settings
 from scorekeeper.database import (
     BenchmarkRun,
     MetricScore,
@@ -36,7 +48,7 @@ from scorekeeper.database import (
     Turn,
     _now,
 )
-from scorekeeper.metrics.base import Metric, TurnView
+from scorekeeper.metrics.base import Metric, MetricResult, TurnView
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.judges import make_judge
 from scorekeeper.metrics.rollup import platform_average, scenario_average, turn_score
@@ -60,6 +72,9 @@ class EvalRunner:
     def __init__(self, session: Session, judge: Judge | None = None) -> None:
         self.session = session
         self.judge = judge or make_judge()
+        settings = get_settings()
+        self._turn_delay_min = settings.turn_delay_min_seconds
+        self._turn_delay_max = settings.turn_delay_max_seconds
 
     # ---- Level 1: whole run -------------------------------------------------
     def run_benchmark(self, run: BenchmarkRun) -> None:
@@ -82,22 +97,42 @@ class EvalRunner:
 
     # ---- Level 3: one scenario (conversation) ------------------------------
     def run_scenario(self, scenario: ScenarioResult) -> None:
-        """Score every turn of one conversation and roll up its average.
+        """Score every turn of one conversation, roll up its average, and commit.
 
         Metric selection follows ``scenario.use_case`` — a comma-separated list of
         tokens whose metrics are unioned; the running conversation ``history`` is
-        fed forward so later turns see earlier exchanges.
+        fed forward so later turns see earlier exchanges. Consecutive turns are
+        paced by a short random delay (see ``_pace_between_turns``).
+
+        Individual metric scores are already committed as they are written (see
+        ``run_turn``); this final commit persists the scenario roll-up
+        (``average_score`` / ``status``).
         """
         metrics = resolve_scenario(self.session, scenario.use_case)
         history: list[tuple[str, str]] = []
         turn_scores: list[float | None] = []
-        for turn in scenario.turns:
+        for index, turn in enumerate(scenario.turns):
+            if index > 0:
+                self._pace_between_turns()
             self.run_turn(turn, metrics, history)
             turn_scores.append(turn.turn_score)
             history.append((turn.prompt, turn.response))
         scenario.average_score = scenario_average(turn_scores)
         scenario.status = _scenario_status(scenario)
-        self.session.flush()
+        self.session.commit()
+
+    def _pace_between_turns(self) -> None:
+        """Pause a random interval between consecutive turns to spread out judge calls.
+
+        The pause is drawn uniformly from the configured
+        ``[turn_delay_min_seconds, turn_delay_max_seconds]`` window; a non-positive
+        upper bound disables it.
+        """
+        if self._turn_delay_max <= 0:
+            return
+        low = max(0.0, self._turn_delay_min)
+        high = max(low, self._turn_delay_max)
+        time.sleep(random.uniform(low, high))
 
     # ---- Level 4: one turn --------------------------------------------------
     def run_turn(
@@ -108,20 +143,20 @@ class EvalRunner:
     ) -> None:
         """Evaluate every metric on one turn, persist scores, roll up the turn.
 
-        A metric that raises is logged and skipped (skip-metric-continue); the
-        turn scores from the survivors. Existing scores are cleared first so a
-        re-run is idempotent (no duplicate ``MetricScore`` rows).
+        The metrics evaluate concurrently — one thread per metric — since each is an
+        independent judge call; their results are then written back serially on this
+        thread. A metric that raises is logged and skipped (skip-metric-continue); the
+        turn scores from the survivors. Existing scores are cleared first so a re-run
+        is idempotent (no duplicate ``MetricScore`` rows).
+
+        Commits each ``MetricScore`` once the concurrent evaluation has gathered its
+        results, then commits the ``turn_score`` roll-up. The turn is the atomic-write
+        unit: an interruption mid-turn loses that turn's in-flight scores, but earlier
+        turns stay committed.
         """
         view = self._to_turn_view(turn, history or [])
         turn.metric_scores.clear()
-        for metric in metrics:
-            try:
-                result = metric.evaluate(view, self.judge)
-            except Exception as exc:  # skip-metric-continue
-                logger.warning(
-                    "Métrica %s falló en turno %s: %s", metric.name, turn.turn_number, exc
-                )
-                continue
+        for result in self._evaluate_metrics(view, metrics, turn.turn_number):
             turn.metric_scores.append(
                 MetricScore(
                     metric_name=result.metric_name,
@@ -131,8 +166,42 @@ class EvalRunner:
                     rubric_version=result.rubric_version,
                 )
             )
+            self.session.commit()  # persist each surviving metric's score
         turn.turn_score = turn_score(turn.metric_scores)
-        self.session.flush()
+        self.session.commit()
+
+    def _evaluate_metrics(
+        self, view: TurnView, metrics: list[Metric], turn_number: int
+    ) -> list[MetricResult]:
+        """Evaluate every metric concurrently — one thread each — and return the
+        surviving results in metric-declaration order.
+
+        Only ``metric.evaluate`` runs off-thread: it takes the ORM-free ``view`` and
+        the shared, thread-safe ``judge`` and touches no session state. Results are
+        placed by metric index so the caller writes ``MetricScore`` rows in a stable
+        order regardless of which judge call finishes first. A metric that raises is
+        logged and dropped (skip-metric-continue).
+        """
+        if not metrics:
+            return []
+        results: list[MetricResult | None] = [None] * len(metrics)
+        with ThreadPoolExecutor(max_workers=len(metrics)) as pool:
+            futures = {
+                pool.submit(metric.evaluate, view, self.judge): index
+                for index, metric in enumerate(metrics)
+            }
+            for future in as_completed(futures):
+                index = futures[future]
+                try:
+                    results[index] = future.result()
+                except Exception as exc:  # skip-metric-continue
+                    logger.warning(
+                        "Métrica %s falló en turno %s: %s",
+                        metrics[index].name,
+                        turn_number,
+                        exc,
+                    )
+        return [result for result in results if result is not None]
 
     # ---- Helpers ------------------------------------------------------------
     def _to_turn_view(self, turn: Turn, history: list[tuple[str, str]]) -> TurnView:
