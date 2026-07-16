@@ -30,9 +30,14 @@ class StubJudge:
         self,
         verdicts: list[JudgeVerdict] | None = None,
         extractions: list[BaseModel] | None = None,
+        embeddings: dict[str, list[float]] | None = None,
+        model: str | None = None,
     ) -> None:
         self._verdicts = list(verdicts or [])
         self._extractions = list(extractions or [])
+        # Map text -> vector; embed() returns one vector per requested text.
+        self._embeddings = dict(embeddings or {})
+        self.model = model
         self.calls: list[tuple[str, str | None]] = []
 
     def score(self, *, rubric, turn, scale, rubric_version=None) -> JudgeVerdict:
@@ -42,6 +47,11 @@ class StubJudge:
     def structured(self, *, instruction, turn, schema):
         self.calls.append(("structured", schema.__name__))
         return self._extractions.pop(0)
+
+    def embed(self, *, texts):
+        self.calls.append(("embed", str(len(texts))))
+        # Unknown texts embed to a zero vector, keeping the stub total.
+        return [self._embeddings.get(text, [0.0, 0.0]) for text in texts]
 
 
 # The concrete catalog metrics under test.
@@ -73,8 +83,12 @@ def make_judge():
     def _make(
         verdicts: list[JudgeVerdict] | None = None,
         extractions: list[BaseModel] | None = None,
+        embeddings: dict[str, list[float]] | None = None,
+        model: str | None = None,
     ) -> StubJudge:
-        return StubJudge(verdicts=verdicts, extractions=extractions)
+        return StubJudge(
+            verdicts=verdicts, extractions=extractions, embeddings=embeddings, model=model
+        )
 
     return _make
 

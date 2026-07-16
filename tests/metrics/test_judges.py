@@ -61,9 +61,21 @@ class FakeCompletions:
         return type("Completion", (), {"choices": [choice]})()
 
 
+class FakeEmbeddings:
+    def __init__(self, vectors: list[list[float]]) -> None:
+        self._vectors = vectors
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        data = [type("Emb", (), {"embedding": v})() for v in self._vectors]
+        return type("Response", (), {"data": data})()
+
+
 class FakeOpenAIClient:
-    def __init__(self, parsed: object) -> None:
+    def __init__(self, parsed: object, embeddings: list[list[float]] | None = None) -> None:
         self.chat = type("Chat", (), {"completions": FakeCompletions(parsed)})()
+        self.embeddings = FakeEmbeddings(embeddings or [])
 
 
 # --- base helpers -------------------------------------------------------------
@@ -221,6 +233,43 @@ def test_openai_structured_returns_schema(turn: TurnView) -> None:
     assert result.claims == ["x"]
 
 
+def test_openai_embed_returns_vectors_in_order() -> None:
+    client = FakeOpenAIClient(None, embeddings=[[1.0, 0.0], [0.0, 1.0]])
+    judge = OpenAIJudge(model="gpt-test", client=client, embedding_model="emb-test")
+
+    vectors = judge.embed(texts=["a", "b"])
+
+    assert vectors == [[1.0, 0.0], [0.0, 1.0]]
+    call = client.embeddings.calls[0]
+    assert call["model"] == "emb-test"
+    assert call["input"] == ["a", "b"]
+
+
+def test_openai_embed_empty_skips_call() -> None:
+    client = FakeOpenAIClient(None, embeddings=[[1.0]])
+    judge = OpenAIJudge(model="gpt-test", client=client)
+
+    assert judge.embed(texts=[]) == []
+    assert client.embeddings.calls == []
+
+
+def test_anthropic_embed_delegates_to_embedder(turn: TurnView) -> None:
+    embed_client = FakeOpenAIClient(None, embeddings=[[0.5, 0.5]])
+    embedder = OpenAIJudge(model="gpt-test", client=embed_client)
+    client = FakeAnthropicClient(_ScoreResponse(score=3.0, justification="ok"))
+    judge = AnthropicJudge(model="claude-test", client=client, embedder=embedder)
+
+    assert judge.embed(texts=["a"]) == [[0.5, 0.5]]
+
+
+def test_anthropic_embed_without_backend_raises(turn: TurnView) -> None:
+    client = FakeAnthropicClient(_ScoreResponse(score=3.0, justification="ok"))
+    judge = AnthropicJudge(model="claude-test", client=client)
+
+    with pytest.raises(NotImplementedError, match="embeddings"):
+        judge.embed(texts=["a"])
+
+
 # --- Factory ------------------------------------------------------------------
 
 
@@ -254,6 +303,36 @@ def test_make_judge_selects_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     assert built["provider"] == "openai"
     assert built["api_key"] == "sk-o"
     assert built["system_prompt"] is None
+
+
+def test_make_judge_anthropic_wires_embedder_when_openai_key_present(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: dict = {}
+
+    class DummyAnthropic:
+        def __init__(self, **kwargs) -> None:
+            built.update(provider="anthropic", **kwargs)
+
+    class DummyOpenAI:
+        def __init__(self, **kwargs) -> None:
+            pass  # stands in for the embedder backend
+
+    monkeypatch.setattr(judges_pkg, "AnthropicJudge", DummyAnthropic)
+    monkeypatch.setattr(judges_pkg, "OpenAIJudge", DummyOpenAI)
+
+    # No OpenAI key: no embeddings backend attached.
+    make_judge(Settings(judge_provider="anthropic", anthropic_api_key="sk-a"))
+    assert built["embedder"] is None
+
+    # OpenAI key present: an OpenAI-backed embedder is attached to the Anthropic judge.
+    built.clear()
+    make_judge(
+        Settings(
+            judge_provider="anthropic", anthropic_api_key="sk-a", openai_api_key="sk-o"
+        )
+    )
+    assert isinstance(built["embedder"], DummyOpenAI)
 
 
 def test_make_judge_missing_key_raises() -> None:

@@ -10,3 +10,4 @@ package registers every metric::
 
 from scorekeeper.metrics.catalog import faithfulness  # noqa: F401
 from scorekeeper.metrics.catalog import hallucination  # noqa: F401
+from scorekeeper.metrics.catalog import answer_relevance  # noqa: F401

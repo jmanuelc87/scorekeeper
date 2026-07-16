@@ -27,6 +27,7 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound=BaseModel)
 
 DEFAULT_MODEL = "gpt-5.6-sol"
+DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 
 
 class OpenAIJudge:
@@ -34,7 +35,8 @@ class OpenAIJudge:
 
     ``client`` may be injected (tests); otherwise a real ``openai.OpenAI`` is built
     from ``api_key`` on first construction. Uses the SDK's ``chat.completions.parse``
-    structured-outputs helper.
+    structured-outputs helper. Also serves as the project's embeddings backend
+    (``embed()``) via the OpenAI embeddings endpoint.
     """
 
     def __init__(
@@ -44,8 +46,10 @@ class OpenAIJudge:
         api_key: str | None = None,
         client: Any | None = None,
         system_prompt: str | None = None,
+        embedding_model: str = DEFAULT_EMBEDDING_MODEL,
     ) -> None:
         self.model = model
+        self.embedding_model = embedding_model
         self.system_prompt = system_prompt or DEFAULT_SYSTEM_PROMPT
         if client is None:
             import openai  # lazy: only needed when building a real client
@@ -88,3 +92,10 @@ class OpenAIJudge:
             response_format=schema,
         )
         return completion.choices[0].message.parsed
+
+    def embed(self, *, texts: list[str]) -> list[list[float]]:
+        """Embed ``texts`` via the OpenAI embeddings endpoint, order preserved."""
+        if not texts:
+            return []
+        response = self._client.embeddings.create(model=self.embedding_model, input=texts)
+        return [item.embedding for item in response.data]
