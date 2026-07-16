@@ -17,7 +17,10 @@ from scorekeeper.database import ScenarioMetric
 from scorekeeper.metrics.base import Metric
 from scorekeeper.metrics.selection import (
     metrics_for,
+    metrics_for_scenario,
+    parse_use_cases,
     resolve,
+    resolve_scenario,
     sync_selection,
 )
 
@@ -80,3 +83,71 @@ def test_resolve_raises_on_unknown_stored_metric(db_session: Session, registered
 
     with pytest.raises(KeyError, match="Métrica desconocida"):
         resolve(db_session, "raro")
+
+
+# --- Comma-separated (per-scenario) selection ---------------------------------
+
+
+def test_parse_use_cases_splits_and_strips() -> None:
+    assert parse_use_cases(" document_retrieval ,, web_search ") == [
+        "document_retrieval",
+        "web_search",
+    ]
+    assert parse_use_cases("default") == ["default"]
+    assert parse_use_cases("  ,  ") == []
+
+
+def test_metrics_for_scenario_unions_tokens(db_session: Session, registered_metrics) -> None:
+    sync_selection(db_session)
+    db_session.commit()
+
+    names = metrics_for_scenario(db_session, "document_retrieval, default")
+    assert set(names) == RETRIEVAL_METRICS | DEFAULT_METRICS
+    # No duplicates in the union.
+    assert len(names) == len(set(names))
+
+
+def test_metrics_for_scenario_dedups_repeated_tokens(
+    db_session: Session, registered_metrics
+) -> None:
+    sync_selection(db_session)
+    db_session.commit()
+
+    names = metrics_for_scenario(db_session, "document_retrieval, document_retrieval, web_search")
+    assert names == sorted(RETRIEVAL_METRICS)  # each metric once, name-ordered
+
+
+def test_metrics_for_scenario_ignores_whitespace_and_empty_tokens(
+    db_session: Session, registered_metrics
+) -> None:
+    sync_selection(db_session)
+    db_session.commit()
+
+    assert set(metrics_for_scenario(db_session, " document_retrieval ,, web_search ")) == (
+        RETRIEVAL_METRICS
+    )
+
+
+def test_metrics_for_scenario_falls_back_only_when_all_miss(
+    db_session: Session, registered_metrics
+) -> None:
+    sync_selection(db_session)
+    db_session.commit()
+
+    # Every token misses → default set.
+    assert set(metrics_for_scenario(db_session, "inexistente, otro_raro")) == DEFAULT_METRICS
+    # One token matches → no default injected.
+    assert set(metrics_for_scenario(db_session, "inexistente, document_retrieval")) == (
+        RETRIEVAL_METRICS
+    )
+
+
+def test_resolve_scenario_returns_union_instances(
+    db_session: Session, registered_metrics
+) -> None:
+    sync_selection(db_session)
+    db_session.commit()
+
+    metrics = resolve_scenario(db_session, "document_retrieval, default")
+    assert all(isinstance(m, Metric) for m in metrics)
+    assert {m.name for m in metrics} == RETRIEVAL_METRICS | DEFAULT_METRICS
