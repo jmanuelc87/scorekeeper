@@ -1,8 +1,9 @@
 """DB-backed per-scenario selection, synced from the decorator-declared classes.
 
-The catalog metrics (``faithfulness_ragas``/``faithfulness_deepeval``) declare no
-scenarios, so they belong to the reserved ``"default"`` set and every scenario
-resolves to them via the fallback.
+``hallucination`` declares no scenarios, so it belongs to the reserved
+``"default"`` set and every scenario without its own rows resolves to it via the
+fallback. ``faithfulness_ragas``/``faithfulness_deepeval`` declare
+``["document_retrieval", "web_search"]`` and materialize under those use cases.
 """
 
 from __future__ import annotations
@@ -19,15 +20,19 @@ from scorekeeper.metrics.selection import (
     sync_selection,
 )
 
-DEFAULT_METRICS = {"faithfulness_ragas", "faithfulness_deepeval"}
+DEFAULT_METRICS = {"hallucination"}
+RETRIEVAL_METRICS = {"faithfulness_ragas", "faithfulness_deepeval"}
 
 
 def test_sync_materializes_declared_scenarios(db_session: Session, registered_metrics) -> None:
     sync_selection(db_session)
     db_session.commit()
 
-    # Both metrics declare no scenarios → they land in the "default" set.
+    # hallucination declares no scenarios → it lands in the "default" set.
     assert set(metrics_for(db_session, "default")) == DEFAULT_METRICS
+    # The faithfulness metrics materialize under their declared use cases.
+    assert set(metrics_for(db_session, "document_retrieval")) == RETRIEVAL_METRICS
+    assert set(metrics_for(db_session, "web_search")) == RETRIEVAL_METRICS
 
 
 def test_sync_is_idempotent(db_session: Session, registered_metrics) -> None:
