@@ -1,9 +1,10 @@
 """DB-backed per-scenario selection, synced from the decorator-declared classes.
 
-``hallucination`` declares no scenarios, so it belongs to the reserved
-``"default"`` set and every scenario without its own rows resolves to it via the
-fallback. ``faithfulness_ragas``/``faithfulness_deepeval`` declare
-``["document_retrieval", "web_search"]`` and materialize under those use cases.
+``hallucination`` and ``contextual_precision`` declare no scenarios, so they
+belong to the reserved ``"default"`` set and every scenario without its own rows
+resolves to it via the fallback. ``faithfulness_ragas``/``faithfulness_deepeval``
+declare ``["document_retrieval", "web_search"]`` and materialize under those use
+cases.
 """
 
 from __future__ import annotations
@@ -20,7 +21,7 @@ from scorekeeper.metrics.selection import (
     sync_selection,
 )
 
-DEFAULT_METRICS = {"hallucination"}
+DEFAULT_METRICS = {"hallucination", "contextual_precision"}
 RETRIEVAL_METRICS = {"faithfulness_ragas", "faithfulness_deepeval"}
 
 

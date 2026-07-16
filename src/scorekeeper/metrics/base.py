@@ -36,6 +36,9 @@ class TurnView(BaseModel):
     history: list[tuple[str, str]] = []
     # Retrieved context a RAG answer was grounded on, for groundedness-style metrics.
     retrieved_context: str = ""
+    # Ground-truth answer for the turn, for reference-based metrics (e.g. contextual
+    # precision judges retrieved nodes against this, not the generator's response).
+    expected_output: str = ""
 
 
 class StepTrace(BaseModel):

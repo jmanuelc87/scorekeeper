@@ -12,6 +12,7 @@ All rubrics, prompts and justifications are in Spanish.
 | Metric (`name`) | Category | Scale | Weight | Higher means | Applies to |
 | --- | --- | --- | --- | --- | --- |
 | [`answer_relevance`](#answer_relevance) | `rag` | `Unit()` 0–1 | 1.0 | answer sticks closer to the question (better) | `default` |
+| [`contextual_precision`](#contextual_precision) | `rag` | `Unit()` 0–1 | 1.0 | retriever ranks relevant nodes ahead of irrelevant ones (better) | `default` |
 | [`faithfulness_ragas`](#faithfulness_ragas) | `rag` | `Unit()` 0–1 | 1.0 | more answer statements entailed by context (better) | `document_retrieval`, `web_search` |
 | [`faithfulness_deepeval`](#faithfulness_deepeval) | `rag` | `Unit()` 0–1 | 1.0 | fewer answer claims contradicted by context (better) | `document_retrieval`, `web_search` |
 | [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination — worse raw score, but `Inverted` normalizes it to higher-is-better faithfulness | `default` |
@@ -20,10 +21,11 @@ Every metric here is a `MultiStepMetric` — it orchestrates several `Judge` cal
 and flattens their per-step `StepTrace`s into a single Spanish `justification`.
 None import an LLM SDK: they depend only on the `Judge` seam.
 
-`answer_relevance` and `hallucination` register with a bare `@register` (no
-`scenarios=`), so they belong to the reserved **`default`** selection — the set
-applied to any scenario that has no explicit metric rows of its own. Both
-`faithfulness_*` metrics declare `scenarios=["document_retrieval", "web_search"]`,
+`answer_relevance`, `contextual_precision` and `hallucination` register with a
+bare `@register` (no `scenarios=`), so they belong to the reserved **`default`**
+selection — the set applied to any scenario that has no explicit metric rows of
+its own. Both `faithfulness_*` metrics declare
+`scenarios=["document_retrieval", "web_search"]`,
 since their statement/truth extraction only makes sense where the answer cites
 retrieved sources (see [Evaluation metrics → Per-scenario
 selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
@@ -89,6 +91,96 @@ call**.
 degenerate inputs), the generate → embed → average happy path, and the
 no-question short-circuit. No database and no live LLM: a stub judge scripts the
 generated questions and a text→vector embedding table.
+
+## `contextual_precision`
+
+**Does the retriever rank relevant nodes ahead of irrelevant ones?**
+
+`ContextualPrecision` — `src/scorekeeper/metrics/catalog/contextual_precision.py`
+
+A *ranking* metric for the retrieval stage of a RAG turn. Given the ordered list
+of retrieved nodes (rank 1 = the node the retriever/re-ranker placed first), it
+rewards putting relevant nodes before irrelevant ones. **Order is the whole
+point:** the same set of nodes scores higher when the relevant ones come first.
+The score is the **Average Precision** of the relevance labels over the ranking.
+
+```
+contextual_precision = ( Σ_k precision@k · r_k ) / total_relevant
+                        # r_k = 1 if node at rank k is relevant, else 0
+                        # precision@k = (relevant nodes seen up to k) / k
+                        # 0 = no relevant node retrieved (or none at all)
+                        # 1 = every relevant node ranked ahead of every irrelevant one
+```
+
+### Inputs
+
+- **Nodes (ranked):** `TurnView.retrieved_context`, stored as one free-form blob
+  (`Turn.retrieved_context`). `split_context_docs()` splits it into ordered,
+  blank-line-separated nodes (the same node convention `hallucination` uses); the
+  block order is the retriever's ranking.
+- **Reference:** `TurnView.expected_output` — the ground-truth answer
+  (`Turn.expected_output`, added alongside this metric). Nodes are judged against
+  this reference, **not** the generator's `response`, which is what makes the
+  metric reference-based: ranking is scored honestly even when the generator
+  answered badly.
+
+### Scoring steps
+
+This is a `MultiStepMetric`: one judge call per node, no single rubric.
+
+1. Split `retrieved_context` into ordered nodes.
+2. For each node, in rank order, call `judge.structured(..., schema=RelevanceVerdict)`
+   — a relevance **classification**, so it goes through the `structured()` seam
+   rather than `score()`. The node is judged in an isolated
+   `TurnView(prompt=…, response="")`, so the judge sees the question and the node
+   but never the assistant's actual answer or the other nodes.
+3. Turn the verdicts into binary `r_k` in rank order, then compute Average
+   Precision: at each rank where a relevant node appears, add
+   `precision@k = (relevant seen so far) / k`, then divide by the total relevant
+   count.
+4. Each node's verdict, plus a summary line, is recorded as a `StepTrace` and
+   flattened into the single Spanish `justification`.
+
+**No relevant nodes / no context.** If nothing relevant was retrieved (or
+`retrieved_context` is empty), the metric short-circuits to `raw_score = 0.0` —
+the empty-context case makes **no judge calls**.
+
+**`strict_mode`.** Off by default. When enabled, the score collapses to a pass/fail:
+only a perfect ranking (every relevant node ahead of every irrelevant one → `1.0`)
+passes; anything less becomes `0.0`.
+
+### The verdict prompt
+
+`VERDICT_PROMPT` frames the judge as a retrieval evaluator deciding whether a node
+is *useful for constructing the expected answer*. Only `{expected_output}` and
+`{node}` are interpolated (via `.format()`); the template deliberately contains no
+other braces so formatting never trips on stray `{}`. The turn's input question is
+appended automatically by the judge.
+
+### Scenarios
+
+Registered with a bare `@register` (no `scenarios=`), so it belongs to the
+reserved `default` set and applies to any scenario without explicit metric rows of
+its own. To restrict it to specific use cases, add them to the decorator and run
+`sync_selection(session)` once to re-materialize the mapping (see [Evaluation
+metrics → Per-scenario
+selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
+
+### Notes
+
+- `judge_model` is read best-effort via `getattr(judge, "model", None)`, since the
+  `structured()` seam does not itself surface the model name.
+- The reference lives on both `TurnView.expected_output` and `Turn.expected_output`
+  (Alembic migration `a3f1c2b4d5e6`), mirroring how `retrieved_context` is carried.
+
+### Tests
+
+`tests/metrics/test_contextual_precision.py` — perfect ranking, order sensitivity
+(relevant-first `1.0` vs relevant-last `0.5`), interleaved Average Precision, the
+no-relevant and no-context short-circuits, both `strict_mode` branches, and a spy
+test proving nodes are judged against `expected_output` and never against the
+response. No database and no live LLM: a stub judge scripts `RelevanceVerdict`
+values through `structured()`.
 
 ## `faithfulness_ragas`
 
