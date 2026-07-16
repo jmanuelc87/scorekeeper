@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -40,6 +41,15 @@ class Settings(BaseSettings):
     turn_delay_max_seconds: float = 2.0
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    @field_validator("judge_system_prompt", mode="after")
+    @classmethod
+    def _blank_prompt_is_none(cls, value: str | None) -> str | None:
+        # A blank JUDGE_SYSTEM_PROMPT (e.g. the empty line in .env.example) means
+        # "unset" — fall back to the judge's built-in default, not an empty prompt.
+        if value is not None and not value.strip():
+            return None
+        return value
 
     @property
     def allowed_origins(self) -> list[str]:
