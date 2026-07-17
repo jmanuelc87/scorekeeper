@@ -2,7 +2,7 @@ import logging
 from pathlib import Path
 
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -161,6 +161,41 @@ def get_evaluation(run_id: str) -> EvaluationResponse:
     if summary is None:
         raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
     return EvaluationResponse.model_validate(summary)
+
+
+@app.get("/runs")
+def list_runs(
+    run_id: str | None = Query(None, description="Limita a una sola evaluación."),
+    platform: str | None = Query(None, description="Coincidencia exacta de plataforma."),
+    start_date: str | None = Query(
+        None, description="Inicio del rango ISO-8601 sobre la ventana de evaluación."
+    ),
+    end_date: str | None = Query(
+        None, description="Fin del rango ISO-8601 sobre la ventana de evaluación."
+    ),
+    granularity: str = Query(
+        "scenario_results",
+        description="platform_executions | scenario_results | metric_scores",
+    ),
+) -> list[dict]:
+    """Retrieve full scored details for the runs matching the filters.
+
+    The HTTP twin of the MCP ``retrieve`` tool. All filters are optional and
+    AND-combined; ``granularity`` controls depth (``platform_executions`` →
+    ``scenario_results`` → ``metric_scores``). Returns a list ordered by creation date;
+    an unknown ``run_id`` yields ``[]``. ``400`` for an unknown ``granularity`` or an
+    unparseable date.
+    """
+    try:
+        return evaluation.retrieve_runs(
+            run_id=run_id,
+            platform=platform,
+            start_date=start_date,
+            end_date=end_date,
+            granularity=granularity,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 def main() -> None:

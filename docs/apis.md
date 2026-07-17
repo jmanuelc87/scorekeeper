@@ -12,6 +12,7 @@ over the Model Context Protocol — see [MCP tools](mcp.md).
 | `GET /health`                | Liveness probe. |
 | `POST /evaluations`          | Ingest conversation `.xlsx` files and **enqueue** them for scoring (per-file platform, defaulting to the payload platform). |
 | `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
+| `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity (HTTP twin of the MCP `retrieve` tool). |
 
 ## Architecture: API enqueues, worker scores
 
@@ -167,6 +168,63 @@ is in its lifecycle (`en_cola → en_proceso → completado|parcial|fallido`).
 |--------|------|
 | `404`  | No run with that `run_id` exists. |
 
+## `GET /runs`
+
+Retrieve full scored details for the runs matching a set of filters, as a **list**.
+This is the HTTP twin of the MCP [`retrieve` tool](mcp.md#retrieve) — same filters,
+granularity, and semantics. Unlike `GET /evaluations/{run_id}` (a single run's shallow
+poll summary), `/runs` returns the deep, granularity-configurable shape.
+
+### Query parameters
+
+All are optional and combined with AND.
+
+| Param         | Type     | Default             | Description |
+|---------------|----------|---------------------|-------------|
+| `run_id`      | `string` | —                   | Narrow to a single run. An unknown/invalid id yields `[]` (not an error). |
+| `platform`    | `string` | —                   | Exact, **case-sensitive** platform match (e.g. `claude`, `copilot`, `gemini`). |
+| `start_date`  | `string` | —                   | ISO-8601 lower bound (`YYYY-MM-DD` or full timestamp) on the scoring window. |
+| `end_date`    | `string` | —                   | ISO-8601 upper bound on the scoring window. |
+| `granularity` | `string` | `scenario_results`  | One of `platform_executions`, `scenario_results`, `metric_scores`. |
+
+The date range filters the **scoring window** (`PlatformExecution.started_at` /
+`finished_at`), which is `null` until a worker scores the run — so a bound excludes
+still-queued/in-progress runs. Results are ordered by run creation date. Granularity
+controls depth (each level adds to the one above): `platform_executions` → per-platform
+rollups; `scenario_results` → adds each scenario; `metric_scores` → adds each turn and
+its per-metric scores. See the [`retrieve` tool](mcp.md#retrieve) for the full response
+shape.
+
+### Response `200`
+
+```json
+[
+  {
+    "run_id": "b1f2…",
+    "status": "completado",
+    "created_at": "2026-07-10T12:00:00+00:00",
+    "progress": {"done": 2, "total": 2, "ratio": 1.0},
+    "platforms": [
+      {
+        "platform": "claude",
+        "average_score": 0.81,
+        "started_at": "2026-07-10T12:00:00+00:00",
+        "finished_at": "2026-07-10T12:05:00+00:00",
+        "scenarios": 2,
+        "status_breakdown": {"completado": 2},
+        "scenario_results": [ … ]
+      }
+    ]
+  }
+]
+```
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `400`  | `granularity` is not one of the three accepted values, or `start_date`/`end_date` is not a valid ISO-8601 date. No-match filters are **not** errors — they return `[]`. |
+
 ## Examples
 
 Enqueue (defaults, single file) → returns a `run_id`:
@@ -182,6 +240,12 @@ Poll until terminal:
 
 ```bash
 curl http://localhost:8001/evaluations/b1f2…
+```
+
+Retrieve full details for all `claude` runs scored in July, down to metric scores:
+
+```bash
+curl 'http://localhost:8001/runs?platform=claude&start_date=2026-07-01&end_date=2026-07-31&granularity=metric_scores'
 ```
 
 Multiple files with per-file overrides — `esc1` keeps the payload `claude` default;

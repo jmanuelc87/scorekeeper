@@ -506,6 +506,76 @@ def test_endpoint_get_unknown_run_404(monkeypatch) -> None:
     assert response.status_code == 404
 
 
+def test_runs_endpoint_forwards_filters_and_returns_list(monkeypatch) -> None:
+    captured: dict = {}
+    runs = [{"run_id": "run-1", "status": "completado", "platforms": []}]
+
+    def fake_retrieve(**kwargs):
+        captured.update(kwargs)
+        return runs
+
+    monkeypatch.setattr(evaluation, "retrieve_runs", fake_retrieve)
+
+    with TestClient(app) as client:
+        response = client.get(
+            "/runs",
+            params={
+                "run_id": "run-1",
+                "platform": "claude",
+                "start_date": "2026-07-01",
+                "end_date": "2026-07-31",
+                "granularity": "metric_scores",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == runs
+    # Every query param is forwarded to retrieve_runs.
+    assert captured == {
+        "run_id": "run-1",
+        "platform": "claude",
+        "start_date": "2026-07-01",
+        "end_date": "2026-07-31",
+        "granularity": "metric_scores",
+    }
+
+
+def test_runs_endpoint_defaults_granularity_and_empty_result(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_retrieve(**kwargs):
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(evaluation, "retrieve_runs", fake_retrieve)
+
+    with TestClient(app) as client:
+        response = client.get("/runs")
+
+    assert response.status_code == 200
+    assert response.json() == []
+    # No filters given; granularity defaults to scenario_results.
+    assert captured == {
+        "run_id": None,
+        "platform": None,
+        "start_date": None,
+        "end_date": None,
+        "granularity": "scenario_results",
+    }
+
+
+def test_runs_endpoint_invalid_input_400(monkeypatch) -> None:
+    def fake_retrieve(**kwargs):
+        raise ValueError("Granularidad 'nope' inválida")
+
+    monkeypatch.setattr(evaluation, "retrieve_runs", fake_retrieve)
+
+    with TestClient(app) as client:
+        response = client.get("/runs", params={"granularity": "nope"})
+
+    assert response.status_code == 400
+
+
 def test_endpoint_rejects_invalid_payload() -> None:
     with TestClient(app) as client:
         response = client.post(
