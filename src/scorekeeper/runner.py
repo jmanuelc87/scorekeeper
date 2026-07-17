@@ -79,13 +79,24 @@ class EvalRunner:
     # ---- Level 1: whole run -------------------------------------------------
     def run_benchmark(self, run: BenchmarkRun) -> None:
         """Score every platform execution in ``run`` and commit."""
+        logger.info(
+            "Run %s: puntuando %d ejecución(es) de plataforma",
+            run.id,
+            len(run.platform_executions),
+        )
         for platform_exec in run.platform_executions:
             self.run_platform(platform_exec)
         self.session.commit()
+        logger.info("Run %s: todas las plataformas puntuadas", run.id)
 
     # ---- Level 2: one platform ---------------------------------------------
     def run_platform(self, platform_exec: PlatformExecution) -> None:
         """Score every scenario for one platform and roll up its average."""
+        logger.info(
+            "Plataforma %s: puntuando %d escenario(s)",
+            platform_exec.platform,
+            len(platform_exec.scenario_results),
+        )
         platform_exec.started_at = _now()
         scenario_scores: list[float | None] = []
         for scenario in platform_exec.scenario_results:
@@ -94,6 +105,11 @@ class EvalRunner:
         platform_exec.average_score = platform_average(scenario_scores)
         platform_exec.finished_at = _now()
         self.session.flush()
+        logger.info(
+            "Plataforma %s finalizada: promedio=%s",
+            platform_exec.platform,
+            platform_exec.average_score,
+        )
 
     # ---- Level 3: one scenario (conversation) ------------------------------
     def run_scenario(self, scenario: ScenarioResult) -> None:
@@ -109,6 +125,13 @@ class EvalRunner:
         (``average_score`` / ``status``).
         """
         metrics = resolve_scenario(self.session, scenario.use_case)
+        logger.info(
+            "Escenario %s (use_case=%s): %d turno(s), métricas=%s",
+            scenario.scenario_id,
+            scenario.use_case,
+            len(scenario.turns),
+            [metric.name for metric in metrics],
+        )
         history: list[tuple[str, str]] = []
         turn_scores: list[float | None] = []
         for index, turn in enumerate(scenario.turns):
@@ -120,6 +143,12 @@ class EvalRunner:
         scenario.average_score = scenario_average(turn_scores)
         scenario.status = _scenario_status(scenario)
         self.session.commit()
+        logger.info(
+            "Escenario %s finalizado: estado=%s, promedio=%s",
+            scenario.scenario_id,
+            scenario.status,
+            scenario.average_score,
+        )
 
     def _pace_between_turns(self) -> None:
         """Pause a random interval between consecutive turns to spread out judge calls.
@@ -132,7 +161,9 @@ class EvalRunner:
             return
         low = max(0.0, self._turn_delay_min)
         high = max(low, self._turn_delay_max)
-        time.sleep(random.uniform(low, high))
+        delay = random.uniform(low, high)
+        logger.debug("Pausa de %.2fs antes del siguiente turno", delay)
+        time.sleep(delay)
 
     # ---- Level 4: one turn --------------------------------------------------
     def run_turn(
@@ -156,6 +187,9 @@ class EvalRunner:
         """
         view = self._to_turn_view(turn, history or [])
         turn.metric_scores.clear()
+        logger.info(
+            "Turno %s: evaluando %d métrica(s) en paralelo", turn.turn_number, len(metrics)
+        )
         for result in self._evaluate_metrics(view, metrics, turn.turn_number):
             turn.metric_scores.append(
                 MetricScore(
@@ -167,8 +201,20 @@ class EvalRunner:
                 )
             )
             self.session.commit()  # persist each surviving metric's score
+            logger.info(
+                "Turno %s · métrica %s = %s",
+                turn.turn_number,
+                result.metric_name,
+                result.raw_score,
+            )
         turn.turn_score = turn_score(turn.metric_scores)
         self.session.commit()
+        logger.info(
+            "Turno %s puntuado: turn_score=%s (%d métrica(s) exitosa(s))",
+            turn.turn_number,
+            turn.turn_score,
+            len(turn.metric_scores),
+        )
 
     def _evaluate_metrics(
         self, view: TurnView, metrics: list[Metric], turn_number: int
