@@ -81,7 +81,7 @@ no lo es, junto con una justificación breve en español.
 """
 
 
-@register
+@register(scenarios=["contextual_precision"])
 class ContextualPrecision(MultiStepMetric):
     """Average Precision of relevant nodes over the retriever's ranking."""
 

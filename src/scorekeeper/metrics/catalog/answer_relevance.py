@@ -52,7 +52,7 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     return float(np.dot(va, vb) / (norm_a * norm_b))
 
 
-@register
+@register(scenarios=["answer_relevance"])
 class AnswerRelevance(MultiStepMetric):
     name = "answer_relevance"
     category = MetricCategory.RAG

@@ -38,6 +38,13 @@ Transport can also be selected with `MCP_TRANSPORT=stdio|http`. Without a
 `DATABASE_URL`, local commands use `scorekeeper.db` through SQLite. Copy
 `.env.example` to `.env` to use the Compose PostgreSQL instance from the host.
 
+### Tools
+
+- `retrieve` — fetch full scored details for the runs matching a set of filters
+  (`run_id`, `platform`, a `start_date`/`end_date` scoring-window range), at a
+  chosen `granularity` (`platform_executions`, `scenario_results`, or
+  `metric_scores`). See [docs/mcp.md](docs/mcp.md).
+
 ## Database migrations
 
 The schema is owned by [Alembic](https://alembic.sqlalchemy.org/), not by the

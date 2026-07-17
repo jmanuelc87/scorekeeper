@@ -7,6 +7,7 @@ skip-on-error, roll-up, history wiring, idempotency — is asserted directly.
 
 from __future__ import annotations
 
+import threading
 from typing import ClassVar
 
 import pytest
@@ -54,9 +55,13 @@ class RecordingJudge:
         # When set, scoring a turn with this prompt raises (simulates an API error).
         self.fail_on_prompt = fail_on_prompt
         self.seen_turns: list[TurnView] = []
+        # Metrics within a turn now evaluate concurrently, so several threads may
+        # call ``score`` at once — guard the record. (Turns stay sequential.)
+        self._lock = threading.Lock()
 
     def score(self, *, rubric, turn, scale, rubric_version=None) -> JudgeVerdict:
-        self.seen_turns.append(turn)
+        with self._lock:
+            self.seen_turns.append(turn)
         if self.fail_on_prompt is not None and turn.prompt == self.fail_on_prompt:
             raise RuntimeError("fallo del juez")
         return JudgeVerdict(score=self.score_value, justification="razón", model=self.model)
@@ -130,6 +135,12 @@ def session() -> Session:
     Base.metadata.create_all(engine)
     with Session(engine) as session:
         yield session
+
+
+@pytest.fixture(autouse=True)
+def _no_turn_delay(monkeypatch) -> None:
+    """Skip the real between-turns pacing sleep so tests stay fast and deterministic."""
+    monkeypatch.setattr("scorekeeper.runner.time.sleep", lambda *_: None)
 
 
 def _select_metrics(session: Session, names: list[str], use_case: str = USE_CASE) -> None:
@@ -271,6 +282,71 @@ def test_rescoring_is_idempotent(session: Session, registry) -> None:
     count_2 = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
 
     assert count_1 == count_2 == 2
+
+
+def test_delay_paced_between_consecutive_turns(
+    session: Session, registry, monkeypatch
+) -> None:
+    _select_metrics(session, ["utilidad"])
+    _, _, scenario = _seed_scenario(session, [("a", "b"), ("c", "d"), ("e", "f")])
+    slept: list[float] = []
+    monkeypatch.setattr("scorekeeper.runner.time.sleep", lambda seconds: slept.append(seconds))
+    monkeypatch.setattr("scorekeeper.runner.random.uniform", lambda low, high: 0.123)
+
+    EvalRunner(session, RecordingJudge()).run_scenario(scenario)
+
+    # One pause between each consecutive pair of turns (N-1 for N turns), none after
+    # the last turn.
+    assert slept == [0.123, 0.123]
+
+
+def test_delay_disabled_when_max_non_positive(
+    session: Session, registry, monkeypatch
+) -> None:
+    _select_metrics(session, ["utilidad"])
+    _, _, scenario = _seed_scenario(session, [("a", "b"), ("c", "d")])
+    slept: list[float] = []
+    monkeypatch.setattr("scorekeeper.runner.time.sleep", lambda seconds: slept.append(seconds))
+
+    runner = EvalRunner(session, RecordingJudge())
+    runner._turn_delay_max = 0.0
+    runner.run_scenario(scenario)
+
+    assert slept == []
+
+
+class _BarrierMetric(_JudgeMetric):
+    """Metric whose evaluation blocks on a shared barrier.
+
+    ``barrier.wait`` only releases once every sibling metric has reached it, so the
+    turn completes iff all of them evaluate *at the same time* — i.e. on different
+    threads. If they ran sequentially the first would time out, break the barrier,
+    and every metric would fail (skip-metric-continue → no rows).
+    """
+
+    barrier: ClassVar[threading.Barrier]
+
+    def evaluate(self, turn: TurnView, judge) -> MetricResult:
+        self.barrier.wait(timeout=5)
+        return super().evaluate(turn, judge)
+
+
+def test_metrics_evaluate_concurrently(session: Session, registry) -> None:
+    names = ["m1", "m2", "m3"]
+    barrier = threading.Barrier(len(names))
+    for name in names:
+        MetricRegistry.add(type(name, (_BarrierMetric,), {"name": name, "barrier": barrier}))
+    _select_metrics(session, names)
+    _, _, scenario = _seed_scenario(session, [("hola", "qué tal")])
+
+    EvalRunner(session, RecordingJudge(score_value=0.9)).run_scenario(scenario)
+    session.commit()
+
+    # All three rows exist only because the metrics ran on distinct threads and
+    # cleared the barrier together; a sequential runner would time out and drop them.
+    turn = scenario.turns[0]
+    assert {ms.metric_name for ms in turn.metric_scores} == set(names)
+    assert turn.turn_score == pytest.approx(0.9)
 
 
 def test_comma_separated_use_case_unions_metrics(session: Session, registry) -> None:

@@ -1,0 +1,584 @@
+"""Glue that turns uploaded conversation ``.xlsx`` files into scored results.
+
+Ties together the two halves that already existed but were never wired: the
+``importer`` (parses one ``.xlsx`` into a flat list of message dicts) and the
+``EvalRunner`` (scores an already-persisted
+``BenchmarkRun → PlatformExecution → ScenarioResult → Turn`` tree). In between it
+*projects* parsed messages into evaluation ``Turn`` rows, builds the run hierarchy
+for a **single platform** and its set of files (each file is one scenario, scored
+under that one platform), seeds the metric-selection table, runs the evaluation,
+and reports a JSON-serializable summary.
+
+Two phases, split so scoring can run off the request path (see ``scorekeeper.tasks``):
+
+* :func:`ingest_evaluation` — parse the uploads and persist the run tree as
+  ``en_cola`` (*queued*), returning the ``run_id``. Fast; the API runs it inline.
+* :func:`score_run` — load a queued run by id and score it with the LLM judge.
+  Slow; the Celery worker runs it. The runner commits **per scenario** (its
+  atomic-write unit), so an interrupted job keeps every scenario it already
+  finished. On failure the run is marked ``fallido`` so pollers see a terminal state.
+
+:func:`run_evaluation` runs both phases on one session — the synchronous path kept
+for tests and any in-process caller. :func:`get_run_summary` reads a run's current
+status/summary for polling.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import logging
+import os
+import tempfile
+import uuid
+from collections import OrderedDict
+from dataclasses import dataclass
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session, selectinload
+
+from scorekeeper.database import (
+    BenchmarkRun,
+    PlatformExecution,
+    ScenarioResult,
+    SessionLocal,
+    SourceFile,
+    Turn,
+)
+from scorekeeper.importer import parse_conversation
+from scorekeeper.metrics.judge import Judge
+from scorekeeper.metrics.selection import sync_selection
+from scorekeeper.runner import (
+    STATUS_COMPLETADO,
+    STATUS_FALLIDO,
+    STATUS_PARCIAL,
+    EvalRunner,
+)
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_USE_CASE = "default"
+
+# Orchestration-level run statuses that precede scoring (the scoring-complete
+# literals — completado/parcial/fallido — live in ``runner``).
+STATUS_EN_COLA = "en_cola"  # ingested, waiting for a worker
+STATUS_EN_PROCESO = "en_proceso"  # a worker is scoring it now
+
+# Retrieval granularity: how deep :func:`retrieve_runs` serializes the run tree.
+GRANULARITY_PLATFORM = "platform_executions"  # stop at the platform execution
+GRANULARITY_SCENARIO = "scenario_results"  # descend into scenario results
+GRANULARITY_METRIC = "metric_scores"  # descend through turns to metric scores
+_GRANULARITIES = (GRANULARITY_PLATFORM, GRANULARITY_SCENARIO, GRANULARITY_METRIC)
+
+
+@dataclass
+class UploadedFile:
+    """One uploaded conversation file plus its resolved evaluation metadata.
+
+    ``scenario_id`` and ``use_case`` are resolved by the caller (e.g. the HTTP
+    endpoint applies per-file overrides and defaults) before reaching the
+    orchestrator. ``platform`` is an optional per-file override; when ``None`` the
+    file falls back to the run-level platform passed to :func:`ingest_evaluation`.
+    """
+
+    filename: str
+    content: bytes
+    scenario_id: str
+    use_case: str = DEFAULT_USE_CASE
+    platform: str | None = None
+
+
+def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Project parsed messages into evaluation-turn dicts.
+
+    ``parse_conversation`` yields one dict per message tagged with a ``turn``
+    number (a user+model pair shares a number). This groups by that number and,
+    per turn, joins the ``user`` messages into ``prompt`` and the ``model``
+    messages into ``response`` (a missing side becomes ``""``), carrying through
+    ``retrieved_context`` / ``expected_output`` when the sheet provided them.
+    Turns are returned in ascending ``turn_number`` order.
+    """
+    grouped: OrderedDict[int, dict[str, Any]] = OrderedDict()
+    for message in messages:
+        turn = message.get("turn", 1)
+        bucket = grouped.setdefault(
+            turn,
+            {"prompt": [], "response": [], "retrieved_context": "", "expected_output": ""},
+        )
+        role = message.get("role")
+        content = message.get("content", "")
+        if role == "user":
+            bucket["prompt"].append(content)
+        elif role == "model":
+            bucket["response"].append(content)
+        for key in ("retrieved_context", "expected_output"):
+            value = message.get(key)
+            if value and not bucket[key]:
+                bucket[key] = value
+
+    turns: list[dict[str, Any]] = []
+    for turn_number in sorted(grouped):
+        bucket = grouped[turn_number]
+        turns.append(
+            {
+                "turn_number": turn_number,
+                "prompt": "\n".join(bucket["prompt"]),
+                "response": "\n".join(bucket["response"]),
+                "retrieved_context": bucket["retrieved_context"] or None,
+                "expected_output": bucket["expected_output"] or None,
+            }
+        )
+    return turns
+
+
+def ingest_evaluation(
+    platform: str,
+    files: list[UploadedFile],
+    *,
+    session: Session | None = None,
+) -> str:
+    """Parse ``files`` and persist a queued run for ``platform``; return its ``run_id``.
+
+    Builds one ``BenchmarkRun`` and, under it, one ``PlatformExecution`` per distinct
+    platform — each file lands under ``upload.platform`` when set, otherwise under the
+    run-level ``platform`` fallback. Each file becomes one ``ScenarioResult`` (with its
+    ``Turn`` rows) attached to its platform's execution. The run is committed with
+    status ``en_cola`` and left unscored; a worker later scores it via
+    :func:`score_run`.
+
+    This is the fast, on-request half: parsing is synchronous so a malformed sheet is
+    rejected here (as ``ValueError``) before any job is enqueued. ``session`` defaults
+    to ``SessionLocal()``; tests inject an in-memory session.
+
+    Raises ``ValueError`` when ``platform`` or ``files`` is empty, or when a file
+    cannot be parsed (propagated from ``parse_conversation``); the transaction is
+    rolled back first so nothing is persisted.
+    """
+    if not platform:
+        raise ValueError("Se requiere una plataforma.")
+    if not files:
+        raise ValueError("Se requiere al menos un archivo.")
+
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        # Seed the use_case -> metric table so resolve_scenario finds metrics;
+        # without this every turn scores None and every scenario is "fallido".
+        sync_selection(db)
+        db.flush()
+
+        # Parse each file once and record its provenance as a SourceFile.
+        parsed: list[tuple[UploadedFile, list[dict[str, Any]], SourceFile]] = []
+        for upload in files:
+            messages = _parse_upload(upload)
+            logger.info(
+                "Analizado %s: %d mensaje(s) -> %d turno(s)",
+                upload.filename,
+                len(messages),
+                len(project_turns(messages)),
+            )
+            source_file = SourceFile(
+                filename=upload.filename,
+                file_hash=hashlib.sha256(upload.content).hexdigest(),
+            )
+            db.add(source_file)
+            parsed.append((upload, messages, source_file))
+
+        run = BenchmarkRun(status=STATUS_EN_COLA)
+        # A run references a single source file; only meaningful with one upload.
+        if len(parsed) == 1:
+            run.source_file = parsed[0][2]
+
+        # One PlatformExecution per distinct resolved platform (first-seen order);
+        # each file's optional override wins over the run-level fallback.
+        executions: dict[str, PlatformExecution] = {}
+        for upload, messages, _ in parsed:
+            resolved = upload.platform or platform
+            platform_exec = executions.get(resolved)
+            if platform_exec is None:
+                platform_exec = PlatformExecution(platform=resolved, run=run)
+                executions[resolved] = platform_exec
+            scenario = ScenarioResult(
+                scenario_id=upload.scenario_id,
+                use_case=upload.use_case,
+                source_ref=upload.filename,
+                raw_conversation={"messages": messages},
+                platform_execution=platform_exec,
+            )
+            for turn in project_turns(messages):
+                scenario.turns.append(
+                    Turn(
+                        turn_number=turn["turn_number"],
+                        prompt=turn["prompt"],
+                        response=turn["response"],
+                        retrieved_context=turn["retrieved_context"],
+                        expected_output=turn["expected_output"],
+                    )
+                )
+
+        db.add(run)
+        db.commit()
+        turn_total = sum(
+            len(s.turns) for pe in run.platform_executions for s in pe.scenario_results
+        )
+        logger.info(
+            "Run %s en cola: %d plataforma(s) × %d archivo(s) = %d turno(s).",
+            run.id,
+            len(executions),
+            len(parsed),
+            turn_total,
+        )
+        return str(run.id)
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        if owns_session:
+            db.close()
+
+
+def score_run(
+    run_id: str,
+    *,
+    session: Session | None = None,
+    judge: Judge | None = None,
+) -> dict[str, Any]:
+    """Score a previously-ingested run and persist the results.
+
+    Loads the run by id, marks it ``en_proceso``, scores every turn with the LLM
+    judge (``EvalRunner`` commits per scenario), rolls the status up, and returns the
+    JSON-serializable summary. This is the slow half the Celery worker runs off the
+    request path.
+
+    ``session`` / ``judge`` default to ``SessionLocal()`` / the configured judge.
+    Raises ``ValueError`` when ``run_id`` is unknown. On any scoring failure the run
+    is marked ``fallido`` (a terminal state for pollers) and the error re-raised.
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        run = _load_run(db, run_id)
+        if run is None:
+            raise ValueError(f"El run {run_id} no existe.")
+
+        run.status = STATUS_EN_PROCESO
+        db.commit()
+
+        turn_total = sum(
+            len(s.turns) for pe in run.platform_executions for s in pe.scenario_results
+        )
+        logger.info("Puntuando run %s: %d turno(s) con el juez…", run.id, turn_total)
+        try:
+            EvalRunner(db, judge).run_benchmark(run)  # scores everything and commits
+        except Exception:
+            db.rollback()
+            run = _load_run(db, run_id)
+            if run is not None:
+                run.status = STATUS_FALLIDO
+                db.commit()
+            raise
+
+        run.status = _run_status(run)
+        db.commit()
+        logger.info("Run %s finalizado con estado %s", run.id, run.status)
+        return _summarize(run)
+    finally:
+        if owns_session:
+            db.close()
+
+
+def run_evaluation(
+    platform: str,
+    files: list[UploadedFile],
+    *,
+    session: Session | None = None,
+    judge: Judge | None = None,
+) -> dict[str, Any]:
+    """Ingest ``files`` and score them under ``platform`` in one call.
+
+    The synchronous path: :func:`ingest_evaluation` followed by :func:`score_run` on
+    the same session. Kept for tests and in-process callers; the HTTP API instead
+    ingests inline and enqueues :func:`score_run` onto the Celery worker.
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        run_id = ingest_evaluation(platform, files, session=db)
+        return score_run(run_id, session=db, judge=judge)
+    finally:
+        if owns_session:
+            db.close()
+
+
+def get_run_summary(run_id: str, *, session: Session | None = None) -> dict[str, Any] | None:
+    """Return a run's current status/summary for polling, or ``None`` if unknown."""
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        run = _load_run(db, run_id)
+        return _summarize(run) if run is not None else None
+    finally:
+        if owns_session:
+            db.close()
+
+
+def retrieve_runs(
+    *,
+    run_id: str | None = None,
+    platform: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    granularity: str = GRANULARITY_SCENARIO,
+    session: Session | None = None,
+) -> list[dict[str, Any]]:
+    """Return full scored details for the runs matching the given filters.
+
+    Every filter is optional and combined with AND:
+
+    * ``run_id`` — narrow to a single run. An unknown/invalid id yields ``[]``.
+    * ``platform`` — exact, case-sensitive match on ``PlatformExecution.platform``
+      (e.g. ``"claude"``, ``"copilot"``, ``"gemini"``).
+    * ``start_date`` / ``end_date`` — an ISO-8601 range (``YYYY-MM-DD`` or a full
+      timestamp) over the **scoring window**: ``started_at >= start_date`` and
+      ``finished_at <= end_date``. Those columns stay ``NULL`` until a worker scores
+      the run, so a bound naturally excludes queued/in-progress runs.
+
+    ``granularity`` controls how deep each run is serialized:
+    ``platform_executions`` → ``scenario_results`` → ``metric_scores`` (see
+    :func:`_serialize_run`). Raises ``ValueError`` for an unknown granularity or an
+    unparseable date. Results are ordered by ``BenchmarkRun.created_at``.
+    """
+    if granularity not in _GRANULARITIES:
+        raise ValueError(
+            f"Granularidad {granularity!r} inválida; use una de {_GRANULARITIES}."
+        )
+    start = _parse_date(start_date, "start_date")
+    end = _parse_date(end_date, "end_date")
+
+    key: uuid.UUID | None = None
+    if run_id is not None:
+        try:
+            key = uuid.UUID(run_id)
+        except ValueError:
+            return []
+
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        stmt = (
+            select(BenchmarkRun)
+            .join(BenchmarkRun.platform_executions)
+            .order_by(BenchmarkRun.created_at)
+            .options(_load_options(granularity))
+        )
+        if key is not None:
+            stmt = stmt.where(BenchmarkRun.id == key)
+        if platform is not None:
+            stmt = stmt.where(PlatformExecution.platform == platform)
+        if start is not None:
+            stmt = stmt.where(PlatformExecution.started_at >= start)
+        if end is not None:
+            stmt = stmt.where(PlatformExecution.finished_at <= end)
+        runs = db.execute(stmt).scalars().unique().all()
+        return [_serialize_run(run, granularity) for run in runs]
+    finally:
+        if owns_session:
+            db.close()
+
+
+def _parse_date(value: str | None, field: str) -> datetime | None:
+    """Parse an ISO-8601 ``value`` (date or timestamp), or ``None`` when unset."""
+    if value is None:
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(
+            f"{field} {value!r} inválido; use un formato ISO-8601 (YYYY-MM-DD)."
+        ) from exc
+
+
+def _load_options(granularity: str):
+    """Eager-load the run tree down to the depth ``granularity`` requires (no N+1)."""
+    scenarios = selectinload(PlatformExecution.scenario_results)
+    if granularity == GRANULARITY_METRIC:
+        scenarios = scenarios.selectinload(ScenarioResult.turns).selectinload(
+            Turn.metric_scores
+        )
+    return selectinload(BenchmarkRun.platform_executions).options(scenarios)
+
+
+def _load_run(db: Session, run_id: str) -> BenchmarkRun | None:
+    """Load a ``BenchmarkRun`` by its string id, or ``None`` for an unknown/invalid id."""
+    try:
+        key = uuid.UUID(run_id)
+    except ValueError:
+        return None
+    return db.get(BenchmarkRun, key)
+
+
+def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:
+    """Write ``upload`` to a temp ``.xlsx`` and parse it into raw messages.
+
+    ``parse_conversation`` needs a filesystem path (openpyxl opens by path), so the
+    in-memory upload is spilled to a short-lived temp file that is always removed.
+    """
+    fd, path = tempfile.mkstemp(suffix=".xlsx")
+    try:
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(upload.content)
+        return parse_conversation(path)
+    finally:
+        os.unlink(path)
+
+
+def _run_status(run: BenchmarkRun) -> str:
+    """Roll scenario statuses up to a run-level status.
+
+    ``fallido`` when nothing scored or every scenario failed, ``completado`` when
+    all completed, otherwise ``parcial``.
+    """
+    statuses = [
+        scenario.status
+        for platform_exec in run.platform_executions
+        for scenario in platform_exec.scenario_results
+    ]
+    if not statuses or all(status == STATUS_FALLIDO for status in statuses):
+        return STATUS_FALLIDO
+    if all(status == STATUS_COMPLETADO for status in statuses):
+        return STATUS_COMPLETADO
+    return STATUS_PARCIAL
+
+
+#: Statuses at which scoring has stopped — nothing more will be scored.
+_TERMINAL_STATUSES = {STATUS_COMPLETADO, STATUS_PARCIAL, STATUS_FALLIDO}
+
+
+def _run_progress(run: BenchmarkRun) -> dict[str, Any]:
+    """Turn-level progress of a run: how many turns have been scored so far.
+
+    A turn counts as done once ``run_turn`` sets its ``turn_score``. While the run is
+    still queued/running the ratio climbs live; once it reaches a terminal status it
+    is pinned to 1.0 — a turn whose every metric failed keeps ``turn_score = None``
+    (skip-metric-continue), so a finished run must not read < 100% forever.
+    """
+    turns = [
+        turn
+        for platform_exec in run.platform_executions
+        for scenario in platform_exec.scenario_results
+        for turn in scenario.turns
+    ]
+    total = len(turns)
+    if run.status in _TERMINAL_STATUSES:
+        done = total
+    else:
+        done = sum(turn.turn_score is not None for turn in turns)
+    return {"done": done, "total": total, "ratio": round(done / total, 4) if total else 0.0}
+
+
+def _summarize(run: BenchmarkRun) -> dict[str, Any]:
+    """Project the scored run into the JSON-serializable API response shape.
+
+    A run may hold one ``PlatformExecution`` per distinct platform (files can carry
+    a per-file platform override), so ``platforms`` is a list.
+    """
+    return {
+        "run_id": str(run.id),
+        "status": run.status,
+        "progress": _run_progress(run),
+        "platforms": [
+            _platform_summary(platform_exec)
+            for platform_exec in run.platform_executions
+        ],
+    }
+
+
+def _platform_summary(platform_exec: PlatformExecution) -> dict[str, Any]:
+    """One platform execution's rollup: average, scenario count, status breakdown."""
+    breakdown: dict[str, int] = {}
+    for scenario in platform_exec.scenario_results:
+        breakdown[scenario.status] = breakdown.get(scenario.status, 0) + 1
+    return {
+        "platform": platform_exec.platform,
+        "average_score": platform_exec.average_score,
+        "scenarios": len(platform_exec.scenario_results),
+        "status_breakdown": breakdown,
+    }
+
+
+def _iso(value: datetime | None) -> str | None:
+    """ISO-8601 string for a timestamp column, or ``None`` when unset."""
+    return value.isoformat() if value is not None else None
+
+
+def _serialize_run(run: BenchmarkRun, granularity: str) -> dict[str, Any]:
+    """Project a run into a JSON-serializable dict, deepened to ``granularity``.
+
+    ``platform_executions`` emits run + per-platform rollups; ``scenario_results``
+    adds each scenario; ``metric_scores`` adds each turn and its metric scores. All
+    rollup values are already-persisted columns — nothing is recomputed here.
+    """
+    return {
+        "run_id": str(run.id),
+        "status": run.status,
+        "created_at": _iso(run.created_at),
+        "progress": _run_progress(run),
+        "platforms": [
+            _serialize_platform(platform_exec, granularity)
+            for platform_exec in run.platform_executions
+        ],
+    }
+
+
+def _serialize_platform(
+    platform_exec: PlatformExecution, granularity: str
+) -> dict[str, Any]:
+    breakdown: dict[str, int] = {}
+    for scenario in platform_exec.scenario_results:
+        breakdown[scenario.status] = breakdown.get(scenario.status, 0) + 1
+    entry: dict[str, Any] = {
+        "platform": platform_exec.platform,
+        "average_score": platform_exec.average_score,
+        "started_at": _iso(platform_exec.started_at),
+        "finished_at": _iso(platform_exec.finished_at),
+        "scenarios": len(platform_exec.scenario_results),
+        "status_breakdown": breakdown,
+    }
+    if granularity in (GRANULARITY_SCENARIO, GRANULARITY_METRIC):
+        entry["scenario_results"] = [
+            _serialize_scenario(scenario, granularity)
+            for scenario in platform_exec.scenario_results
+        ]
+    return entry
+
+
+def _serialize_scenario(
+    scenario: ScenarioResult, granularity: str
+) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "scenario_id": scenario.scenario_id,
+        "use_case": scenario.use_case,
+        "status": scenario.status,
+        "average_score": scenario.average_score,
+    }
+    if granularity == GRANULARITY_METRIC:
+        entry["turns"] = [_serialize_turn(turn) for turn in scenario.turns]
+    return entry
+
+
+def _serialize_turn(turn: Turn) -> dict[str, Any]:
+    return {
+        "turn_number": turn.turn_number,
+        "turn_score": turn.turn_score,
+        "metric_scores": [
+            {
+                "metric_name": score.metric_name,
+                "score": score.score,
+                "justification": score.justification,
+                "judge_model": score.judge_model,
+                "rubric_version": score.rubric_version,
+            }
+            for score in turn.metric_scores
+        ],
+    }
