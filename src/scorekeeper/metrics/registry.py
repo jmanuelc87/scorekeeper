@@ -20,9 +20,14 @@ The decorator optionally carries the scenarios a metric applies to::
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from typing import overload
+from typing import TypeVar, overload
 
 from scorekeeper.metrics.base import Metric
+
+# Preserve the concrete metric subclass through the decorator so callers (and type
+# checkers) still see class-specific attributes, e.g. FaithfulnessRagas.bulk_model,
+# rather than an erased ``type[Metric]``.
+_M = TypeVar("_M", bound=Metric)
 
 
 class MetricRegistry:
@@ -62,27 +67,27 @@ class MetricRegistry:
 
 
 @overload
-def register(metric_cls: type[Metric]) -> type[Metric]: ...
+def register(metric_cls: type[_M]) -> type[_M]: ...
 
 
 @overload
 def register(
     *, scenarios: Iterable[str] | None = ...
-) -> Callable[[type[Metric]], type[Metric]]: ...
+) -> Callable[[type[_M]], type[_M]]: ...
 
 
 def register(
-    metric_cls: type[Metric] | None = None,
+    metric_cls: type[_M] | None = None,
     *,
     scenarios: Iterable[str] | None = None,
-) -> type[Metric] | Callable[[type[Metric]], type[Metric]]:
+) -> type[_M] | Callable[[type[_M]], type[_M]]:
     """Register a metric class, optionally tagging the scenarios it applies to.
 
     Usable bare (``@register``) or parameterized (``@register(scenarios=[...])``).
     Scenario tags passed here override a class-level ``scenarios`` attribute.
     """
 
-    def wrap(cls: type[Metric]) -> type[Metric]:
+    def wrap(cls: type[_M]) -> type[_M]:
         if scenarios is not None:
             cls.scenarios = tuple(scenarios)
         MetricRegistry.add(cls)

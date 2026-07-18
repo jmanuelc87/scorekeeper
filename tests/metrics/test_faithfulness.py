@@ -14,6 +14,7 @@ from scorekeeper.metrics.base import TurnView
 from scorekeeper.metrics.catalog.faithfulness import (
     FaithfulnessDeepeval,
     FaithfulnessRagas,
+    RagasEntailment,
     Truths,
 )
 from scorekeeper.metrics.judge import JudgeVerdict
@@ -21,17 +22,21 @@ from scorekeeper.metrics.judge import JudgeVerdict
 
 # --- RAGAS --------------------------------------------------------------------
 
+# The RAGAS verdict is a Haiku→Opus cascade run through judge.structured():
+# each claim gets one RagasEntailment from the bulk model, and only a
+# low-confidence verdict triggers a second (audit) structured call.
+
 
 def test_ragas_all_supported_is_one(make_judge) -> None:
-    # Two sentences → two claims, both entailed by the context.
+    # Two sentences → two claims, both entailed with high confidence (no escalation).
     turn = TurnView(
         prompt="¿Cómo reinicio el router?",
         response="El router se reinicia en 10s. El LED parpadea.",
     )
     judge = make_judge(
-        verdicts=[
-            JudgeVerdict(score=1, justification="Se deduce", model="m"),
-            JudgeVerdict(score=1, justification="Se deduce", model="m"),
+        extractions=[
+            RagasEntailment(entailed=True, confidence=1.0, justification="Se deduce"),
+            RagasEntailment(entailed=True, confidence=1.0, justification="Se deduce"),
         ],
     )
     result = FaithfulnessRagas().evaluate(turn, judge)
@@ -39,7 +44,10 @@ def test_ragas_all_supported_is_one(make_judge) -> None:
     assert result.metric_name == "faithfulness_ragas"
     assert result.raw_score == 1.0
     assert result.normalized_score == 1.0
-    assert result.judge_model == "m"
+    # One bulk verdict per claim, all confident → only the bulk model ran.
+    assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
+    assert judge.models == [FaithfulnessRagas.bulk_model, FaithfulnessRagas.bulk_model]
+    assert result.judge_model == FaithfulnessRagas.bulk_model
 
 
 def test_ragas_mixed_is_fraction_supported(make_judge) -> None:
@@ -48,22 +56,55 @@ def test_ragas_mixed_is_fraction_supported(make_judge) -> None:
         response="Afirmación fundada aquí. Afirmación inventada aquí.",
     )
     judge = make_judge(
-        verdicts=[
-            JudgeVerdict(score=1, justification="Se deduce del contexto", model="m"),
-            JudgeVerdict(score=0, justification="No aparece en el contexto", model="m"),
+        extractions=[
+            RagasEntailment(
+                entailed=True, confidence=0.9, justification="Se deduce del contexto"
+            ),
+            RagasEntailment(
+                entailed=False, confidence=0.9, justification="No aparece en el contexto"
+            ),
         ],
     )
     result = FaithfulnessRagas().evaluate(turn, judge)
 
     # supported / n = 1 / 2
     assert result.raw_score == 0.5
-    # Claims come from syntok (no extraction call); one verify per sentence.
-    assert [kind for kind, _ in judge.calls] == ["score", "score"]
+    # Claims come from syntok (no extraction call); one confident bulk verdict each.
+    assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
     # Steps flattened into the single Spanish justification.
     assert "### Extracción de afirmaciones de la respuesta" in result.justification
     assert "### Verificación: Afirmación fundada aquí." in result.justification
     assert "### Verificación: Afirmación inventada aquí." in result.justification
     assert len(result.trace) == 3
+
+
+def test_ragas_low_confidence_escalates_to_audit(make_judge) -> None:
+    # One claim: the bulk model is unsure (confidence below threshold), so the claim
+    # is re-judged by the audit model and the audit verdict wins.
+    turn = TurnView(
+        prompt="¿Cómo reinicio el router?",
+        response="El router se reinicia en 10s.",
+    )
+    judge = make_judge(
+        extractions=[
+            RagasEntailment(entailed=False, confidence=0.3, justification="Dudoso"),
+            RagasEntailment(entailed=True, confidence=1.0, justification="Confirmado"),
+        ],
+    )
+    result = FaithfulnessRagas().evaluate(turn, judge)
+
+    # Audit verdict (entailed) wins → supported / n = 1 / 1.
+    assert result.raw_score == 1.0
+    # Two structured calls for the single claim: bulk (Haiku) then audit (Opus).
+    assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
+    assert judge.models == [FaithfulnessRagas.bulk_model, FaithfulnessRagas.audit_model]
+    assert result.judge_model == (
+        f"{FaithfulnessRagas.bulk_model} → {FaithfulnessRagas.audit_model}"
+    )
+    # The escalation is flagged, and the surfaced rationale is the audit model's.
+    assert f"(escalado a {FaithfulnessRagas.audit_model})" in result.justification
+    assert "Confirmado" in result.justification
+    assert len(result.trace) == 2  # 1 claims step + 1 verification step
 
 
 def test_ragas_no_statements_is_one(make_judge) -> None:
@@ -154,3 +195,28 @@ def test_deepeval_no_claims_skips_truths(make_judge) -> None:
     # No claims → neither truths extraction nor any verdict call is made.
     assert [kind for kind, _ in judge.calls] == []
     assert len(result.trace) == 1
+
+
+def test_deepeval_pins_models_per_call(make_judge) -> None:
+    # The two live LLM calls are pinned per the impact analysis: truths extraction on
+    # Sonnet, each per-claim verdict on Opus — regardless of the judge's own default.
+    turn = TurnView(
+        prompt="¿Cómo reinicio el router?",
+        response="Concuerda con el manual. Contradice el manual.",
+    )
+    verdict_model = FaithfulnessDeepeval.verdict_model
+    truths_model = FaithfulnessDeepeval.truths_model
+    judge = make_judge(
+        extractions=[Truths(truths=["Verdad 1"], summary="Una verdad")],
+        verdicts=[
+            JudgeVerdict(score=1, justification="Concuerda", model=verdict_model),
+            JudgeVerdict(score=0, justification="Contradice", model=verdict_model),
+        ],
+        model="claude-opus-4-8",  # the judge default, deliberately different from pins
+    )
+    FaithfulnessDeepeval().evaluate(turn, judge)
+
+    # Call order is truths extraction (structured), then one verdict (score) per claim;
+    # models are the explicit per-call pins, not judge.model_for's default.
+    assert [kind for kind, _ in judge.calls] == ["structured", "score", "score"]
+    assert judge.models == [truths_model, verdict_model, verdict_model]

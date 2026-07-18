@@ -249,6 +249,28 @@ def test_anthropic_routes_model_per_step(turn: TurnView) -> None:
     assert default.model == "claude-opus-4-8"
 
 
+def test_anthropic_thinking_is_per_model(turn: TurnView) -> None:
+    # Adaptive thinking is a 4.6+ feature: Opus/Sonnet calls send it, but Haiku 4.5
+    # does not support it and would 400, so those calls omit ``thinking`` entirely.
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-opus-4-8")
+    assert client.messages.calls[-1]["thinking"] == {"type": "adaptive"}
+
+    judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-sonnet-5")
+    assert client.messages.calls[-1]["thinking"] == {"type": "adaptive"}
+
+    # Haiku (bulk tier) via both seam methods → no thinking kwarg at all.
+    judge.score(rubric="s", turn=turn, scale=Boolean(), model="claude-haiku-4-5-20251001")
+    assert "thinking" not in client.messages.calls[-1]
+
+    judge.structured(
+        instruction="x", turn=turn, schema=Claims, model="claude-haiku-4-5-20251001"
+    )
+    assert "thinking" not in client.messages.calls[-1]
+
+
 def test_openai_routes_model_per_step(turn: TurnView) -> None:
     client = FakeOpenAIClient(_ScoreResponse(score=1.0, justification="ok"))
     judge = OpenAIJudge(
@@ -521,12 +543,12 @@ def test_make_judge_builds_step_models_from_settings(
             anthropic_api_key="sk-a",
             anthropic_judge_model="claude-strong",
             judge_extract_model="claude-cheap",
-            judge_verify_model="claude-cheap",
             # judge_score_model left unset → SCORE uses the default judge model.
         )
     )
     step_models = built["step_models"]
     assert step_models.for_step(JudgeStep.EXTRACT) == "claude-cheap"
-    assert step_models.for_step(JudgeStep.VERIFY) == "claude-cheap"
+    # No VERIFY config knob → VERIFY falls back to the default judge model.
+    assert step_models.for_step(JudgeStep.VERIFY) == "claude-strong"
     assert step_models.for_step(JudgeStep.SCORE) == "claude-strong"
     assert step_models.for_step(None) == "claude-strong"
