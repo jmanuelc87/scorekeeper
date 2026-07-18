@@ -13,11 +13,16 @@ from pydantic import BaseModel
 
 from scorekeeper.config import Settings
 from scorekeeper.metrics.base import TurnView
-from scorekeeper.metrics.judge import JudgeVerdict
+from scorekeeper.metrics.judge import JudgeStep, JudgeVerdict
 from scorekeeper.metrics import judges as judges_pkg
-from scorekeeper.metrics.judges import AnthropicJudge, OpenAIJudge, make_judge
+from scorekeeper.metrics.judges import (
+    AnthropicJudge,
+    OpenAIJudge,
+    make_judge,
+)
 from scorekeeper.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
+    StepModels,
     _ScoreResponse,
     clamp,
     render_prompt,
@@ -153,14 +158,14 @@ def test_clamp_bounds_and_boolean_rounding() -> None:
 
 def test_anthropic_score_returns_verdict_with_model(turn: TurnView) -> None:
     client = FakeAnthropicClient(_ScoreResponse(score=4.0, justification="Correcta y clara."))
-    judge = AnthropicJudge(model="claude-test", client=client)
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
 
     verdict = judge.score(rubric="Evalúa (1-5): {prompt} {response}", turn=turn, scale=Likert())
 
     assert isinstance(verdict, JudgeVerdict)
     assert verdict.score == 4.0
     assert verdict.justification == "Correcta y clara."
-    assert verdict.model == "claude-test"
+    assert verdict.model == "claude-opus-4-8"
     # The rendered rubric + Spanish scale instruction reach the model.
     sent = client.messages.calls[0]["messages"][0]["content"]
     assert "Asigna una puntuación entre 1 y 5." in sent
@@ -168,7 +173,7 @@ def test_anthropic_score_returns_verdict_with_model(turn: TurnView) -> None:
 
 def test_anthropic_score_clamps_out_of_range(turn: TurnView) -> None:
     client = FakeAnthropicClient(_ScoreResponse(score=9.0, justification="Excelente."))
-    judge = AnthropicJudge(model="claude-test", client=client)
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
 
     verdict = judge.score(rubric="Evalúa", turn=turn, scale=Likert())
     assert verdict.score == 5.0
@@ -176,14 +181,14 @@ def test_anthropic_score_clamps_out_of_range(turn: TurnView) -> None:
 
 def test_anthropic_uses_default_system_prompt_and_custom_override(turn: TurnView) -> None:
     client = FakeAnthropicClient(_ScoreResponse(score=3.0, justification="ok"))
-    AnthropicJudge(model="claude-test", client=client).score(
+    AnthropicJudge(model="claude-opus-4-8", client=client).score(
         rubric="Evalúa", turn=turn, scale=Likert()
     )
     assert client.messages.calls[0]["system"] == DEFAULT_SYSTEM_PROMPT
 
     custom = "Eres un juez estricto. Responde en español."
     client2 = FakeAnthropicClient(_ScoreResponse(score=3.0, justification="ok"))
-    AnthropicJudge(model="claude-test", client=client2, system_prompt=custom).score(
+    AnthropicJudge(model="claude-opus-4-8", client=client2, system_prompt=custom).score(
         rubric="Evalúa", turn=turn, scale=Likert()
     )
     assert client2.messages.calls[0]["system"] == custom
@@ -192,7 +197,7 @@ def test_anthropic_uses_default_system_prompt_and_custom_override(turn: TurnView
 def test_openai_custom_system_prompt(turn: TurnView) -> None:
     custom = "Eres un juez estricto. Responde en español."
     client = FakeOpenAIClient(_ScoreResponse(score=1.0, justification="ok"))
-    OpenAIJudge(model="gpt-test", client=client, system_prompt=custom).score(
+    OpenAIJudge(model="gpt-5.6-sol", client=client, system_prompt=custom).score(
         rubric="verifica", turn=turn, scale=Boolean()
     )
     messages = client.chat.completions.calls[0]["messages"]
@@ -202,7 +207,7 @@ def test_openai_custom_system_prompt(turn: TurnView) -> None:
 def test_anthropic_structured_returns_schema(turn: TurnView) -> None:
     extraction = Claims(claims=["a", "b"], summary="resumen")
     client = FakeAnthropicClient(extraction)
-    judge = AnthropicJudge(model="claude-test", client=client)
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
 
     result = judge.structured(instruction="extrae afirmaciones", turn=turn, schema=Claims)
     assert isinstance(result, Claims)
@@ -210,23 +215,92 @@ def test_anthropic_structured_returns_schema(turn: TurnView) -> None:
     assert client.messages.calls[0]["output_format"] is Claims
 
 
+# --- Per-step model routing ---------------------------------------------------
+
+
+def test_anthropic_routes_model_per_step(turn: TurnView) -> None:
+    # EXTRACT and VERIFY get their own models; the unmapped SCORE step and a None
+    # step fall back to the judge's default model, and the returned verdict/model
+    # reflects the model actually used.
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = AnthropicJudge(
+        model="claude-opus-4-8",
+        client=client,
+        step_models=StepModels(
+            "claude-opus-4-8",
+            {
+                JudgeStep.EXTRACT: "claude-haiku-4-5-20251001",
+                JudgeStep.VERIFY: "claude-sonnet-5",
+            },
+        ),
+    )
+
+    verify = judge.score(rubric="v", turn=turn, scale=Boolean(), step=JudgeStep.VERIFY)
+    assert verify.model == "claude-sonnet-5"
+    assert client.messages.calls[-1]["model"] == "claude-sonnet-5"
+
+    judge.structured(instruction="x", turn=turn, schema=Claims, step=JudgeStep.EXTRACT)
+    assert client.messages.calls[-1]["model"] == "claude-haiku-4-5-20251001"
+
+    # SCORE is unmapped, and step=None both resolve to the default model.
+    scored = judge.score(rubric="s", turn=turn, scale=Unit(), step=JudgeStep.SCORE)
+    assert scored.model == "claude-opus-4-8"
+    default = judge.score(rubric="s", turn=turn, scale=Unit())
+    assert default.model == "claude-opus-4-8"
+
+
+def test_openai_routes_model_per_step(turn: TurnView) -> None:
+    client = FakeOpenAIClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = OpenAIJudge(
+        model="gpt-5.6-sol",
+        client=client,
+        step_models=StepModels("gpt-5.6-sol", {JudgeStep.VERIFY: "gpt-4o-mini"}),
+    )
+
+    verify = judge.score(rubric="v", turn=turn, scale=Boolean(), step=JudgeStep.VERIFY)
+    assert verify.model == "gpt-4o-mini"
+    assert client.chat.completions.calls[-1]["model"] == "gpt-4o-mini"
+
+    default = judge.score(rubric="s", turn=turn, scale=Unit(), step=JudgeStep.SCORE)
+    assert default.model == "gpt-5.6-sol"
+
+
+def test_judge_without_step_models_uses_single_model(turn: TurnView) -> None:
+    # No step_models → every step resolves to ``model`` (back-compat).
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    for step in (None, JudgeStep.EXTRACT, JudgeStep.VERIFY, JudgeStep.SCORE):
+        verdict = judge.score(rubric="r", turn=turn, scale=Boolean(), step=step)
+        assert verdict.model == "claude-opus-4-8"
+
+
+def test_step_models_resolution() -> None:
+    models = StepModels("base", {JudgeStep.EXTRACT: "cheap", JudgeStep.VERIFY: ""})
+    assert models.for_step(JudgeStep.EXTRACT) == "cheap"
+    assert models.for_step(JudgeStep.VERIFY) == "base"  # falsy override ignored
+    assert models.for_step(JudgeStep.SCORE) == "base"  # unmapped
+    assert models.for_step(None) == "base"
+    assert models.for_step("extract") == "cheap"  # accepts the raw value too
+
+
 # --- OpenAIJudge --------------------------------------------------------------
 
 
 def test_openai_score_returns_verdict_and_clamps(turn: TurnView) -> None:
     client = FakeOpenAIClient(_ScoreResponse(score=1.0, justification="Cumple el requisito."))
-    judge = OpenAIJudge(model="gpt-test", client=client)
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
 
     verdict = judge.score(rubric="verifica", turn=turn, scale=Boolean())
 
     assert verdict.score == 1.0
     assert verdict.justification == "Cumple el requisito."
-    assert verdict.model == "gpt-test"
+    assert verdict.model == "gpt-5.6-sol"
 
 
 def test_openai_structured_returns_schema(turn: TurnView) -> None:
     client = FakeOpenAIClient(Claims(claims=["x"], summary="s"))
-    judge = OpenAIJudge(model="gpt-test", client=client)
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
 
     result = judge.structured(instruction="extrae", turn=turn, schema=Claims)
     assert isinstance(result, Claims)
@@ -235,7 +309,7 @@ def test_openai_structured_returns_schema(turn: TurnView) -> None:
 
 def test_openai_embed_returns_vectors_in_order() -> None:
     client = FakeOpenAIClient(None, embeddings=[[1.0, 0.0], [0.0, 1.0]])
-    judge = OpenAIJudge(model="gpt-test", client=client, embedding_model="emb-test")
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client, embedding_model="emb-test")
 
     vectors = judge.embed(texts=["a", "b"])
 
@@ -247,7 +321,7 @@ def test_openai_embed_returns_vectors_in_order() -> None:
 
 def test_openai_embed_empty_skips_call() -> None:
     client = FakeOpenAIClient(None, embeddings=[[1.0]])
-    judge = OpenAIJudge(model="gpt-test", client=client)
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
 
     assert judge.embed(texts=[]) == []
     assert client.embeddings.calls == []
@@ -255,19 +329,102 @@ def test_openai_embed_empty_skips_call() -> None:
 
 def test_anthropic_embed_delegates_to_embedder(turn: TurnView) -> None:
     embed_client = FakeOpenAIClient(None, embeddings=[[0.5, 0.5]])
-    embedder = OpenAIJudge(model="gpt-test", client=embed_client)
+    embedder = OpenAIJudge(model="gpt-5.6-sol", client=embed_client)
     client = FakeAnthropicClient(_ScoreResponse(score=3.0, justification="ok"))
-    judge = AnthropicJudge(model="claude-test", client=client, embedder=embedder)
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client, embedder=embedder)
 
     assert judge.embed(texts=["a"]) == [[0.5, 0.5]]
 
 
 def test_anthropic_embed_without_backend_raises(turn: TurnView) -> None:
     client = FakeAnthropicClient(_ScoreResponse(score=3.0, justification="ok"))
-    judge = AnthropicJudge(model="claude-test", client=client)
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
 
     with pytest.raises(NotImplementedError, match="embeddings"):
         judge.embed(texts=["a"])
+
+
+# --- Explicit model selection + provider validation ---------------------------
+
+
+def test_explicit_model_overrides_step_routing(turn: TurnView) -> None:
+    # An explicit ``model=`` is used verbatim and wins over the step router.
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = AnthropicJudge(
+        model="claude-opus-4-8",
+        client=client,
+        step_models=StepModels(
+            "claude-opus-4-8", {JudgeStep.VERIFY: "claude-sonnet-5"}
+        ),
+    )
+
+    verdict = judge.score(
+        rubric="v",
+        turn=turn,
+        scale=Boolean(),
+        step=JudgeStep.VERIFY,
+        model="claude-haiku-4-5-20251001",
+    )
+    assert verdict.model == "claude-haiku-4-5-20251001"
+    assert client.messages.calls[-1]["model"] == "claude-haiku-4-5-20251001"
+
+
+def test_anthropic_rejects_foreign_model(turn: TurnView) -> None:
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(ValueError, match="no pertenece"):
+        judge.score(rubric="r", turn=turn, scale=Boolean(), model="gpt-5.6-sol")
+
+
+def test_openai_rejects_foreign_model(turn: TurnView) -> None:
+    client = FakeOpenAIClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
+
+    with pytest.raises(ValueError, match="no pertenece"):
+        judge.structured(
+            instruction="x", turn=turn, schema=Claims, model="claude-opus-4-8"
+        )
+
+
+def test_model_for_resolves_and_validates(turn: TurnView) -> None:
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = AnthropicJudge(
+        model="claude-opus-4-8",
+        client=client,
+        step_models=StepModels(
+            "claude-opus-4-8", {JudgeStep.EXTRACT: "claude-haiku-4-5-20251001"}
+        ),
+    )
+
+    assert judge.model_for(JudgeStep.EXTRACT) == "claude-haiku-4-5-20251001"
+    assert judge.model_for(JudgeStep.SCORE) == "claude-opus-4-8"
+    assert judge.model_for(None) == "claude-opus-4-8"
+
+    # A step override pointing at another provider's model surfaces as a per-call
+    # ValueError (the global-settings leakage becomes visible at point of use).
+    leaked = AnthropicJudge(
+        model="claude-opus-4-8",
+        client=client,
+        step_models=StepModels(
+            "claude-opus-4-8", {JudgeStep.VERIFY: "gpt-5.6-sol"}
+        ),
+    )
+    with pytest.raises(ValueError, match="no pertenece"):
+        leaked.model_for(JudgeStep.VERIFY)
+
+
+def test_openai_embed_model_override_validates(turn: TurnView) -> None:
+    client = FakeOpenAIClient(None, embeddings=[[1.0]])
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
+
+    # An explicit embedding model overrides the default and is passed to the SDK.
+    judge.embed(texts=["a"], model="text-embedding-3-large")
+    assert client.embeddings.calls[-1]["model"] == "text-embedding-3-large"
+
+    # A chat model is not a valid embedding model → Spanish ValueError.
+    with pytest.raises(ValueError, match="no pertenece"):
+        judge.embed(texts=["a"], model="gpt-5.6-sol")
 
 
 # --- Factory ------------------------------------------------------------------
@@ -345,3 +502,31 @@ def test_make_judge_missing_key_raises() -> None:
 def test_make_judge_unknown_provider_raises() -> None:
     with pytest.raises(ValueError, match="desconocido"):
         make_judge(Settings(judge_provider="gemini"))
+
+
+def test_make_judge_builds_step_models_from_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: dict = {}
+
+    class DummyAnthropic:
+        def __init__(self, **kwargs) -> None:
+            built.update(**kwargs)
+
+    monkeypatch.setattr(judges_pkg, "AnthropicJudge", DummyAnthropic)
+
+    make_judge(
+        Settings(
+            judge_provider="anthropic",
+            anthropic_api_key="sk-a",
+            anthropic_judge_model="claude-strong",
+            judge_extract_model="claude-cheap",
+            judge_verify_model="claude-cheap",
+            # judge_score_model left unset → SCORE uses the default judge model.
+        )
+    )
+    step_models = built["step_models"]
+    assert step_models.for_step(JudgeStep.EXTRACT) == "claude-cheap"
+    assert step_models.for_step(JudgeStep.VERIFY) == "claude-cheap"
+    assert step_models.for_step(JudgeStep.SCORE) == "claude-strong"
+    assert step_models.for_step(None) == "claude-strong"

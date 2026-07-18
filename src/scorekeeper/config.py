@@ -25,6 +25,14 @@ class Settings(BaseSettings):
     anthropic_judge_model: str = "claude-opus-4-8"
     openai_judge_model: str = "gpt-5.6-sol"
     judge_max_tokens: int = 16384
+    # Per-step model overrides. Metrics label each judge call with a JudgeStep
+    # (extract / verify / score); these route that step to a specific model of the
+    # active provider so bulk extraction and per-claim verification can run on a
+    # cheaper/faster model than the decisive rubric scoring. Unset (None) → the
+    # provider's default judge model above (see scorekeeper.metrics.judges).
+    judge_extract_model: str | None = None
+    judge_verify_model: str | None = None
+    judge_score_model: str | None = None
     # Embeddings for similarity-based metrics (e.g. answer relevance). Anthropic
     # offers no embedding endpoint, so embeddings always run through OpenAI; when
     # the judge provider is Anthropic, an OpenAI-backed embedder is attached iff

@@ -40,7 +40,7 @@ from scorekeeper.metrics.base import (
 )
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.catalog.hallucination import split_context_docs
-from scorekeeper.metrics.judge import Judge
+from scorekeeper.metrics.judge import Judge, JudgeStep
 from scorekeeper.metrics.registry import register
 from scorekeeper.metrics.scale import Unit
 
@@ -117,7 +117,7 @@ class ContextualPrecision(MultiStepMetric):
         trace: list[StepTrace] = []
         verdicts: list[int] = []
         node_view = TurnView(prompt=turn.prompt, response="")
-        judge_model = getattr(judge, "model", None)
+        judge_model = judge.model_for(JudgeStep.EXTRACT)
         for k, node in enumerate(nodes, start=1):
             verdict = judge.structured(
                 instruction=VERDICT_PROMPT.format(
@@ -125,6 +125,8 @@ class ContextualPrecision(MultiStepMetric):
                 ),
                 turn=node_view,
                 schema=RelevanceVerdict,
+                step=JudgeStep.EXTRACT,
+                model=judge_model,
             )
             r_k = 1 if verdict.relevant else 0
             verdicts.append(r_k)

@@ -35,7 +35,7 @@ from scorekeeper.metrics.base import (
     TurnView,
 )
 from scorekeeper.metrics.category import MetricCategory
-from scorekeeper.metrics.judge import Judge
+from scorekeeper.metrics.judge import Judge, JudgeStep
 from scorekeeper.metrics.registry import register
 from scorekeeper.metrics.scale import Inverted, Unit
 
@@ -162,11 +162,14 @@ class Hallucination(MultiStepMetric):
 
         trace: list[StepTrace] = []
         contradicted = 0
+        judge_model = judge.model_for(JudgeStep.EXTRACT)
         for i, doc in enumerate(docs, start=1):
             judgment = judge.structured(
                 instruction=NLI_PROMPT.format(documento=doc, response=turn.response),
                 turn=turn,
                 schema=NLIJudgment,
+                step=JudgeStep.EXTRACT,
+                model=judge_model,
             )
             if judgment.label == NLILabel.CONTRADICTION:
                 contradicted += 1
@@ -192,6 +195,7 @@ class Hallucination(MultiStepMetric):
             raw_score=raw,
             normalized_score=self.normalize(raw),
             justification=self.render_justification(trace),
+            judge_model=judge_model,
             rubric_version=self.rubric_version,
             trace=trace,
         )

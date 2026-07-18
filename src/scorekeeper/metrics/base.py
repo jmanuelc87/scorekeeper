@@ -22,7 +22,7 @@ from typing import ClassVar
 from pydantic import BaseModel
 
 from scorekeeper.metrics.category import MetricCategory
-from scorekeeper.metrics.judge import Judge
+from scorekeeper.metrics.judge import Judge, JudgeStep
 from scorekeeper.metrics.scale import Scale
 
 
@@ -97,6 +97,8 @@ class SingleRubricMetric(Metric):
             turn=turn,
             scale=self.scale,
             rubric_version=self.rubric_version,
+            step=JudgeStep.SCORE,
+            model=judge.model_for(JudgeStep.SCORE),
         )
         return MetricResult(
             metric_name=self.name,

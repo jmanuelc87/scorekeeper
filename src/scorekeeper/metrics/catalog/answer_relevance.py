@@ -19,7 +19,7 @@ from pydantic import BaseModel
 
 from scorekeeper.metrics.base import MetricResult, MultiStepMetric, StepTrace, TurnView
 from scorekeeper.metrics.category import MetricCategory
-from scorekeeper.metrics.judge import Judge
+from scorekeeper.metrics.judge import Judge, JudgeStep
 from scorekeeper.metrics.registry import register
 from scorekeeper.metrics.scale import Unit
 
@@ -69,12 +69,15 @@ class AnswerRelevance(MultiStepMetric):
         # is isolated in its own TurnView so the judge never sees the original
         # question and cannot copy it when generating.
         answer_view = TurnView(prompt="", response=turn.response)
+        judge_model = judge.model_for(JudgeStep.EXTRACT)
         questions: list[str] = []
         for _ in range(self.n_questions):
             generated = judge.structured(
                 instruction=GENERATE_QUESTION,
                 turn=answer_view,
                 schema=GeneratedQuestion,
+                step=JudgeStep.EXTRACT,
+                model=judge_model,
             )
             question = generated.question.strip()
             if question:
@@ -98,7 +101,7 @@ class AnswerRelevance(MultiStepMetric):
                 raw_score=0.0,
                 normalized_score=self.normalize(0.0),
                 justification=self.render_justification(trace),
-                judge_model=getattr(judge, "model", None),
+                judge_model=judge_model,
                 rubric_version=self.rubric_version,
                 trace=trace,
             )
