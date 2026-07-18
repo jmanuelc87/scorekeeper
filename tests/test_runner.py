@@ -59,14 +59,14 @@ class RecordingJudge:
         # call ``score`` at once — guard the record. (Turns stay sequential.)
         self._lock = threading.Lock()
 
-    def score(self, *, rubric, turn, scale, rubric_version=None) -> JudgeVerdict:
+    def score(self, *, rubric, turn, scale, rubric_version=None, step=None) -> JudgeVerdict:
         with self._lock:
             self.seen_turns.append(turn)
         if self.fail_on_prompt is not None and turn.prompt == self.fail_on_prompt:
             raise RuntimeError("fallo del juez")
         return JudgeVerdict(score=self.score_value, justification="razón", model=self.model)
 
-    def structured(self, *, instruction, turn, schema):  # pragma: no cover - unused here
+    def structured(self, *, instruction, turn, schema, step=None):  # pragma: no cover - unused here
         raise NotImplementedError
 
     def embed(self, *, texts):  # pragma: no cover - unused here

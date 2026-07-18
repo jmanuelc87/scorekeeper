@@ -29,6 +29,7 @@ def test_turn_score_empty_is_none() -> None:
 
 
 def test_average_ignores_none() -> None:
-    assert average([0.5, 1.0, None]) == 0.75
+    # None is dropped; 1.0 is an excluded outlier, leaving only [0.5].
+    assert average([0.5, 1.0, None]) == 0.5
     assert average([None]) is None
     assert average([]) is None

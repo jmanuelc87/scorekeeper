@@ -57,10 +57,10 @@ class RecordingJudge:
         self.score_value = score_value
         self.model = model
 
-    def score(self, *, rubric, turn, scale, rubric_version=None) -> JudgeVerdict:
+    def score(self, *, rubric, turn, scale, rubric_version=None, step=None) -> JudgeVerdict:
         return JudgeVerdict(score=self.score_value, justification="razón", model=self.model)
 
-    def structured(self, *, instruction, turn, schema):  # pragma: no cover - unused
+    def structured(self, *, instruction, turn, schema, step=None):  # pragma: no cover - unused
         raise NotImplementedError
 
     def embed(self, *, texts):  # pragma: no cover - unused
