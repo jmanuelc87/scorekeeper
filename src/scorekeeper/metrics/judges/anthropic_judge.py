@@ -36,6 +36,11 @@ DEFAULT_MODEL = "claude-opus-4-8"
 KNOWN_MODELS = frozenset(
     {"claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"}
 )
+# Models that support adaptive thinking (a 4.6+ feature). Others — e.g.
+# Haiku 4.5 — reject ``thinking={"type": "adaptive"}`` with a 400, so those calls
+# omit the ``thinking`` parameter entirely (no thinking). Keep in sync as new
+# adaptive-capable models are added to KNOWN_MODELS.
+ADAPTIVE_THINKING_MODELS = frozenset({"claude-opus-4-8", "claude-sonnet-5"})
 
 
 class AnthropicJudge:
@@ -88,6 +93,19 @@ class AnthropicJudge:
             return owned_model(model, owns=self._owns, provider=PROVIDER)
         return self.model_for(step)
 
+    @staticmethod
+    def _thinking_kwargs(model: str) -> dict[str, Any]:
+        """Per-model ``thinking`` for ``messages.parse``.
+
+        Adaptive-thinking models get ``thinking={"type": "adaptive"}`` so they
+        reason before committing to a score; models that don't support it (e.g.
+        Haiku 4.5, used as the cheap bulk tier) omit ``thinking`` entirely, since
+        sending adaptive thinking to them returns a 400.
+        """
+        if model in ADAPTIVE_THINKING_MODELS:
+            return {"thinking": {"type": "adaptive"}}
+        return {}
+
     def score(
         self,
         *,
@@ -104,7 +122,7 @@ class AnthropicJudge:
         message = self._client.messages.parse(
             model=model,
             max_tokens=self.max_tokens,
-            thinking={"type": "adaptive"},
+            **self._thinking_kwargs(model),
             system=self.system_prompt,
             messages=[{"role": "user", "content": content}],
             output_format=_ScoreResponse,
@@ -125,10 +143,11 @@ class AnthropicJudge:
         step: JudgeStep | None = None,
         model: str | None = None,
     ) -> T:
+        model = self._resolve(step, model)
         message = self._client.messages.parse(
-            model=self._resolve(step, model),
+            model=model,
             max_tokens=self.max_tokens,
-            thinking={"type": "adaptive"},
+            **self._thinking_kwargs(model),
             system=self.system_prompt,
             messages=[{"role": "user", "content": render_prompt(instruction, turn)}],
             output_format=schema,

@@ -43,6 +43,9 @@ class StubJudge:
         # The JudgeStep each score()/structured() call was labeled with, in order,
         # so tests can assert metrics route work to the right per-step model.
         self.steps: list[JudgeStep | None] = []
+        # The explicit model= each score()/structured() call passed, in order, so
+        # tests can assert metrics pin specific models (e.g. faithfulness).
+        self.models: list[str | None] = []
 
     def model_for(self, step=None) -> str | None:
         # The stub has no provider allow-list; it just echoes its configured model,
@@ -54,11 +57,13 @@ class StubJudge:
     ) -> JudgeVerdict:
         self.calls.append(("score", rubric_version))
         self.steps.append(step)
+        self.models.append(model)
         return self._verdicts.pop(0)
 
     def structured(self, *, instruction, turn, schema, step=None, model=None):
         self.calls.append(("structured", schema.__name__))
         self.steps.append(step)
+        self.models.append(model)
         return self._extractions.pop(0)
 
     def embed(self, *, texts, model=None):

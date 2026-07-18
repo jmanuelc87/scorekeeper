@@ -30,11 +30,13 @@ def _step_models(settings: Settings, default_model: str) -> StepModels:
     values), so with none configured every step routes to the provider's default
     judge model — identical to the previous single-model behavior.
     """
+    # No VERIFY override: no metric routes a model through the VERIFY step via config
+    # (faithfulness pins its own), so exposing one would be a no-op. StepModels still
+    # supports VERIFY as a role — this only omits the settings-driven knob for it.
     return StepModels(
         default_model,
         {
             JudgeStep.EXTRACT: settings.judge_extract_model,
-            JudgeStep.VERIFY: settings.judge_verify_model,
             JudgeStep.SCORE: settings.judge_score_model,
         },
     )

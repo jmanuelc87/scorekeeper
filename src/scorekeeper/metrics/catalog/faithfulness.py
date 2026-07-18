@@ -9,12 +9,21 @@ judge:
 
 * :class:`FaithfulnessRagas` (RAGAS) — take the answer's sentences as statements,
   then verify each *against the context* by positive entailment. Score is the
-  fraction of statements that can be inferred from the context.
+  fraction of statements that can be inferred from the context. The per-claim
+  entailment runs a two-tier cascade: a cheap high-volume model (Haiku 4.5)
+  decides every claim and reports a confidence, and only low-confidence verdicts
+  are escalated to a fixed decisive/audit model (Opus 4.8). The two tiers are
+  pinned model ids, not the judge's step routing.
 * :class:`FaithfulnessDeepeval` (DeepEval) — extract *truths from the context*
   (still an LLM step) and take the answer's sentences as *claims*, then per claim
   ask whether the truths *contradict* it. Score is the fraction **not**
   contradicted — an unverifiable claim (not mentioned in the truths) passes; only
-  a direct contradiction fails.
+  a direct contradiction fails. Its two LLM steps are likewise pinned (Sonnet for
+  truths extraction, Opus for the per-claim verdict).
+
+Because both metrics name Anthropic models explicitly (see the per-call pins
+below), they require the Anthropic judge — under another provider the judge raises
+a Spanish ``ValueError`` for the unowned model.
 
 Neither metric touches ``retrieved_context`` directly. It is a single Spanish
 text blob on ``TurnView``; the judge layer renders it into every prompt (via the
@@ -74,6 +83,19 @@ class Truths(BaseModel):
     summary: str = ""
 
 
+class RagasEntailment(BaseModel):
+    """One claim's entailment verdict plus the judge's self-reported confidence.
+
+    Returned by the RAGAS per-claim verification. ``confidence`` (0..1) drives the
+    Haiku→Opus cascade: a low-confidence bulk verdict is re-judged by the audit
+    model. ``justification`` is the Spanish rationale surfaced in the trace.
+    """
+
+    entailed: bool = False
+    confidence: float = 0.0  # 0..1
+    justification: str = ""
+
+
 # --- Spanish prompts ----------------------------------------------------------
 
 # Extraction instructions may reference {prompt}/{response}/{context}; the judge
@@ -88,10 +110,19 @@ GENERATE_TRUTHS = (
 # Verification rubrics: {claim}/{truths} are pre-filled in the metric with
 # .format(); they must NOT contain {prompt}/{response}/{context} — the judge
 # appends the full turn (including retrieved context) automatically.
+# RAGAS entailment is run via judge.structured() (returning RagasEntailment), so the
+# prompt must be self-describing: it elicits the verdict, a calibrated confidence and a
+# justification directly (structured() does not append a scale instruction the way
+# score() does).
 VERIFY_RAGAS = (
-    "¿Puede inferirse la siguiente afirmación a partir del contexto recuperado? "
-    "Asigna 1 si la afirmación se deduce del contexto, o 0 si no se deduce o lo "
-    "contradice. Justifica brevemente en español.\n"
+    "¿Puede inferirse la siguiente afirmación a partir del contexto recuperado?\n"
+    "Devuelve:\n"
+    "- entailed: true si la afirmación se deduce del contexto, false si no se "
+    "deduce o lo contradice.\n"
+    "- confidence: tu confianza en ese veredicto, un número entre 0.0 y 1.0 "
+    "(1.0 = certeza total; usa valores bajos si el contexto es ambiguo o "
+    "insuficiente).\n"
+    "- justification: una justificación breve en español.\n"
     "Afirmación: {claim}"
 )
 
@@ -116,6 +147,45 @@ class FaithfulnessRagas(MultiStepMetric):
     category = MetricCategory.RAG
     scale = Unit()  # 0-1
     weight = 1.0
+
+    # Per-call model pins for the entailment cascade (per-claim, the n× hot loop),
+    # overridable per instance. A cheap high-volume model (bulk, Haiku) decides every
+    # claim; only verdicts it reports below ``escalation_confidence`` are re-judged by
+    # the decisive/audit model (Opus). These are explicit model ids, not JudgeStep
+    # routing, so the two tiers are fixed regardless of the judge's step config; both
+    # must stay in ``AnthropicJudge.KNOWN_MODELS`` or the judge will reject the call.
+    bulk_model: str = "claude-haiku-4-5-20251001"
+    audit_model: str = "claude-opus-4-8"
+    escalation_confidence: float = 0.7
+
+    def _verify_claim(
+        self, turn: TurnView, judge: Judge, claim: str
+    ) -> tuple[bool, str, bool]:
+        """Entailment cascade for one claim.
+
+        The cheap bulk model (Haiku) decides first; if it reports confidence below
+        ``self.escalation_confidence`` the claim is re-judged by the audit model
+        (Opus) and that verdict wins. Returns ``(entailed, justification,
+        escalated)`` where ``justification`` is from the model whose verdict is used.
+        """
+        prompt = VERIFY_RAGAS.format(claim=claim)
+        bulk = judge.structured(
+            instruction=prompt,
+            turn=turn,
+            schema=RagasEntailment,
+            step=JudgeStep.VERIFY,
+            model=self.bulk_model,
+        )
+        if bulk.confidence >= self.escalation_confidence:
+            return bulk.entailed, bulk.justification, False
+        audit = judge.structured(
+            instruction=prompt,
+            turn=turn,
+            schema=RagasEntailment,
+            step=JudgeStep.SCORE,
+            model=self.audit_model,
+        )
+        return audit.entailed, audit.justification, True
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
         trace: list[StepTrace] = []
@@ -142,30 +212,32 @@ class FaithfulnessRagas(MultiStepMetric):
                 trace=trace,
             )
 
-        verdicts = [
-            judge.score(
-                rubric=VERIFY_RAGAS.format(claim=claim),
-                turn=turn,
-                scale=Boolean(),
-                rubric_version=self.rubric_version,
-                step=JudgeStep.VERIFY,
-                model=judge.model_for(JudgeStep.VERIFY),
-            )
-            for claim in claims
-        ]
-        for claim, verdict in zip(claims, verdicts, strict=True):
-            trace.append(
-                StepTrace(label=f"Verificación: {claim}", detail=verdict.justification)
-            )
+        # Per-claim entailment via the Haiku→Opus cascade. Track which models
+        # actually ran so ``judge_model`` reflects the escalations.
+        supported = 0
+        escalated_any = False
+        for claim in claims:
+            entailed, justification, escalated = self._verify_claim(turn, judge, claim)
+            supported += int(entailed)
+            escalated_any = escalated_any or escalated
+            detail = justification
+            if escalated:
+                detail = f"{justification} (escalado a {self.audit_model})"
+            trace.append(StepTrace(label=f"Verificación: {claim}", detail=detail))
 
-        # Boolean scale → each score is 0/1; mean = supported / n.
-        raw = sum(v.score for v in verdicts) / len(verdicts)
+        # Fraction of statements entailed by the context = supported / n.
+        raw = supported / len(claims)
+        judge_model = (
+            f"{self.bulk_model} → {self.audit_model}"
+            if escalated_any
+            else self.bulk_model
+        )
         return MetricResult(
             metric_name=self.name,
             raw_score=raw,
             normalized_score=self.normalize(raw),
             justification=self.render_justification(trace),
-            judge_model=verdicts[0].model,
+            judge_model=judge_model,
             rubric_version=self.rubric_version,
             trace=trace,
         )
@@ -179,6 +251,16 @@ class FaithfulnessDeepeval(MultiStepMetric):
     category = MetricCategory.RAG
     scale = Unit()  # 0-1
     weight = 1.0
+
+    # Per-call model pins for the two live LLM steps, overridable per instance. Both
+    # are high-impact, so neither runs on a weak model: truths extraction (very high,
+    # indirect — any fact dropped here later reads as "no mencionado" and forces a
+    # pass) runs on Sonnet; the per-claim verdict (direct and dominant — a weak model
+    # drifts toward "no verificable", which silently passes) runs on Opus. These are
+    # explicit model ids, not JudgeStep routing; both must stay in
+    # ``AnthropicJudge.KNOWN_MODELS`` or the judge will reject the call.
+    truths_model: str = "claude-sonnet-5"
+    verdict_model: str = "claude-opus-4-8"
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
         trace: list[StepTrace] = []
@@ -208,7 +290,7 @@ class FaithfulnessDeepeval(MultiStepMetric):
             turn=turn,
             schema=Truths,
             step=JudgeStep.EXTRACT,
-            model=judge.model_for(JudgeStep.EXTRACT),
+            model=self.truths_model,
         )
         trace.append(
             StepTrace(
@@ -247,7 +329,7 @@ class FaithfulnessDeepeval(MultiStepMetric):
                 scale=Boolean(),
                 rubric_version=self.rubric_version,
                 step=JudgeStep.VERIFY,
-                model=judge.model_for(JudgeStep.VERIFY),
+                model=self.verdict_model,
             )
             for claim in claims
         ]
