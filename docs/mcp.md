@@ -46,8 +46,9 @@ above):
 - `scenario_results` — adds a `scenario_results` list to each platform
   (`scenario_id`, `use_case`, `status`, `average_score`).
 - `metric_scores` — adds a `turns` list to each scenario, each turn carrying its
-  `turn_score` and a `metric_scores` list (`metric_name`, `score`, `justification`,
-  `judge_model`, `rubric_version`).
+  `turn_score` and a `metric_scores` list (`metric_name`, `score`, `judge_model`,
+  `rubric_version`). Each score's structured trace is persisted on the
+  `metric_traces` table but is not surfaced here.
 
 ### Result (`metric_scores`)
 
@@ -80,7 +81,6 @@ above):
                   {
                     "metric_name": "utilidad",
                     "score": 0.8,
-                    "justification": "razón",
                     "judge_model": "claude-opus-4-8",
                     "rubric_version": "v1"
                   }

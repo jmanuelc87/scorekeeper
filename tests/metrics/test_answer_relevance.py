@@ -56,9 +56,10 @@ def test_perfect_relevance_when_questions_match_original(make_judge) -> None:
     assert [kind for kind, _ in judge.calls] == ["structured", "structured", "embed"]
     # The embed call batched the original question + both generated questions.
     assert judge.calls[-1] == ("embed", "3")
-    # Every step is flattened into the Spanish justification.
-    assert "### Preguntas generadas a partir de la respuesta" in result.justification
-    assert "### Relevancia media" in result.justification
+    # Structured trace: generation step, similarity step, mean step.
+    labels = [step.label for step in result.trace.steps]
+    assert "Preguntas generadas a partir de la respuesta" in labels
+    assert "Relevancia media" in labels
 
 
 def test_partial_relevance_is_averaged(make_judge) -> None:
@@ -78,8 +79,9 @@ def test_partial_relevance_is_averaged(make_judge) -> None:
 
     # (1.0 + 0.0) / 2
     assert result.raw_score == pytest.approx(0.5)
-    assert "coseno = 1.000" in result.justification
-    assert "coseno = 0.000" in result.justification
+    # Similarities are typed entry values, not formatted strings.
+    sim_step = next(s for s in result.trace.steps if s.label == "Similitud por pregunta")
+    assert {e.label: e.value for e in sim_step.entries} == {"igual": 1.0, "ortogonal": 0.0}
 
 
 def test_negative_cosine_is_clamped_to_zero(make_judge) -> None:
@@ -109,7 +111,10 @@ def test_no_questions_generated_is_safe(make_judge) -> None:
     assert result.raw_score == 0.0
     # No embedding call happens when there is nothing to compare.
     assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
-    assert "(ninguna)" in result.justification
+    # No questions → generation step has no entries; relevance is zero.
+    gen_step = result.trace.steps[0]
+    assert gen_step.entries == []
+    assert result.trace.steps[-1].entries[0].value == 0.0
 
 
 def test_generation_step_does_not_leak_original_question(make_judge) -> None:

@@ -37,6 +37,12 @@ def test_single_rubric_maps_verdict_to_result(turn: TurnView, make_judge) -> Non
     assert result.judge_model == "claude-x"
     assert result.rubric_version == "v1"
     assert judge.calls == [("score", "v1")]  # exactly one scoring call
+    # The single verdict is wrapped as a one-step, one-entry structured trace.
+    (step,) = result.trace.steps
+    (entry,) = step.entries
+    assert entry.value == 4
+    assert entry.justification == "Correcto en general"
+    assert entry.metadata["model"] == "claude-x"
 
 
 def test_normalization_boundaries() -> None:

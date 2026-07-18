@@ -56,8 +56,11 @@ def test_contradiction_raises_score(make_judge) -> None:
     # 1 of 2 documents contradicts → hallucination 0.5, faithfulness 0.5.
     assert result.raw_score == 0.5
     assert result.normalized_score == 0.5
-    assert "1 de 2 documentos contradicen" in result.justification
-    assert "### Documento 1: contradiction" in result.justification
+    # NLI labels are typed entry values; the result step summarizes the rate.
+    nli_step, result_step = result.trace.steps
+    assert nli_step.entries[0].label == "Documento 1"
+    assert nli_step.entries[0].value == "contradiction"
+    assert "1 de 2 documentos contradicen" in result_step.summary
 
 
 def test_no_context_is_zero_without_judge_calls(make_judge) -> None:
@@ -68,4 +71,5 @@ def test_no_context_is_zero_without_judge_calls(make_judge) -> None:
     # No context to contradict → fully faithful (higher-is-better).
     assert result.normalized_score == 1.0
     assert judge.calls == []
-    assert "No hay contexto recuperado" in result.justification
+    assert len(result.trace.steps) == 1
+    assert "No hay contexto recuperado" in result.trace.steps[0].summary

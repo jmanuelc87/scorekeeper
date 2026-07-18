@@ -192,8 +192,9 @@ The date range filters the **scoring window** (`PlatformExecution.started_at` /
 still-queued/in-progress runs. Results are ordered by run creation date. Granularity
 controls depth (each level adds to the one above): `platform_executions` → per-platform
 rollups; `scenario_results` → adds each scenario; `metric_scores` → adds each turn and
-its per-metric scores. See the [`retrieve` tool](mcp.md#retrieve) for the full response
-shape.
+its per-metric scores (`metric_name`, `score`, `judge_model`, `rubric_version`). Each
+score's structured `trace` is persisted on the `metric_traces` table but is not surfaced
+by either read path (this endpoint or the MCP [`retrieve` tool](mcp.md#retrieve)).
 
 ### Response `200`
 

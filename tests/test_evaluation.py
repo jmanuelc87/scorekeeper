@@ -31,6 +31,7 @@ from scorekeeper.database import (
     SourceFile,
     Turn,
 )
+from scorekeeper.database import MetricTrace as MetricTraceRow
 from scorekeeper.evaluation import (
     UploadedFile,
     get_run_summary,
@@ -40,7 +41,14 @@ from scorekeeper.evaluation import (
     run_evaluation,
     score_run,
 )
-from scorekeeper.metrics.base import Metric, MetricResult, TurnView
+from scorekeeper.metrics.base import (
+    Metric,
+    MetricResult,
+    MetricTrace,
+    TraceEntry,
+    TraceStep,
+    TurnView,
+)
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry
@@ -78,7 +86,20 @@ class _FakeMetric(Metric):
             metric_name=self.name,
             raw_score=verdict.score,
             normalized_score=self.normalize(verdict.score),
-            justification=verdict.justification,
+            trace=MetricTrace(
+                steps=[
+                    TraceStep(
+                        label="Puntuación",
+                        entries=[
+                            TraceEntry(
+                                label=self.name,
+                                value=verdict.score,
+                                justification=verdict.justification,
+                            )
+                        ],
+                    )
+                ]
+            ),
             judge_model=verdict.model,
             rubric_version=self.rubric_version,
         )
@@ -677,6 +698,13 @@ def test_retrieve_metric_granularity_adds_turns_and_scores(session: Session, reg
     assert scores[0]["metric_name"] == "utilidad"
     assert scores[0]["score"] == pytest.approx(0.8)
     assert scores[0]["judge_model"] == "judge-test"
+    # The structured trace is never surfaced (nor the old flattened justification),
+    # even though a trace row is persisted per metric score for direct inspection.
+    assert "trace" not in scores[0]
+    assert "justification" not in scores[0]
+    trace_rows = session.execute(select(func.count()).select_from(MetricTraceRow)).scalar_one()
+    metric_rows = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
+    assert trace_rows == metric_rows
 
 
 def test_retrieve_default_granularity_is_scenario(session: Session, registry) -> None:

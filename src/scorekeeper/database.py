@@ -174,11 +174,38 @@ class MetricScore(Base):
     )
     metric_name: Mapped[str] = mapped_column(String(128))
     score: Mapped[float] = mapped_column(Float)
-    justification: Mapped[str | None] = mapped_column(Text, default=None)
     judge_model: Mapped[str | None] = mapped_column(String(128), default=None)
     rubric_version: Mapped[str | None] = mapped_column(String(64), default=None)
 
     turn: Mapped[Turn] = relationship(back_populates="metric_scores")
+    # Structured record of what the metric produced for this turn, as its own 1:1
+    # entity (replaces the former flattened Spanish justification string).
+    trace: Mapped[MetricTrace | None] = relationship(
+        back_populates="metric_score",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+
+class MetricTrace(Base):
+    """The structured trace a metric produced for one turn (1:1 with MetricScore).
+
+    Distinct from the Pydantic ``scorekeeper.metrics.base.MetricTrace`` domain
+    model — this is its persisted mirror. ``steps`` holds the same list the domain
+    model's ``steps`` field carries (each step: label/summary/entries).
+    """
+
+    __tablename__ = "metric_traces"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    metric_score_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("metric_scores.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    # The list of steps (each: label/summary/entries) as JSON; the same payload the
+    # domain MetricTrace.steps carries.
+    steps: Mapped[list[Any] | None] = mapped_column(JsonColumn, default=None)
+
+    metric_score: Mapped[MetricScore] = relationship(back_populates="trace")
 
 
 class ScenarioMetric(Base):

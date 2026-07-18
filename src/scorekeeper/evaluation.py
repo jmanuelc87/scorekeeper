@@ -346,8 +346,10 @@ def retrieve_runs(
 
     ``granularity`` controls how deep each run is serialized:
     ``platform_executions`` → ``scenario_results`` → ``metric_scores`` (see
-    :func:`_serialize_run`). Raises ``ValueError`` for an unknown granularity or an
-    unparseable date. Results are ordered by ``BenchmarkRun.created_at``.
+    :func:`_serialize_run`). Metric scores never carry their structured ``trace``;
+    it is persisted for direct inspection but not surfaced here. Raises
+    ``ValueError`` for an unknown granularity or an unparseable date. Results are
+    ordered by ``BenchmarkRun.created_at``.
     """
     if granularity not in _GRANULARITIES:
         raise ValueError(
@@ -568,6 +570,9 @@ def _serialize_scenario(
 
 
 def _serialize_turn(turn: Turn) -> dict[str, Any]:
+    # The structured ``trace`` is intentionally not surfaced here: it is persisted
+    # on the ``metric_traces`` table for direct inspection, but neither read surface
+    # (HTTP ``/runs`` nor the MCP ``retrieve`` tool) exposes it.
     return {
         "turn_number": turn.turn_number,
         "turn_score": turn.turn_score,
@@ -575,7 +580,6 @@ def _serialize_turn(turn: Turn) -> dict[str, Any]:
             {
                 "metric_name": score.metric_name,
                 "score": score.score,
-                "justification": score.justification,
                 "judge_model": score.judge_model,
                 "rubric_version": score.rubric_version,
             }

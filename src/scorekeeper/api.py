@@ -185,6 +185,9 @@ def list_runs(
     ``scenario_results`` → ``metric_scores``). Returns a list ordered by creation date;
     an unknown ``run_id`` yields ``[]``. ``400`` for an unknown ``granularity`` or an
     unparseable date.
+
+    Metric scores are returned without their structured ``trace``, which is
+    persisted for direct inspection but not surfaced through this API.
     """
     try:
         return evaluation.retrieve_runs(
