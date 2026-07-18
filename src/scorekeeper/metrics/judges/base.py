@@ -9,11 +9,13 @@ Anthropic and OpenAI judges stay thin wrappers over their respective clients.
 
 from __future__ import annotations
 
+from collections.abc import Callable, Mapping
 from typing import NamedTuple
 
 from pydantic import BaseModel
 
 from scorekeeper.metrics.base import TurnView
+from scorekeeper.metrics.judge import JudgeStep
 from scorekeeper.metrics.scale import Boolean, Likert, Scale, Unit
 
 # Default system prompt for every judge call. Overridable per judge (constructor
@@ -24,6 +26,49 @@ DEFAULT_SYSTEM_PROMPT = (
     "numérica junto con una justificación breve. Sé objetivo y responde siempre "
     "en español."
 )
+
+
+class StepModels:
+    """Resolve a :class:`JudgeStep` to the model name a judge should use for it.
+
+    Wraps a ``default`` model plus optional per-step overrides. Unmapped steps —
+    and a ``None`` step — resolve to the default, so a judge built with no
+    overrides is indistinguishable from a plain single-model judge. Falsy override
+    values (``None``/``""``) are ignored, letting callers pass through unset
+    settings without special-casing.
+    """
+
+    def __init__(
+        self,
+        default: str,
+        overrides: Mapping[JudgeStep | str, str | None] | None = None,
+    ) -> None:
+        self.default = default
+        self._overrides: dict[JudgeStep, str] = {}
+        for step, model in (overrides or {}).items():
+            if model:
+                self._overrides[JudgeStep(step)] = model
+
+    def for_step(self, step: JudgeStep | str | None) -> str:
+        """Return the model for ``step``, falling back to the default model."""
+        if step is None:
+            return self.default
+        return self._overrides.get(JudgeStep(step), self.default)
+
+
+def owned_model(model: str, *, owns: Callable[[str], bool], provider: str) -> str:
+    """Return ``model`` if it belongs to ``provider``, else raise a Spanish error.
+
+    ``owns`` is the judge's provider-ownership predicate. Used to validate both a
+    step-resolved model and an explicitly requested one before it reaches the SDK,
+    so a judge never issues a call for a model of a different provider.
+    """
+    if not owns(model):
+        raise ValueError(
+            f"El modelo {model!r} no pertenece al proveedor {provider}. "
+            f"Usa un modelo de {provider}."
+        )
+    return model
 
 
 class _ScoreResponse(BaseModel):

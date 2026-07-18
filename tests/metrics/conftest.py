@@ -20,7 +20,7 @@ from scorekeeper.metrics.catalog.faithfulness import (
 )
 from scorekeeper.metrics.catalog.contextual_precision import ContextualPrecision
 from scorekeeper.metrics.catalog.hallucination import Hallucination
-from scorekeeper.metrics.judge import JudgeVerdict
+from scorekeeper.metrics.judge import JudgeStep, JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry
 
 
@@ -40,16 +40,28 @@ class StubJudge:
         self._embeddings = dict(embeddings or {})
         self.model = model
         self.calls: list[tuple[str, str | None]] = []
+        # The JudgeStep each score()/structured() call was labeled with, in order,
+        # so tests can assert metrics route work to the right per-step model.
+        self.steps: list[JudgeStep | None] = []
 
-    def score(self, *, rubric, turn, scale, rubric_version=None) -> JudgeVerdict:
+    def model_for(self, step=None) -> str | None:
+        # The stub has no provider allow-list; it just echoes its configured model,
+        # so metrics reporting judge.model_for(step) see the value tests pass in.
+        return self.model
+
+    def score(
+        self, *, rubric, turn, scale, rubric_version=None, step=None, model=None
+    ) -> JudgeVerdict:
         self.calls.append(("score", rubric_version))
+        self.steps.append(step)
         return self._verdicts.pop(0)
 
-    def structured(self, *, instruction, turn, schema):
+    def structured(self, *, instruction, turn, schema, step=None, model=None):
         self.calls.append(("structured", schema.__name__))
+        self.steps.append(step)
         return self._extractions.pop(0)
 
-    def embed(self, *, texts):
+    def embed(self, *, texts, model=None):
         self.calls.append(("embed", str(len(texts))))
         # Unknown texts embed to a zero vector, keeping the stub total.
         return [self._embeddings.get(text, [0.0, 0.0]) for text in texts]

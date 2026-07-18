@@ -126,9 +126,11 @@ def test_judges_against_expected_output_not_response(make_judge) -> None:
     seen: list[tuple[str, str]] = []
     original = judge.structured
 
-    def _spy(*, instruction, turn, schema):  # noqa: A002 - mirror protocol kwarg name
+    def _spy(*, instruction, turn, schema, step=None, model=None):  # noqa: A002 - mirror protocol kwarg name
         seen.append((instruction, turn.response))
-        return original(instruction=instruction, turn=turn, schema=schema)
+        return original(
+            instruction=instruction, turn=turn, schema=schema, step=step, model=model
+        )
 
     judge.structured = _spy
     ContextualPrecision().evaluate(turn, judge)

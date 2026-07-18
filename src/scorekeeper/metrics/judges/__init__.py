@@ -11,7 +11,9 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from scorekeeper.config import get_settings
+from scorekeeper.metrics.judge import JudgeStep
 from scorekeeper.metrics.judges.anthropic_judge import AnthropicJudge
+from scorekeeper.metrics.judges.base import StepModels
 from scorekeeper.metrics.judges.openai_judge import OpenAIJudge
 
 if TYPE_CHECKING:
@@ -19,6 +21,23 @@ if TYPE_CHECKING:
     from scorekeeper.metrics.judge import Judge
 
 __all__ = ["AnthropicJudge", "OpenAIJudge", "make_judge"]
+
+
+def _step_models(settings: Settings, default_model: str) -> StepModels:
+    """Build the per-step model map for ``default_model`` from ``settings``.
+
+    Unset overrides fall back to ``default_model`` (``StepModels`` ignores falsy
+    values), so with none configured every step routes to the provider's default
+    judge model — identical to the previous single-model behavior.
+    """
+    return StepModels(
+        default_model,
+        {
+            JudgeStep.EXTRACT: settings.judge_extract_model,
+            JudgeStep.VERIFY: settings.judge_verify_model,
+            JudgeStep.SCORE: settings.judge_score_model,
+        },
+    )
 
 
 def make_judge(settings: Settings | None = None) -> Judge:
@@ -51,6 +70,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
             max_tokens=settings.judge_max_tokens,
             system_prompt=settings.judge_system_prompt,
             embedder=embedder,
+            step_models=_step_models(settings, settings.anthropic_judge_model),
         )
 
     if provider == "openai":
@@ -61,6 +81,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
             api_key=settings.openai_api_key,
             system_prompt=settings.judge_system_prompt,
             embedding_model=settings.openai_embedding_model,
+            step_models=_step_models(settings, settings.openai_judge_model),
         )
 
     raise ValueError(

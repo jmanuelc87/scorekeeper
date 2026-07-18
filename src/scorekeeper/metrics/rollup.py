@@ -13,6 +13,8 @@ from __future__ import annotations
 from collections.abc import Iterable
 from typing import Protocol
 
+import numpy as np
+
 from scorekeeper.metrics.registry import MetricRegistry
 
 
@@ -39,9 +41,17 @@ def turn_score(scores: Iterable[_Scored]) -> float | None:
 
 
 def average(values: Iterable[float | None]) -> float | None:
-    """Plain mean of the non-null values; ``None`` if there are none."""
-    present = [v for v in values if v is not None]
-    return sum(present) / len(present) if present else None
+    """Mean of the non-null values, excluding exact-0.0 and exact-1.0 outliers.
+
+    ``None`` values are dropped, then any value equal to ``0.0`` or ``1.0`` is
+    treated as an outlier and removed before computing the mean with numpy.
+    Returns ``None`` if nothing remains.
+    """
+    present = np.array(
+        [v for v in values if v is not None and v != 0.0 and v != 1.0],
+        dtype=float,
+    )
+    return float(np.mean(present)) if present.size else None
 
 
 # Scenario and platform averages are the same plain mean of their children.

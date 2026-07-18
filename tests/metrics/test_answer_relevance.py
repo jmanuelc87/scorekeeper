@@ -122,9 +122,11 @@ def test_generation_step_does_not_leak_original_question(make_judge) -> None:
     seen_prompts: list[str] = []
     original_structured = judge.structured
 
-    def _spy(*, instruction, turn, schema):  # noqa: A002 - mirror protocol kwarg name
+    def _spy(*, instruction, turn, schema, step=None, model=None):  # noqa: A002 - mirror protocol kwarg name
         seen_prompts.append(turn.prompt)
-        return original_structured(instruction=instruction, turn=turn, schema=schema)
+        return original_structured(
+            instruction=instruction, turn=turn, schema=schema, step=step, model=model
+        )
 
     judge.structured = _spy
     metric = AnswerRelevance()
