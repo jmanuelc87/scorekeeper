@@ -40,6 +40,7 @@ from sqlalchemy.orm import Session, selectinload
 
 from scorekeeper.database import (
     BenchmarkRun,
+    MetricScore,
     PlatformExecution,
     ScenarioResult,
     SessionLocal,
@@ -323,6 +324,35 @@ def get_run_summary(run_id: str, *, session: Session | None = None) -> dict[str,
             db.close()
 
 
+def retrieve_turn_traces(
+    turn_id: str,
+    *,
+    include_provenance: bool = True,
+    session: Session | None = None,
+) -> list[dict[str, Any]] | None:
+    """Structured metric traces for one turn, or ``None`` if the turn is unknown.
+
+    One entry per metric scored on the turn (in metric-score order): its
+    ``metric_name`` and ``trace`` (``{"steps": [...]}`` or ``None``). With
+    ``include_provenance`` each entry also carries ``judge_model`` and
+    ``rubric_version``. A malformed or unknown ``turn_id`` yields ``None`` (the HTTP
+    layer maps that to ``404``); a turn with no scores yields ``[]``.
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        turn = _load_turn(db, turn_id)
+        if turn is None:
+            return None
+        return [
+            _serialize_metric_trace(score, include_provenance)
+            for score in turn.metric_scores
+        ]
+    finally:
+        if owns_session:
+            db.close()
+
+
 def retrieve_runs(
     *,
     run_id: str | None = None,
@@ -418,6 +448,15 @@ def _load_run(db: Session, run_id: str) -> BenchmarkRun | None:
     except ValueError:
         return None
     return db.get(BenchmarkRun, key)
+
+
+def _load_turn(db: Session, turn_id: str) -> Turn | None:
+    """Load a ``Turn`` by its string id, or ``None`` for an unknown/invalid id."""
+    try:
+        key = uuid.UUID(turn_id)
+    except ValueError:
+        return None
+    return db.get(Turn, key)
 
 
 def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:
@@ -569,11 +608,24 @@ def _serialize_scenario(
     return entry
 
 
+def _serialize_metric_trace(
+    score: MetricScore, include_provenance: bool
+) -> dict[str, Any]:
+    """One metric's trace for the per-turn traces endpoint (steps, optional provenance)."""
+    entry: dict[str, Any] = {"metric_name": score.metric_name}
+    if include_provenance:
+        entry["judge_model"] = score.judge_model
+        entry["rubric_version"] = score.rubric_version
+    entry["trace"] = {"steps": score.trace.steps} if score.trace is not None else None
+    return entry
+
+
 def _serialize_turn(turn: Turn) -> dict[str, Any]:
     # The structured ``trace`` is intentionally not surfaced here: it is persisted
     # on the ``metric_traces`` table for direct inspection, but neither read surface
     # (HTTP ``/runs`` nor the MCP ``retrieve`` tool) exposes it.
     return {
+        "turn_id": str(turn.id),
         "turn_number": turn.turn_number,
         "turn_score": turn.turn_score,
         "metric_scores": [

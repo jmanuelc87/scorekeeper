@@ -46,9 +46,10 @@ above):
 - `scenario_results` — adds a `scenario_results` list to each platform
   (`scenario_id`, `use_case`, `status`, `average_score`).
 - `metric_scores` — adds a `turns` list to each scenario, each turn carrying its
-  `turn_score` and a `metric_scores` list (`metric_name`, `score`, `judge_model`,
-  `rubric_version`). Each score's structured trace is persisted on the
-  `metric_traces` table but is not surfaced here.
+  `turn_id`, `turn_score`, and a `metric_scores` list (`metric_name`, `score`,
+  `judge_model`, `rubric_version`). Each score's structured trace is persisted on
+  the `metric_traces` table but is not surfaced here — fetch it per turn with
+  [`retrieve_turn_traces`](#retrieve_turn_traces) using the `turn_id`.
 
 ### Result (`metric_scores`)
 
@@ -75,6 +76,7 @@ above):
             "average_score": 0.8,
             "turns": [
               {
+                "turn_id": "7c9e…",
                 "turn_number": 1,
                 "turn_score": 0.8,
                 "metric_scores": [
@@ -109,9 +111,43 @@ A tool error (surfaced from a `ValueError`) is raised when:
 
 No-match filters are **not** errors — they return an empty list `[]`.
 
+## `retrieve_turn_traces`
+
+Fetch the structured metric traces for a single turn — the per-metric reasoning
+that `retrieve` omits. Get the `turn_id` (the turn's UUID) from `retrieve` with
+`granularity="metric_scores"`.
+
+| Argument     | Type      | Default | Notes |
+|--------------|-----------|---------|-------|
+| `turn_id`    | `string`  | —       | The turn's UUID. Unknown/invalid → empty list `[]`. |
+| `provenance` | `boolean` | `true`  | When `true`, each entry also carries `judge_model` and `rubric_version`; `false` returns the minimal shape. |
+
+Returns one entry per metric on the turn:
+
+```json
+[
+  {
+    "metric_name": "utilidad",
+    "judge_model": "claude-opus-4-8",
+    "rubric_version": "v1",
+    "trace": {
+      "steps": [
+        {
+          "label": "Puntuación",
+          "summary": null,
+          "entries": [
+            {"label": "utilidad", "value": 0.8, "justification": "razón", "metadata": {}}
+          ]
+        }
+      ]
+    }
+  }
+]
+```
+
 ## Related code
 
-- Tool registration — `src/scorekeeper/server.py` (`retrieve`)
+- Tool registration — `src/scorekeeper/server.py` (`retrieve`, `retrieve_turn_traces`)
 - Query & serialization — `src/scorekeeper/evaluation.py`
-  (`retrieve_runs`, `_serialize_run`)
+  (`retrieve_runs`, `_serialize_run`, `retrieve_turn_traces`)
 - Entities returned — `src/scorekeeper/database.py`, [Data model](data-model.md)

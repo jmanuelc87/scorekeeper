@@ -38,6 +38,7 @@ from scorekeeper.evaluation import (
     ingest_evaluation,
     project_turns,
     retrieve_runs,
+    retrieve_turn_traces,
     run_evaluation,
     score_run,
 )
@@ -693,6 +694,8 @@ def test_retrieve_metric_granularity_adds_turns_and_scores(session: Session, reg
     scenario = runs[0]["platforms"][0]["scenario_results"][0]
     turns = scenario["turns"]
     assert [t["turn_number"] for t in turns] == [1, 2]
+    # Each serialized turn carries its id so clients can reach /turns/{id}/traces.
+    assert all(uuid.UUID(t["turn_id"]) for t in turns)
     scores = turns[0]["metric_scores"]
     assert len(scores) == 1
     assert scores[0]["metric_name"] == "utilidad"
@@ -705,6 +708,84 @@ def test_retrieve_metric_granularity_adds_turns_and_scores(session: Session, reg
     trace_rows = session.execute(select(func.count()).select_from(MetricTraceRow)).scalar_one()
     metric_rows = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
     assert trace_rows == metric_rows
+
+
+# --- retrieve_turn_traces + /turns/{turn_id}/traces ---------------------------
+
+
+def test_retrieve_turn_traces_with_provenance(session: Session, registry) -> None:
+    _score_one(session)
+    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+
+    traces = retrieve_turn_traces(str(turn.id), session=session)
+
+    assert len(traces) == 1
+    entry = traces[0]
+    assert entry["metric_name"] == "utilidad"
+    assert entry["judge_model"] == "judge-test"
+    assert entry["rubric_version"] == "v1"
+    # The full structured trace is surfaced here (unlike the general read paths).
+    assert entry["trace"]["steps"][0]["entries"][0]["value"] == pytest.approx(0.8)
+
+
+def test_retrieve_turn_traces_minimal_omits_provenance(session: Session, registry) -> None:
+    _score_one(session)
+    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+
+    traces = retrieve_turn_traces(str(turn.id), include_provenance=False, session=session)
+
+    entry = traces[0]
+    assert set(entry) == {"metric_name", "trace"}
+    assert entry["metric_name"] == "utilidad"
+    assert entry["trace"]["steps"][0]["entries"][0]["value"] == pytest.approx(0.8)
+
+
+def test_retrieve_turn_traces_unknown_or_malformed_is_none(session: Session, registry) -> None:
+    _score_one(session)
+
+    assert retrieve_turn_traces("not-a-uuid", session=session) is None
+    assert (
+        retrieve_turn_traces(
+            "00000000-0000-0000-0000-000000000000", session=session
+        )
+        is None
+    )
+
+
+def test_turn_traces_endpoint_forwards_and_returns(monkeypatch) -> None:
+    captured: dict = {}
+    payload = [{"metric_name": "utilidad", "trace": {"steps": []}}]
+
+    def fake(turn_id, **kwargs):
+        captured["turn_id"] = turn_id
+        captured.update(kwargs)
+        return payload
+
+    monkeypatch.setattr(evaluation, "retrieve_turn_traces", fake)
+
+    with TestClient(app) as client:
+        response = client.get("/turns/abc/traces", params={"provenance": "false"})
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    assert captured == {"turn_id": "abc", "include_provenance": False}
+
+
+def test_turn_traces_endpoint_unknown_turn_404(monkeypatch) -> None:
+    monkeypatch.setattr(evaluation, "retrieve_turn_traces", lambda *a, **k: None)
+
+    with TestClient(app) as client:
+        response = client.get("/turns/nope/traces")
+
+    assert response.status_code == 404
+
+
+def test_mcp_retrieve_turn_traces_coalesces_none(monkeypatch) -> None:
+    from scorekeeper import server
+
+    monkeypatch.setattr(evaluation, "retrieve_turn_traces", lambda *a, **k: None)
+    # The MCP tool never 404s: an unknown turn becomes an empty list.
+    assert server.retrieve_turn_traces("nope") == []
 
 
 def test_retrieve_default_granularity_is_scenario(session: Session, registry) -> None:

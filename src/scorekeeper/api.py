@@ -163,6 +163,26 @@ def get_evaluation(run_id: str) -> EvaluationResponse:
     return EvaluationResponse.model_validate(summary)
 
 
+@app.get("/turns/{turn_id}/traces")
+def get_turn_traces(
+    turn_id: str,
+    provenance: bool = Query(
+        True, description="Incluir judge_model y rubric_version por métrica."
+    ),
+) -> list[dict]:
+    """Return the structured metric traces for one turn.
+
+    One entry per metric scored on the turn: its ``metric_name`` and ``trace``
+    (``{"steps": [...]}`` or ``null``). ``provenance=true`` (default) also includes
+    ``judge_model`` and ``rubric_version``; ``provenance=false`` returns the minimal
+    shape. ``404`` when the ``turn_id`` is unknown or malformed.
+    """
+    traces = evaluation.retrieve_turn_traces(turn_id, include_provenance=provenance)
+    if traces is None:
+        raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
+    return traces
+
+
 @app.get("/runs")
 def list_runs(
     run_id: str | None = Query(None, description="Limita a una sola evaluación."),
