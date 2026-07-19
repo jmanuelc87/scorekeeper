@@ -38,6 +38,17 @@ Transport can also be selected with `MCP_TRANSPORT=stdio|http`. Without a
 `DATABASE_URL`, local commands use `scorekeeper.db` through SQLite. Copy
 `.env.example` to `.env` to use the Compose PostgreSQL instance from the host.
 
+### Judge providers
+
+Scoring uses an LLM-as-a-judge selected by `JUDGE_PROVIDER` (`anthropic`, `openai`,
+or `lmstudio`); install the SDKs with `uv sync --extra judges`. For end-to-end
+testing with no API key or external cost, set `JUDGE_PROVIDER=lmstudio` and point
+`LMSTUDIO_BASE_URL` at a running [LM Studio](https://lmstudio.ai/) server (default
+`http://localhost:1234/v1`). The local judge remaps every requested/pinned model to
+the loaded model named by `LMSTUDIO_JUDGE_MODEL`, so every metric runs against
+whatever LM Studio has loaded; `answer_relevance` additionally needs an embedding
+model loaded (`LMSTUDIO_EMBEDDING_MODEL`). See `.env.example` for all knobs.
+
 ### Tools
 
 - `retrieve` — fetch full scored details for the runs matching a set of filters
