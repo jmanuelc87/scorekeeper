@@ -52,6 +52,20 @@ def retrieve(
     )
 
 
+@mcp.tool()
+def retrieve_turn_traces(turn_id: str, provenance: bool = True) -> list[dict]:
+    """Recupera las trazas estructuradas de las métricas de un turno.
+
+    Devuelve una entrada por métrica evaluada en el turno: su ``metric_name`` y su
+    ``trace`` (``{"steps": [...]}`` o ``null``). Con ``provenance=true``
+    (predeterminado) cada entrada añade también ``judge_model`` y ``rubric_version``;
+    con ``provenance=false`` devuelve la forma mínima. El ``turn_id`` (UUID del turno)
+    se obtiene de ``retrieve`` con ``granularity="metric_scores"``. Un ``turn_id``
+    desconocido o inválido devuelve una lista vacía.
+    """
+    return evaluation.retrieve_turn_traces(turn_id, include_provenance=provenance) or []
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Scorekeeper MCP server")
     parser.add_argument(

@@ -13,6 +13,7 @@ over the Model Context Protocol — see [MCP tools](mcp.md).
 | `POST /evaluations`          | Ingest conversation `.xlsx` files and **enqueue** them for scoring (per-file platform, defaulting to the payload platform). |
 | `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity (HTTP twin of the MCP `retrieve` tool). |
+| `GET /turns/{turn_id}/traces` | Retrieve the structured metric traces for a single turn. |
 
 ## Architecture: API enqueues, worker scores
 
@@ -192,8 +193,9 @@ The date range filters the **scoring window** (`PlatformExecution.started_at` /
 still-queued/in-progress runs. Results are ordered by run creation date. Granularity
 controls depth (each level adds to the one above): `platform_executions` → per-platform
 rollups; `scenario_results` → adds each scenario; `metric_scores` → adds each turn and
-its per-metric scores. See the [`retrieve` tool](mcp.md#retrieve) for the full response
-shape.
+its per-metric scores (`metric_name`, `score`, `judge_model`, `rubric_version`). Each
+score's structured `trace` is persisted on the `metric_traces` table but is not surfaced
+by either read path (this endpoint or the MCP [`retrieve` tool](mcp.md#retrieve)).
 
 ### Response `200`
 
@@ -225,6 +227,46 @@ shape.
 |--------|------|
 | `400`  | `granularity` is not one of the three accepted values, or `start_date`/`end_date` is not a valid ISO-8601 date. No-match filters are **not** errors — they return `[]`. |
 
+## `GET /turns/{turn_id}/traces`
+
+Retrieve the structured metric traces for a single turn — the full per-metric
+reasoning that the run/scenario read paths omit. The `turn_id` is the turn's UUID,
+discoverable from `GET /runs?granularity=metric_scores` (each turn carries a
+`turn_id`).
+
+| Query param  | Type      | Default | Notes |
+|--------------|-----------|---------|-------|
+| `provenance` | `boolean` | `true`  | When `true`, each entry also includes `judge_model` and `rubric_version`; `false` returns the minimal shape (`metric_name` + `trace`). |
+
+Returns one entry per metric scored on the turn (a turn with no scores yields `[]`):
+
+```json
+[
+  {
+    "metric_name": "utilidad",
+    "judge_model": "claude-opus-4-8",
+    "rubric_version": "v1",
+    "trace": {
+      "steps": [
+        {
+          "label": "Puntuación",
+          "summary": null,
+          "entries": [
+            {"label": "utilidad", "value": 0.8, "justification": "razón", "metadata": {}}
+          ]
+        }
+      ]
+    }
+  }
+]
+```
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | The `turn_id` is unknown or not a valid UUID. |
+
 ## Examples
 
 Enqueue (defaults, single file) → returns a `run_id`:
@@ -246,6 +288,13 @@ Retrieve full details for all `claude` runs scored in July, down to metric score
 
 ```bash
 curl 'http://localhost:8001/runs?platform=claude&start_date=2026-07-01&end_date=2026-07-31&granularity=metric_scores'
+```
+
+Retrieve one turn's metric traces (full, then minimal):
+
+```bash
+curl 'http://localhost:8001/turns/7c9e…/traces'
+curl 'http://localhost:8001/turns/7c9e…/traces?provenance=false'
 ```
 
 Multiple files with per-file overrides — `esc1` keeps the payload `claude` default;

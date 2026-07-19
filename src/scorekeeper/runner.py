@@ -43,6 +43,7 @@ from scorekeeper.config import get_settings
 from scorekeeper.database import (
     BenchmarkRun,
     MetricScore,
+    MetricTrace,
     PlatformExecution,
     ScenarioResult,
     Turn,
@@ -195,7 +196,7 @@ class EvalRunner:
                 MetricScore(
                     metric_name=result.metric_name,
                     score=result.raw_score,
-                    justification=result.justification,
+                    trace=MetricTrace(steps=result.trace.model_dump()["steps"]),
                     judge_model=result.judge_model,
                     rubric_version=result.rubric_version,
                 )

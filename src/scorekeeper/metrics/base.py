@@ -10,14 +10,15 @@ Two shapes cover the space:
 * ``SingleRubricMetric`` — one Spanish rubric → one judge call → one score. A
   concrete metric is then pure declaration (name/category/scale/weight/rubric).
 * ``MultiStepMetric`` — override ``evaluate()`` to orchestrate several judge
-  calls (extract → verify → aggregate) and flatten a step trace into the single
-  Spanish ``justification`` field.
+  calls (extract → verify → aggregate) and record what each step produced as a
+  structured :class:`MetricTrace` (steps → typed entries), so lists stay arrays
+  instead of being flattened into a single string.
 """
 
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from pydantic import BaseModel
 
@@ -41,24 +42,49 @@ class TurnView(BaseModel):
     expected_output: str = ""
 
 
-class StepTrace(BaseModel):
-    """One recorded step of a multi-step evaluation (Spanish label + detail)."""
+class TraceEntry(BaseModel):
+    """One typed observation a step produced (a claim verdict, a similarity, a node judgment).
 
-    label: str
-    detail: str
+    ``value`` carries the machine-readable outcome; the union order ``bool | float
+    | str`` is intentional — Pydantic v2 matches ``bool`` before ``float`` so a
+    boolean verdict is not coerced to ``1.0``. ``metadata`` holds extra typed
+    fields that don't fit ``value`` (confidence, model, escalated, rank, …).
+    """
+
+    label: str  # Spanish; e.g. the claim / node / question text
+    value: bool | float | str | None = None
+    justification: str = ""  # Spanish rationale from the judge
+    metadata: dict[str, Any] = {}
+
+
+class TraceStep(BaseModel):
+    """One phase of a multi-step evaluation (extraction, per-claim verification…)."""
+
+    label: str  # Spanish phase name
+    summary: str | None = None  # optional Spanish one-liner for the phase
+    entries: list[TraceEntry] = []  # kept as an ARRAY, never string-joined
+
+
+class MetricTrace(BaseModel):
+    """Structured record of what a metric produced while evaluating a turn.
+
+    Persisted on the ``metric_traces`` table (1:1 with ``MetricScore``, its
+    ``steps`` stored as JSON) for direct inspection — not surfaced by the read
+    APIs. Replaces the former flattened Spanish ``justification`` string.
+    """
+
+    steps: list[TraceStep] = []
 
 
 class MetricResult(BaseModel):
-    """A metric's output for one turn — flattened onto a ``MetricScore`` row."""
+    """A metric's output for one turn — persisted onto a ``MetricScore`` row."""
 
     metric_name: str
     raw_score: float  # in the metric's own scale
     normalized_score: float  # always [0, 1], used at rollup
-    justification: str  # Spanish; multi-step traces are flattened into this
+    trace: MetricTrace = MetricTrace()  # structured record, persisted as JSON
     judge_model: str | None = None
     rubric_version: str | None = None
-    # Not persisted — kept for debugging/observability only.
-    trace: list[StepTrace] = []
 
 
 class Metric(ABC):
@@ -104,7 +130,23 @@ class SingleRubricMetric(Metric):
             metric_name=self.name,
             raw_score=verdict.score,
             normalized_score=self.normalize(verdict.score),
-            justification=verdict.justification,
+            trace=MetricTrace(
+                steps=[
+                    TraceStep(
+                        label="Puntuación",
+                        entries=[
+                            TraceEntry(
+                                label=self.name,
+                                value=verdict.score,
+                                justification=verdict.justification,
+                                metadata=(
+                                    {"model": verdict.model} if verdict.model else {}
+                                ),
+                            )
+                        ],
+                    )
+                ]
+            ),
             judge_model=verdict.model,
             rubric_version=self.rubric_version,
         )
@@ -113,10 +155,8 @@ class SingleRubricMetric(Metric):
 class MultiStepMetric(Metric):
     """A metric whose score needs several orchestrated steps.
 
-    Subclasses implement ``evaluate()`` and typically build a list of
-    ``StepTrace`` entries, then call ``render_justification()`` to flatten them
-    into the single Spanish ``justification`` Text field.
+    Subclasses implement ``evaluate()`` and build a :class:`MetricTrace` — a list
+    of ``TraceStep`` phases, each holding typed ``TraceEntry`` observations — so
+    the per-item detail (claims, verdicts, similarities) stays structured instead
+    of being flattened into a single Spanish string.
     """
-
-    def render_justification(self, trace: list[StepTrace]) -> str:
-        return "\n\n".join(f"### {step.label}\n{step.detail}" for step in trace)

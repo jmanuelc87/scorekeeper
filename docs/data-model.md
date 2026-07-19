@@ -81,6 +81,8 @@ erDiagram
         Integer turn_number
         Text prompt
         Text response
+        Text retrieved_context
+        Text expected_output
         Integer response_time_ms
         Float turn_score
     }
@@ -90,9 +92,14 @@ erDiagram
         UUID turn_id FK
         String metric_name
         Float score
-        Text justification
         String judge_model
         String rubric_version
+    }
+
+    MetricTrace {
+        UUID id PK
+        UUID metric_score_id FK
+        JSON steps
     }
 
     ScenarioMetric {
@@ -106,6 +113,7 @@ erDiagram
     PlatformExecution ||--o{ ScenarioResult : "has"
     ScenarioResult ||--o{ Turn : "has"
     Turn ||--o{ MetricScore : "has"
+    MetricScore ||--|| MetricTrace : "has"
 ```
 
 `ScenarioMetric` is a standalone selection table (no FK into the run hierarchy):
@@ -176,6 +184,8 @@ One user/model exchange within a conversation, evaluated on its own.
 | `turn_number` | Integer | Order of the turn within the conversation. |
 | `prompt` | Text | User message. |
 | `response` | Text | Model response. |
+| `retrieved_context` | Text | Nullable. Retrieved context a RAG answer was grounded on, for groundedness-style metrics; `None` when not applicable. |
+| `expected_output` | Text | Nullable. Ground-truth answer for reference-based metrics (e.g. contextual precision); `None` when no reference is available. |
 | `response_time_ms` | Integer | Response latency, if available. |
 | `turn_score` | Float | Composite score for the turn; mean of its `MetricScore` values. |
 
@@ -189,9 +199,22 @@ An LLM-as-a-judge score for a single metric on a single turn. A turn has many.
 | `turn_id` | UUID | FK → `turns.id`, `ON DELETE CASCADE`. |
 | `metric_name` | String(128) | Name of the evaluated metric. |
 | `score` | Float | Numeric score for the metric. |
-| `justification` | Text | Judge's rationale for the score. |
 | `judge_model` | String(128) | Model that produced the score, for reproducibility. |
 | `rubric_version` | String(64) | Version of the scoring rubric used. |
+
+Its structured trace lives in a separate `MetricTrace` entity (below), not a column.
+
+### MetricTrace
+
+The structured record of what a metric produced for one turn — its own entity,
+1:1 with `MetricScore` (`ON DELETE CASCADE`). Replaces the former flattened
+`justification` string.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `metric_score_id` | UUID | FK → `metric_scores.id`, `ON DELETE CASCADE`, unique (enforces 1:1). |
+| `steps` | JSON (JSONB on PostgreSQL) | The list of steps (each `label`/`summary`/`entries`, entries carrying typed `value`/`justification`/`metadata`). |
 
 ### ScenarioMetric
 
@@ -209,7 +232,7 @@ scenarios, materialized by `scorekeeper.metrics.selection.sync_selection`.
 
 The `BenchmarkRun` subtree uses `ON DELETE CASCADE` and SQLAlchemy
 `cascade="all, delete-orphan"`, so deleting a `BenchmarkRun` removes its entire
-subtree of executions, scenarios, turns, and scores.
+subtree of executions, scenarios, turns, scores, and each score's `MetricTrace`.
 
 The `SourceFile → BenchmarkRun` link uses `ON DELETE SET NULL` instead: deleting
 a source file leaves its runs and their results intact, only clearing their

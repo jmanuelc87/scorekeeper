@@ -23,7 +23,14 @@ from scorekeeper.database import (
     ScenarioResult,
     Turn,
 )
-from scorekeeper.metrics.base import Metric, MetricResult, TurnView
+from scorekeeper.metrics.base import (
+    Metric,
+    MetricResult,
+    MetricTrace,
+    TraceEntry,
+    TraceStep,
+    TurnView,
+)
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry
@@ -86,7 +93,20 @@ class _JudgeMetric(Metric):
             metric_name=self.name,
             raw_score=verdict.score,
             normalized_score=self.normalize(verdict.score),
-            justification=verdict.justification,
+            trace=MetricTrace(
+                steps=[
+                    TraceStep(
+                        label="Puntuación",
+                        entries=[
+                            TraceEntry(
+                                label=self.name,
+                                value=verdict.score,
+                                justification=verdict.justification,
+                            )
+                        ],
+                    )
+                ]
+            ),
             judge_model=verdict.model,
             rubric_version=self.rubric_version,
         )
