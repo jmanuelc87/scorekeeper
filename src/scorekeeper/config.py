@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     api_port: int = 8001
     cors_origins: str = "http://localhost:5173,http://localhost:8080"
 
+    # Root log level for the structlog-based dual output (plain text on stderr, JSON
+    # on stdout). See scorekeeper.logging_config.configure_logging.
+    log_level: str = "INFO"
+
     # Celery broker for the evaluation worker. Defaults to the app's own Postgres
     # via kombu's SQLAlchemy transport (see the ``broker_url`` property); set
     # CELERY_BROKER_URL to point at a dedicated broker (e.g. Redis) instead.
@@ -50,6 +54,10 @@ class Settings(BaseSettings):
     openai_embedding_model: str = "text-embedding-3-small"
     # Override the judge system prompt at runtime; None uses the built-in default.
     judge_system_prompt: str | None = None
+    # Trace every LLM API call the judge makes (op, model, step, turn, sizes,
+    # latency, outcome) to the ``scorekeeper.metrics.judges.tracing`` logger. Purely
+    # observational — wraps the judge in a TracingJudge and never alters scoring.
+    judge_trace_enabled: bool = False
 
     # Pace scoring by pausing a random interval (seconds) between consecutive turns
     # of a scenario, to spread judge calls out over time. The pause is drawn

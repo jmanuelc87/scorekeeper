@@ -1,6 +1,6 @@
-import logging
 from pathlib import Path
 
+import structlog
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,15 +8,14 @@ from pydantic import BaseModel, Field
 
 from scorekeeper import evaluation, tasks
 from scorekeeper.config import get_settings
-
-# Surface app (INFO) logs in the container output; uvicorn only configures its own
-# loggers, so without this our progress logs would be swallowed.
-logging.basicConfig(level=logging.INFO)
-# httpx logs every judge request at INFO, which floods the output; quiet it.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger("scorekeeper.api")
+from scorekeeper.logging_config import configure_logging
 
 settings = get_settings()
+
+# Structured dual output (plain text → stderr, JSON → stdout). uvicorn only
+# configures its own loggers, so without this our app events would be swallowed.
+configure_logging(settings.log_level)
+logger = structlog.get_logger("scorekeeper.api")
 
 # The database schema is owned by Alembic — run `alembic upgrade head`
 # before starting the app (the compose `migrate` service does this).
