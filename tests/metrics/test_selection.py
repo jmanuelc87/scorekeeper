@@ -1,13 +1,14 @@
 """DB-backed per-scenario selection, synced from the decorator-declared classes.
 
 Each catalog metric declares the use case(s) it applies to via
-``@register(scenarios=…)``: ``contextual_precision`` → ``["contextual_precision"]``,
-``hallucination`` → ``["hallucination"]``, and
-``faithfulness_ragas``/``faithfulness_deepeval`` → ``["document_retrieval",
-"web_search"]``. None declare the reserved ``"default"`` set, so a scenario resolves
-to metrics only when its ``use_case`` names one; an all-miss ``use_case`` falls back
-to whatever the ``"default"`` set contains (empty for the catalog metrics, so these
-tests seed a ``"default"`` row to exercise the fallback).
+``@register(scenarios=…)`` — every one of them a single use case named after the
+metric itself: ``contextual_precision`` → ``["contextual_precision"]``,
+``hallucination`` → ``["hallucination"]``, ``faithfulness_ragas`` →
+``["faithfulness_ragas"]``, ``faithfulness_deepeval`` →
+``["faithfulness_deepeval"]``. None declare the reserved ``"default"`` set, so a
+scenario resolves to metrics only when its ``use_case`` names one; an all-miss
+``use_case`` falls back to whatever the ``"default"`` set contains (empty for the
+catalog metrics, so these tests seed a ``"default"`` row to exercise the fallback).
 """
 
 from __future__ import annotations
@@ -28,7 +29,9 @@ from scorekeeper.metrics.selection import (
 )
 
 CTX_METRICS = {"contextual_precision"}
-RETRIEVAL_METRICS = {"faithfulness_ragas", "faithfulness_deepeval"}
+RAGAS_METRICS = {"faithfulness_ragas"}
+DEEPEVAL_METRICS = {"faithfulness_deepeval"}
+FAITHFULNESS_METRICS = RAGAS_METRICS | DEEPEVAL_METRICS
 HALLUCINATION_METRICS = {"hallucination"}
 
 
@@ -39,8 +42,8 @@ def test_sync_materializes_declared_scenarios(db_session: Session, registered_me
     # Each metric materializes under its own declared use case.
     assert set(metrics_for(db_session, "contextual_precision")) == CTX_METRICS
     assert set(metrics_for(db_session, "hallucination")) == HALLUCINATION_METRICS
-    assert set(metrics_for(db_session, "document_retrieval")) == RETRIEVAL_METRICS
-    assert set(metrics_for(db_session, "web_search")) == RETRIEVAL_METRICS
+    assert set(metrics_for(db_session, "faithfulness_ragas")) == RAGAS_METRICS
+    assert set(metrics_for(db_session, "faithfulness_deepeval")) == DEEPEVAL_METRICS
     # No catalog metric declares the reserved "default" set.
     assert set(metrics_for(db_session, "default")) == set()
 
@@ -98,9 +101,9 @@ def test_resolve_raises_on_unknown_stored_metric(db_session: Session, registered
 
 
 def test_parse_use_cases_splits_and_strips() -> None:
-    assert parse_use_cases(" document_retrieval ,, web_search ") == [
-        "document_retrieval",
-        "web_search",
+    assert parse_use_cases(" faithfulness_ragas ,, faithfulness_deepeval ") == [
+        "faithfulness_ragas",
+        "faithfulness_deepeval",
     ]
     assert parse_use_cases("default") == ["default"]
     assert parse_use_cases("  ,  ") == []
@@ -110,8 +113,8 @@ def test_metrics_for_scenario_unions_tokens(db_session: Session, registered_metr
     sync_selection(db_session)
     db_session.commit()
 
-    names = metrics_for_scenario(db_session, "document_retrieval, contextual_precision")
-    assert set(names) == RETRIEVAL_METRICS | CTX_METRICS
+    names = metrics_for_scenario(db_session, "faithfulness_ragas, contextual_precision")
+    assert set(names) == RAGAS_METRICS | CTX_METRICS
     # No duplicates in the union.
     assert len(names) == len(set(names))
 
@@ -122,8 +125,11 @@ def test_metrics_for_scenario_dedups_repeated_tokens(
     sync_selection(db_session)
     db_session.commit()
 
-    names = metrics_for_scenario(db_session, "document_retrieval, document_retrieval, web_search")
-    assert names == sorted(RETRIEVAL_METRICS)  # each metric once, name-ordered
+    names = metrics_for_scenario(
+        db_session, "faithfulness_ragas, faithfulness_ragas, faithfulness_deepeval"
+    )
+    # Each metric once, in token order (dedup keeps the first occurrence).
+    assert names == ["faithfulness_ragas", "faithfulness_deepeval"]
 
 
 def test_metrics_for_scenario_ignores_whitespace_and_empty_tokens(
@@ -132,9 +138,9 @@ def test_metrics_for_scenario_ignores_whitespace_and_empty_tokens(
     sync_selection(db_session)
     db_session.commit()
 
-    assert set(metrics_for_scenario(db_session, " document_retrieval ,, web_search ")) == (
-        RETRIEVAL_METRICS
-    )
+    assert set(
+        metrics_for_scenario(db_session, " faithfulness_ragas ,, faithfulness_deepeval ")
+    ) == FAITHFULNESS_METRICS
 
 
 def test_metrics_for_scenario_falls_back_only_when_all_miss(
@@ -148,8 +154,8 @@ def test_metrics_for_scenario_falls_back_only_when_all_miss(
     # Every token misses → default set.
     assert set(metrics_for_scenario(db_session, "inexistente, otro_raro")) == CTX_METRICS
     # One token matches → no default injected.
-    assert set(metrics_for_scenario(db_session, "inexistente, document_retrieval")) == (
-        RETRIEVAL_METRICS
+    assert set(metrics_for_scenario(db_session, "inexistente, faithfulness_ragas")) == (
+        RAGAS_METRICS
     )
 
 
@@ -159,6 +165,6 @@ def test_resolve_scenario_returns_union_instances(
     sync_selection(db_session)
     db_session.commit()
 
-    metrics = resolve_scenario(db_session, "document_retrieval, contextual_precision")
+    metrics = resolve_scenario(db_session, "faithfulness_ragas, contextual_precision")
     assert all(isinstance(m, Metric) for m in metrics)
-    assert {m.name for m in metrics} == RETRIEVAL_METRICS | CTX_METRICS
+    assert {m.name for m in metrics} == RAGAS_METRICS | CTX_METRICS

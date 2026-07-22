@@ -82,6 +82,7 @@ erDiagram
         Text prompt
         Text response
         Text expected_output
+        Text retrieved_context_source
         Integer response_time_ms
         Float turn_score
     }
@@ -128,6 +129,17 @@ erDiagram
         DateTime updated_at
     }
 
+    DocumentCacheEntry {
+        UUID id PK
+        Text url UK
+        String sha256
+        Text cache_path
+        String doc_type
+        String content_type
+        Integer size_bytes
+        DateTime fetched_at
+    }
+
     SourceFile ||--o{ BenchmarkRun : "seeds"
     BenchmarkRun ||--o{ PlatformExecution : "has"
     PlatformExecution ||--o{ ScenarioResult : "has"
@@ -136,10 +148,11 @@ erDiagram
     Turn ||--o{ MetricScore : "has"
 ```
 
-`ScenarioMetric` and `AuthProviderConfig` are standalone tables (no FK into the run
-hierarchy). `ScenarioMetric` is joined to scenarios by matching `use_case`;
+`ScenarioMetric`, `AuthProviderConfig`, and `DocumentCacheEntry` are standalone tables (no FK
+into the run hierarchy). `ScenarioMetric` is joined to scenarios by matching `use_case`;
 `AuthProviderConfig` is read by the retrieval pipeline's authorize stage, keyed by `host`
-(unique together with `provider`).
+(unique together with `provider`); `DocumentCacheEntry` is the fetch stage's download index,
+keyed by `url`.
 
 ## Entities
 
@@ -207,11 +220,13 @@ One user/model exchange within a conversation, evaluated on its own.
 | `prompt` | Text | User message. |
 | `response` | Text | Model response. |
 | `expected_output` | Text | Ground-truth answer for reference-based metrics (e.g. contextual precision); `NULL` when no reference is available. |
+| `retrieved_context_source` | Text | Raw `retrieved_context` cell (ranked source references) captured at ingest; the retrieval pipeline parses/fetches/extracts it into `retrieved_documents`. `NULL` when the sheet had no context column. |
 | `response_time_ms` | Integer | Response latency, if available. |
 | `turn_score` | Float | Composite score for the turn; mean of its `MetricScore` values. |
 
 The documents a RAG answer was grounded on are stored as `RetrievedDocument` child
-rows (below), not on the turn itself.
+rows (below), not on the turn itself — **populated by the retrieval stage** (not ingest)
+from `retrieved_context_source`.
 
 ### RetrievedDocument
 
@@ -288,6 +303,25 @@ non-secret identifiers. Shipped kinds: `sharepoint` (client certificate) and `oa
 | `private_key_salt` | Text | Per-row base64 salt used to derive the encryption key. |
 | `settings` | JSON / JSONB | Kind-specific non-secret config (e.g. OAuth2 `token_url` / `scope`) and overflow for fields that don't map onto the columns above. |
 | `created_at` / `updated_at` | DateTime (tz) | Row timestamps (`updated_at` refreshes on change). |
+
+### DocumentCacheEntry
+
+The retrieval pipeline's fetch-stage download index (`table document_cache`). One row per
+distinct source `url` (unique) points at the document's bytes cached on the local filesystem
+under `RETRIEVAL_CACHE_DIR`, so a document is downloaded **at most once** across turns/runs
+(see [Retrieval pipeline § Fetch](retrieval-pipeline.md#fetch)). Standalone — no FK into the
+run hierarchy; the bytes live on disk, not in the DB.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `url` | Text | Source document URL — the fetch/cache key. Unique. |
+| `sha256` | String(64) | Hex digest of the URL; also the cached blob's filename. |
+| `cache_path` | Text | Blob path relative to the cache root (sharded by the SHA prefix). |
+| `doc_type` | String(16) | `DocType` value of the cached document. |
+| `content_type` | String(255) | HTTP `Content-Type` captured on a public fetch; `NULL` for auth'd fetches. |
+| `size_bytes` | Integer | Size of the cached blob. |
+| `fetched_at` | DateTime (tz) | When the blob was last (re)written (`onupdate` refreshes it). |
 
 ## Cascade behavior
 

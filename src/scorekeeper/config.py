@@ -46,6 +46,11 @@ class Settings(BaseSettings):
     # Override the judge system prompt at runtime; None uses the built-in default.
     judge_system_prompt: str | None = None
 
+    # Local filesystem directory for the retrieval pipeline's fetch cache. Fetched document
+    # bytes are stored here (indexed by the ``document_cache`` table) so a document is
+    # downloaded at most once across turns/runs (see scorekeeper.retrieval.fetch).
+    retrieval_cache_dir: str = "./retrieval-cache"
+
     # Master secret for the retrieval pipeline's credential store. Certificate private
     # keys configured per provider (the ``auth_providers`` table) are stored encrypted:
     # a per-row salt derives a key from this secret (PBKDF2) to encrypt/decrypt the PEM

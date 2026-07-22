@@ -76,8 +76,14 @@ class AuthProvider(Protocol):
 class DocumentFetcher(Protocol):
     """Fetch the raw bytes for a located, authorized document."""
 
-    def fetch(self, locator: DocumentLocator, auth: AuthDecision) -> FetchedDocument:
-        """Fetch ``locator.document_url`` (applying ``auth``) and return its bytes."""
+    def fetch(
+        self, locator: DocumentLocator, client: AuthClient | None
+    ) -> FetchedDocument:
+        """Fetch ``locator.document_url`` and return its bytes.
+
+        ``client`` is the authorize stage's generic :class:`AuthClient` for a gated host
+        (``AuthProvider.client``); ``None`` for a public host, which is fetched directly.
+        """
         ...
 
 

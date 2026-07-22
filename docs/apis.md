@@ -20,20 +20,21 @@ Model Context Protocol — see [MCP tools](mcp.md).
 | `PATCH /auth-providers/{id}` | Partially update a credential provider (rotate/clear its key). |
 | `DELETE /auth-providers/{id}`| Delete a credential provider row. |
 
-## Architecture: API enqueues, worker scores
+## Architecture: API enqueues, worker retrieves + scores
 
-Scoring calls the LLM judge once per metric per turn and is slow (minutes for a
-full run), so it runs **off the request path**. `POST /evaluations` parses the
-upload and persists the run tree synchronously, then enqueues a Celery job and
+Retrieval (fetching/extracting each turn's source documents) and scoring (the LLM judge, once
+per metric per turn) are both slow, so they run **off the request path**. `POST /evaluations`
+parses the upload and persists the run tree synchronously, then enqueues one Celery job and
 returns `202` immediately. A separate **worker** process
-(`celery -A scorekeeper.celery_app:celery_app worker`) consumes the queue and
-scores. The broker is the app's own Postgres (kombu's SQLAlchemy transport — no
-extra service); there is no Celery result backend, so clients track progress by
-polling `GET /evaluations/{run_id}`, which reads `BenchmarkRun.status`.
+(`celery -A scorekeeper.celery_app:celery_app worker`) consumes the queue and runs the pipeline
+orchestrator `run_pipeline_task`: **retrieval first, then scoring**
+(`evaluation.retrieve_run` → `evaluation.score_run`). The broker is the app's own Postgres
+(kombu's SQLAlchemy transport — no extra service); there is no Celery result backend, so
+clients track progress by polling `GET /evaluations/{run_id}`, which reads `BenchmarkRun.status`.
 
-Run status lifecycle: `en_cola` (queued) → `en_proceso` (a worker is scoring) →
-`completado` | `parcial` | `fallido` (terminal rollup; `fallido` also marks a run
-whose scoring raised).
+Run status lifecycle: `en_cola` (queued) → `en_recuperacion` (a worker is retrieving the
+turns' source documents) → `en_proceso` (a worker is scoring) → `completado` | `parcial` |
+`fallido` (terminal rollup; `fallido` also marks a run whose retrieval or scoring raised).
 
 ## `GET /health`
 
@@ -61,7 +62,7 @@ the parser (`scorekeeper.importer`) and the scoring runner (`scorekeeper.runner`
 | Field       | Type                     | Required | Default     | Description |
 |-------------|--------------------------|----------|-------------|-------------|
 | `platform`  | `string`                 | yes      | —           | The **default** platform for the upload (e.g. `"claude"`, `"copilot"`, `"gemini"`). Applies to every file that does not override it. Must be non-empty. |
-| `use_case`  | `string`                 | no       | `"default"` | Default metric-selection use case for every file. Comma-separated tokens are unioned (e.g. `"document_retrieval,web_search"`). |
+| `use_case`  | `string`                 | no       | `"default"` | Default metric-selection use case for every file. Comma-separated tokens are unioned (e.g. `"faithfulness_ragas,hallucination"`). |
 | `files`     | `object` (filename → overrides) | no | `{}`   | Per-file overrides keyed by the uploaded filename. A file with no entry uses the defaults. |
 
 Per-file override object:
@@ -102,18 +103,23 @@ On the request (`ingest_evaluation`):
    resolve — without it every turn scores `None`.
 2. Parse each file into raw messages, then **project** them into `Turn` rows:
    messages are grouped by turn number, `user` content becomes the `prompt` and
-   `model` content the `response` (a missing side becomes `""`).
+   `model` content the `response` (a missing side becomes `""`). The raw
+   `retrieved_context` cell is stored verbatim on `Turn.retrieved_context_source` — it is
+   **not** interpreted here; the retrieval pipeline handles it in the worker.
 3. Build and commit the `BenchmarkRun → PlatformExecution → ScenarioResult → Turn`
    tree — one `PlatformExecution` per distinct platform — with status `en_cola`, and
-   enqueue a scoring job carrying just the `run_id`.
+   enqueue the pipeline job carrying just the `run_id`.
 
-In the worker (`score_run`, off the request path):
+In the worker (`run_pipeline_task`, off the request path):
 
-4. Load the queued run, mark it `en_proceso`, and score it with
-   `EvalRunner.run_benchmark` (one `MetricScore` per metric per turn), rolling
-   scores up to scenario, platform, and run level. The runner commits **per
-   scenario**, so partial progress survives an interruption.
-5. Roll the run status up to `completado` / `parcial` / `fallido` and commit.
+4. **Retrieval** (`retrieve_run`): mark the run `en_recuperacion` and run the retrieval
+   pipeline over each turn's `retrieved_context_source`, populating `retrieved_documents`
+   (best-effort; commits **per scenario**).
+5. **Scoring** (`score_run`): mark the run `en_proceso` and score with
+   `EvalRunner.run_benchmark` (one `MetricScore` per metric per turn, reading the
+   just-retrieved context), rolling scores up to scenario, platform, and run level. The
+   runner also commits **per scenario**, so partial progress survives an interruption.
+6. Roll the run status up to `completado` / `parcial` / `fallido` and commit.
 
 > **Prerequisites.** The database schema must already exist (`alembic upgrade head`)
 > and the configured judge must have a valid API key (see `scorekeeper.config`). The
@@ -139,7 +145,7 @@ Poll `GET /evaluations/{run_id}` for progress and results (below).
 ## `GET /evaluations/{run_id}`
 
 Poll a run's current status and summary. Read the `status` to know where the run
-is in its lifecycle (`en_cola → en_proceso → completado|parcial|fallido`).
+is in its lifecycle (`en_cola → en_recuperacion → en_proceso → completado|parcial|fallido`).
 
 ### Response `200`
 
@@ -156,8 +162,8 @@ is in its lifecycle (`en_cola → en_proceso → completado|parcial|fallido`).
 ```
 
 - `status` — run lifecycle / rollup. `completado` (all scenarios scored), `parcial`
-  (some failed), `fallido` (none scored or the job errored); `en_cola` / `en_proceso`
-  while still queued or running.
+  (some failed), `fallido` (none scored or the retrieval/scoring job errored); `en_cola` /
+  `en_recuperacion` / `en_proceso` while still queued, retrieving, or scoring.
 - `progress` — **turn-level** progress: `done` of `total` turns scored, with
   `ratio` = `done / total` (0.0–1.0) for a progress bar. A turn counts as done once
   its `turn_score` is set. The ratio climbs live while `en_cola` / `en_proceso`; on
@@ -302,7 +308,7 @@ curl -X POST http://localhost:8001/evaluations \
         "platform": "claude",
         "use_case": "default",
         "files": {
-          "esc1.xlsx": {"scenario_id": "esc1", "use_case": "document_retrieval,web_search"},
+          "esc1.xlsx": {"scenario_id": "esc1", "use_case": "faithfulness_ragas,hallucination"},
           "esc2.xlsx": {"platform": "gemini"}
         }
       }'
@@ -340,10 +346,12 @@ dedicated broker (e.g. Redis) instead of Postgres.
 ## Related code
 
 - Endpoint & request/response models — `src/scorekeeper/api.py`
-- Ingest / score split + polling — `src/scorekeeper/evaluation.py`
-  (`ingest_evaluation`, `score_run`, `get_run_summary`, `run_evaluation`)
+- Ingest / retrieve / score split + polling — `src/scorekeeper/evaluation.py`
+  (`ingest_evaluation`, `retrieve_run`, `score_run`, `get_run_summary`, `run_evaluation`)
+- Retrieval orchestrator — `src/scorekeeper/retrieval/pipeline.py` (`RetrievalOrchestrator`)
 - Auth-provider CRUD service — `src/scorekeeper/retrieval/credentials/service.py`
-- Celery app & task — `src/scorekeeper/celery_app.py`, `src/scorekeeper/tasks.py`
+- Celery app & tasks — `src/scorekeeper/celery_app.py`, `src/scorekeeper/tasks.py`
+  (`run_pipeline_task` = retrieval then scoring; `enqueue_run`)
 - Parsing — `src/scorekeeper/importer.py`
 - Scoring — `src/scorekeeper/runner.py`
 - Metric selection — `src/scorekeeper/metrics/selection.py`

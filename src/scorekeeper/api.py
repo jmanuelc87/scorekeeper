@@ -104,9 +104,10 @@ def create_evaluation(
     sets one, otherwise under the payload-level ``platform``.
 
     Returns ``202`` with a ``run_id`` as soon as the upload is parsed and persisted
-    (status ``en_cola``); a Celery worker does the slow LLM scoring off the request
-    path. Poll ``GET /evaluations/{run_id}`` for progress and results. A malformed
-    sheet or bad input is still rejected synchronously here, before anything queues.
+    (status ``en_cola``); a Celery worker then runs the retrieval pipeline and the LLM
+    scoring off the request path. Poll ``GET /evaluations/{run_id}`` for progress and
+    results. A malformed sheet or bad input is still rejected synchronously here, before
+    anything queues.
     """
     try:
         parsed_payload = EvaluationPayload.model_validate_json(payload)
@@ -152,7 +153,7 @@ def create_evaluation(
         logger.warning("POST /evaluations rechazado: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    tasks.enqueue_score_run(run_id)
+    tasks.enqueue_run(run_id)
     logger.info("POST /evaluations en cola: run_id=%s", run_id)
     return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_EN_COLA)
 

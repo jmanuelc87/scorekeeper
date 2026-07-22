@@ -47,10 +47,13 @@ from scorekeeper.database import (
     SourceFile,
     Turn,
 )
+from scorekeeper.config import get_settings
 from scorekeeper.importer import parse_conversation
-from scorekeeper.retrieved_context import RetrievedContext
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.selection import sync_selection
+from scorekeeper.retrieval.pipeline import RetrievalOrchestrator
+from scorekeeper.retrieval.protocols import RetrievalPipeline
+from scorekeeper.retrieval.types import STATUS_EN_RECUPERACION, RetrievalSummary
 from scorekeeper.runner import (
     STATUS_COMPLETADO,
     STATUS_FALLIDO,
@@ -98,15 +101,15 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     number (a user+model pair shares a number). This groups by that number and,
     per turn, joins the ``user`` messages into ``prompt`` and the ``model``
     messages into ``response`` (a missing side becomes ``""``), carrying through
-    ``retrieved_context`` / ``expected_output`` when the sheet provided them.
-    Turns are returned in ascending ``turn_number`` order.
+    the raw ``retrieved_context_source`` cell / ``expected_output`` when the sheet
+    provided them. Turns are returned in ascending ``turn_number`` order.
     """
     grouped: OrderedDict[int, dict[str, Any]] = OrderedDict()
     for message in messages:
         turn = message.get("turn", 1)
         bucket = grouped.setdefault(
             turn,
-            {"prompt": [], "response": [], "retrieved_context": None, "expected_output": ""},
+            {"prompt": [], "response": [], "retrieved_context_source": "", "expected_output": ""},
         )
         role = message.get("role")
         content = message.get("content", "")
@@ -114,15 +117,10 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             bucket["prompt"].append(content)
         elif role == "model":
             bucket["response"].append(content)
-        # Keep the first non-empty context (a ``{"documents": [...]}`` dict) and
-        # the first non-empty expected output (a string) seen for the turn.
-        context = message.get("retrieved_context")
-        if (
-            isinstance(context, dict)
-            and context.get("documents")
-            and not bucket["retrieved_context"]
-        ):
-            bucket["retrieved_context"] = context
+        # Keep the first non-empty raw context cell and expected output seen for the turn.
+        source = message.get("retrieved_context_source")
+        if source and not bucket["retrieved_context_source"]:
+            bucket["retrieved_context_source"] = source
         expected = message.get("expected_output")
         if expected and not bucket["expected_output"]:
             bucket["expected_output"] = expected
@@ -135,7 +133,7 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "turn_number": turn_number,
                 "prompt": "\n".join(bucket["prompt"]),
                 "response": "\n".join(bucket["response"]),
-                "retrieved_context": bucket["retrieved_context"],
+                "retrieved_context_source": bucket["retrieved_context_source"] or None,
                 "expected_output": bucket["expected_output"] or None,
             }
         )
@@ -217,20 +215,15 @@ def ingest_evaluation(
                 platform_execution=platform_exec,
             )
             for turn in project_turns(messages):
+                # Store the raw context cell; the retrieval pipeline (score-time worker)
+                # fetches/extracts it into ``retrieved_documents`` — nothing is decoupled here.
                 turn_row = Turn(
                     turn_number=turn["turn_number"],
                     prompt=turn["prompt"],
                     response=turn["response"],
                     expected_output=turn["expected_output"],
+                    retrieved_context_source=turn["retrieved_context_source"],
                 )
-                # Decouple the retrieved context into one child row per document,
-                # preserving retriever rank (array order).
-                if turn["retrieved_context"]:
-                    context = RetrievedContext.model_validate(turn["retrieved_context"])
-                    for rank, doc in enumerate(context.documents):
-                        turn_row.retrieved_documents.append(
-                            RetrievedContextDocument.from_document(doc, rank)
-                        )
                 scenario.turns.append(turn_row)
 
         db.add(run)
@@ -304,23 +297,97 @@ def score_run(
             db.close()
 
 
+def retrieve_run(
+    run_id: str,
+    *,
+    session: Session | None = None,
+    pipeline: RetrievalPipeline | None = None,
+) -> dict[str, Any]:
+    """Run the retrieval pipeline over a queued run, populating each turn's context.
+
+    Loads the run, marks it ``en_recuperacion``, and for each turn parses/fetches/extracts its
+    raw ``retrieved_context_source`` cell into ``retrieved_documents`` — best-effort, so a
+    per-document failure is recorded in the pipeline report (and dropped from the context)
+    rather than raised. Commits **per scenario** so an interrupted job keeps finished scenarios;
+    a hard phase failure marks the run ``fallido`` and re-raises.
+
+    ``session`` defaults to ``SessionLocal()``; ``pipeline`` to a ``RetrievalOrchestrator`` bound
+    to that session (tests inject a fake). This is the retrieval half the worker runs before
+    scoring. Returns the run summary.
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        run = _load_run(db, run_id)
+        if run is None:
+            raise ValueError(f"El run {run_id} no existe.")
+
+        run.status = STATUS_EN_RECUPERACION
+        db.commit()
+
+        orchestrator = pipeline or RetrievalOrchestrator(
+            session=db, encryption_key=get_settings().auth_encryption_key
+        )
+        logger.info("Recuperando contexto para run %s…", run.id)
+        try:
+            for platform_exec in run.platform_executions:
+                for scenario in platform_exec.scenario_results:
+                    for turn in scenario.turns:
+                        _retrieve_turn(turn, orchestrator)
+                    db.commit()  # atomic-write unit: one scenario at a time
+        except Exception:
+            db.rollback()
+            run = _load_run(db, run_id)
+            if run is not None:
+                run.status = STATUS_FALLIDO
+                db.commit()
+            raise
+
+        logger.info("Recuperación completada para run %s", run.id)
+        return _summarize(run)
+    finally:
+        if owns_session:
+            db.close()
+
+
+def _retrieve_turn(turn: Turn, pipeline: RetrievalPipeline) -> None:
+    """Populate one turn's ``retrieved_documents`` from its raw context cell (best-effort)."""
+    turn.retrieved_documents.clear()  # idempotent when a run is retried
+    cell = (turn.retrieved_context_source or "").strip()
+    if not cell:
+        return
+    report = pipeline.run(cell)
+    for rank, document in enumerate(report.to_context().documents):
+        turn.retrieved_documents.append(RetrievedContextDocument.from_document(document, rank))
+    summary = RetrievalSummary.from_outcomes(report.outcomes)
+    logger.info(
+        "Turno %s: %d/%d documento(s) recuperado(s)",
+        turn.turn_number,
+        summary.retrieved,
+        summary.total,
+    )
+
+
 def run_evaluation(
     platform: str,
     files: list[UploadedFile],
     *,
     session: Session | None = None,
     judge: Judge | None = None,
+    pipeline: RetrievalPipeline | None = None,
 ) -> dict[str, Any]:
-    """Ingest ``files`` and score them under ``platform`` in one call.
+    """Ingest ``files``, retrieve their context, and score them under ``platform`` in one call.
 
-    The synchronous path: :func:`ingest_evaluation` followed by :func:`score_run` on
-    the same session. Kept for tests and in-process callers; the HTTP API instead
-    ingests inline and enqueues :func:`score_run` onto the Celery worker.
+    The synchronous path: :func:`ingest_evaluation` → :func:`retrieve_run` → :func:`score_run`
+    on the same session. Kept for tests and in-process callers; the HTTP API instead ingests
+    inline and enqueues the retrieval+scoring orchestrator onto the Celery worker. ``pipeline``
+    is injectable so tests avoid network/LLM calls.
     """
     owns_session = session is None
     db = SessionLocal() if session is None else session
     try:
         run_id = ingest_evaluation(platform, files, session=db)
+        retrieve_run(run_id, session=db, pipeline=pipeline)
         return score_run(run_id, session=db, judge=judge)
     finally:
         if owns_session:

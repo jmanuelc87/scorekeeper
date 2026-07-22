@@ -35,6 +35,13 @@ def test_resolve_html_extensions() -> None:
     assert resolver.resolve(_ref("https://eleconomista.com.mx/a.htm")).doc_type is DocType.HTML
 
 
+def test_resolve_docx_and_legacy_doc() -> None:
+    resolver = UrlDocumentLocatorResolver()
+    # .docx maps to WORD; legacy binary .doc is intentionally unmapped (unsupported).
+    assert resolver.resolve(_ref("https://sp/sites/x/Reporte.docx")).doc_type is DocType.DOCX
+    assert resolver.resolve(_ref("https://sp/sites/x/Reporte.doc")).doc_type is DocType.UNKNOWN
+
+
 def test_resolve_unquotes_encoded_filename() -> None:
     resolver = UrlDocumentLocatorResolver()
     locator = resolver.resolve(_ref("https://sp/sites/x/Reporte%20Financiero%202024.pdf"))

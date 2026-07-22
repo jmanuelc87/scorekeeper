@@ -3,10 +3,10 @@
 The type system behind the [retrieval pipeline](retrieval-pipeline.md) lives in
 `scorekeeper.retrieval.types`: the enums, the per-document outcome/status taxonomy, and the
 pydantic value objects that flow between stages. This module carries **no** network, PDF,
-HTML, or auth logic — its only behaviour is the pure assembly helpers
-`RetrievalReport.to_context` and `RetrievalSummary.from_outcomes`. The stage
-*implementations* live behind the `Protocol` interfaces in
-`scorekeeper.retrieval.protocols`.
+HTML, or auth logic — its only behaviour is the pure **assemble** helpers
+(`ExtractedContent.to_document`, `RetrievalOutcome.assembled`, `RetrievalReport.to_context`)
+and `RetrievalSummary.from_outcomes`. The stage *implementations* live behind the `Protocol`
+interfaces in `scorekeeper.retrieval.protocols`.
 
 Every stage ultimately targets the storage contract in `scorekeeper.retrieved_context`:
 a `{"documents": [{name, document, content, url}, ...]}` object ordered by retriever rank,
@@ -43,6 +43,7 @@ classDiagram
         +DocType doc_type
         +bytes body
         +str|None content_type
+        +bool cached
     }
     class ExtractedContent {
         +str text
@@ -83,10 +84,10 @@ Which stage produces each value object:
 | `SourceRef` | parse | `SourceRefParser` | Ranked reference (label + URL, optional provider `index`). |
 | `DocumentLocator` | locate | `DocumentLocatorResolver` | Fetch target: URL minus fragment, filename, `DocType`, host, page/section. |
 | `AuthDecision` | authorize | `AuthProvider` | Requirement + resolution against available credentials. |
-| `FetchedDocument` | fetch | `DocumentFetcher` | Raw bytes; **never persisted**. |
-| `ExtractedContent` | filter + extract | `ContentExtractor` | Text for the requested page/section. |
-| `RetrievalOutcome` | (threaded) | — | One reference through the whole pipeline; `document` set only when `RETRIEVED`. |
-| `RetrievalReport` | assemble | `RetrievalReport.to_context` | Pure: keeps rank order, includes only `RETRIEVED` outcomes with a `document`. |
+| `FetchedDocument` | fetch | `DocumentFetcher` | Raw bytes (never persisted); `cached` flags a local-cache hit. |
+| `ExtractedContent` | filter + extract | `ContentExtractor` | Markdown for the requested PDF page / whole document (titles, lists, tables; images dropped). |
+| `RetrievalOutcome` | assemble | `RetrievalOutcome.assembled` | Builds one reference's terminal outcome from its `ExtractedContent`: `RETRIEVED` with a `RetrievedDocument` (via `ExtractedContent.to_document`), or `EMPTY_CONTENT` when the markdown is blank. |
+| `RetrievalReport` | assemble | `RetrievalReport.to_context` | Pure: keeps rank order (duplicates preserved), includes only `RETRIEVED` outcomes with a `document`. |
 | `RetrievalSummary` | reporting | `RetrievalSummary.from_outcomes` | Pure per-status tally for `GET /evaluations`. |
 
 ## Enums
@@ -104,6 +105,7 @@ classDiagram
     class DocType {
         <<enumeration>>
         PDF
+        DOCX
         HTML
         UNKNOWN
     }
@@ -135,7 +137,8 @@ classDiagram
   dispatch (see [Cell formats](retrieval-pipeline.md#cell-formats)). JSON and pipe-labelled
   cells parse deterministically; only `PLAINTEXT` reaches the model.
 - **`DocType`** — the kind of document a source URL points at, derived from the filename
-  extension; `UNKNOWN` when unrecognized (e.g. an extensionless page URL).
+  extension (`.pdf`→`PDF`, `.docx`→`DOCX` Word, `.htm`/`.html`→`HTML`); `UNKNOWN` when
+  unrecognized (an extensionless page URL, or legacy binary `.doc`).
 - **`AuthRequirement` / `AuthStatus`** — see [Authorization](#authorization).
 - **`RetrievalStatus`** — the terminal outcome of one reference; see
   [Per-document outcome](#per-document-outcome).

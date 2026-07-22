@@ -23,7 +23,14 @@ from scorekeeper.retrieval.credentials import (
     StoredAuthProvider,
     register_credential_provider,
 )
+from scorekeeper.retrieval.extract import (
+    ExtractError,
+    MarkdownContentExtractor,
+    PageNotFoundError,
+)
+from scorekeeper.retrieval.fetch import CachingDocumentFetcher, FetchError
 from scorekeeper.retrieval.parser import LlmSourceRefParser
+from scorekeeper.retrieval.pipeline import RetrievalOrchestrator
 from scorekeeper.retrieval.protocols import (
     AuthProvider,
     ContentExtractor,
@@ -79,6 +86,12 @@ __all__ = [
     "UrlDocumentLocatorResolver",
     "HostRuleAuthProvider",
     "StoredAuthProvider",
+    "CachingDocumentFetcher",
+    "FetchError",
+    "MarkdownContentExtractor",
+    "ExtractError",
+    "PageNotFoundError",
+    "RetrievalOrchestrator",
     # Credential taxonomy
     "AuthClient",
     "CredentialProvider",

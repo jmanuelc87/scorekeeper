@@ -44,6 +44,10 @@ judges = [
 # SharePoint credential provider builds its authenticated ClientContext.
 retrieval = [
   "Office365-REST-Python-Client>=2.5,<3",
+  # Document → markdown for the extract stage (scorekeeper.retrieval.extract), imported
+  # lazily. markitdown converts PDF/.docx/HTML; pypdf slices the target PDF page first.
+  "markitdown[docx,pdf]>=0.1,<1",
+  "pypdf>=5,<6",
 ]
 
 [project.scripts]

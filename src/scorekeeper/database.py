@@ -154,6 +154,10 @@ class Turn(Base):
     expected_output: Mapped[str | None] = mapped_column(Text, default=None)
     response_time_ms: Mapped[int | None] = mapped_column(Integer, default=None)
     turn_score: Mapped[float | None] = mapped_column(Float, default=None)
+    # Raw ``retrieved_context`` cell (ranked source references) captured at ingest; the
+    # retrieval pipeline (scorekeeper.retrieval) parses/fetches/extracts it into the
+    # ``retrieved_documents`` child rows. None = the sheet had no context column.
+    retrieved_context_source: Mapped[str | None] = mapped_column(Text, default=None)
 
     scenario_result: Mapped[ScenarioResult] = relationship(back_populates="turns")
     # Retrieved context a RAG answer was grounded on, for groundedness-style metrics —
@@ -374,6 +378,31 @@ class AuthProviderConfig(Base):
     def decrypted_private_key(self, encryption_key: str) -> str:
         """Alias of :meth:`decrypted_secret`, reading naturally for certificate providers."""
         return self.decrypted_secret(encryption_key)
+
+
+class DocumentCacheEntry(Base):
+    """Index of documents cached on the local filesystem by the fetch stage.
+
+    One row per distinct source ``url`` (unique), pointing at the cached blob under
+    ``settings.retrieval_cache_dir``. The fetch stage (``scorekeeper.retrieval.fetch``) reads
+    this to avoid re-downloading a document already on disk, so a URL is fetched at most once
+    across turns/runs even though the pipeline may reference it many times. Standalone — no FK
+    into the run hierarchy; the bytes live on disk, not in the DB.
+    """
+
+    __tablename__ = "document_cache"
+    __table_args__ = (UniqueConstraint("url", name="uq_document_cache_url"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    url: Mapped[str] = mapped_column(Text)  # source document URL (fetch/cache key); unique.
+    sha256: Mapped[str] = mapped_column(String(64))  # hex digest of the URL (blob filename).
+    cache_path: Mapped[str] = mapped_column(Text)  # blob path relative to the cache root.
+    doc_type: Mapped[str] = mapped_column(String(16))  # DocType value of the cached document.
+    content_type: Mapped[str | None] = mapped_column(String(255), default=None)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
 
 
 def create_schema() -> None:

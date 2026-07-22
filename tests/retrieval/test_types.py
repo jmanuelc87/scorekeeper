@@ -42,7 +42,7 @@ def test_enum_members() -> None:
         "plaintext",
         "empty",
     }
-    assert {d.value for d in DocType} == {"pdf", "html", "unknown"}
+    assert {d.value for d in DocType} == {"pdf", "docx", "html", "unknown"}
     assert {a.value for a in AuthRequirement} == {"public", "required"}
     assert {a.value for a in AuthStatus} == {
         "not_needed",
@@ -217,7 +217,7 @@ class _DummyResolver:
 
 
 class _DummyFetcher:
-    def fetch(self, locator: DocumentLocator, auth: AuthDecision) -> FetchedDocument:
+    def fetch(self, locator: DocumentLocator, client: object | None) -> FetchedDocument:
         return FetchedDocument(document_url=locator.document_url, doc_type=locator.doc_type, body=b"")
 
 

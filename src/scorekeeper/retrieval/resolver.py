@@ -25,6 +25,7 @@ _PAGE_FRAGMENT = re.compile(r"page=(\d+)")
 # Filename extensions mapped to the document type they denote.
 _EXTENSION_TYPES = {
     ".pdf": DocType.PDF,
+    ".docx": DocType.DOCX,  # legacy binary .doc is intentionally unmapped (→ UNKNOWN).
     ".htm": DocType.HTML,
     ".html": DocType.HTML,
 }

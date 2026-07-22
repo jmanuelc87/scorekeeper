@@ -135,8 +135,8 @@ def test_columns_override(tmp_path: Path) -> None:
     assert [m["content"] for m in result] == ["Hola", "Adiós"]
 
 
-def test_retrieved_context_plaintext_cell_falls_back_to_documents(tmp_path: Path) -> None:
-    # A plain-text cell (no JSON) becomes content-only documents, blank-line split.
+def test_retrieved_context_cell_is_stored_raw(tmp_path: Path) -> None:
+    # The importer stores the raw cell verbatim; the retrieval pipeline interprets it later.
     path = _write_xlsx(
         tmp_path / "with_context.xlsx",
         ["turn", "role", "content", "contexto recuperado"],
@@ -153,39 +153,21 @@ def test_retrieved_context_plaintext_cell_falls_back_to_documents(tmp_path: Path
             "turn": 1,
             "role": "user",
             "content": "¿Política de devoluciones?",
-            "retrieved_context": {"documents": []},
+            "retrieved_context_source": "",
         },
         {
             "turn": 1,
             "role": "model",
             "content": "30 días con recibo.",
-            "retrieved_context": {
-                "documents": [
-                    {
-                        "name": "",
-                        "document": "",
-                        "content": "Devoluciones en 30 días. Requiere recibo.",
-                        "url": None,
-                    }
-                ]
-            },
+            "retrieved_context_source": "Devoluciones en 30 días. Requiere recibo.",
         },
     ]
 
 
-def test_retrieved_context_json_cell_is_parsed(tmp_path: Path) -> None:
-    # A JSON cell matching the schema is preserved with all fields.
+def test_retrieved_context_json_cell_stored_verbatim(tmp_path: Path) -> None:
+    # A JSON source-reference cell is stored verbatim — parsing/fetching is the pipeline's job.
     cell = json.dumps(
-        {
-            "documents": [
-                {
-                    "name": "Política de reembolsos §3",
-                    "document": "manual_v2.pdf",
-                    "content": "El reembolso se procesa en 30 días.",
-                    "url": "https://ejemplo.com/manual",
-                }
-            ]
-        },
+        [{"index": "1", "url": "https://ejemplo.com/manual.pdf#page=3", "name": "manual"}],
         ensure_ascii=False,
     )
     path = _write_xlsx(
@@ -196,16 +178,7 @@ def test_retrieved_context_json_cell_is_parsed(tmp_path: Path) -> None:
 
     result = parse_conversation(path)
 
-    assert result[0]["retrieved_context"] == {
-        "documents": [
-            {
-                "name": "Política de reembolsos §3",
-                "document": "manual_v2.pdf",
-                "content": "El reembolso se procesa en 30 días.",
-                "url": "https://ejemplo.com/manual",
-            }
-        ]
-    }
+    assert result[0]["retrieved_context_source"] == cell
 
 
 def test_retrieved_context_absent_omits_key(tmp_path: Path) -> None:
@@ -252,9 +225,7 @@ def test_retrieved_context_and_expected_output_together(tmp_path: Path) -> None:
 
     result = parse_conversation(path)
 
-    assert result[0]["retrieved_context"] == {
-        "documents": [{"name": "", "document": "", "content": "ctx", "url": None}]
-    }
+    assert result[0]["retrieved_context_source"] == "ctx"
     assert result[0]["expected_output"] == "ref"
 
 

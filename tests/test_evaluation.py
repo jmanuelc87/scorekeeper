@@ -171,24 +171,19 @@ def test_project_turns_missing_side_becomes_empty_string() -> None:
             "turn_number": 1,
             "prompt": "solo pregunta",
             "response": "",
-            "retrieved_context": None,
+            "retrieved_context_source": None,
             "expected_output": None,
         }
     ]
 
 
-def test_project_turns_carries_context_and_expected() -> None:
-    context = {
-        "documents": [
-            {"name": "", "document": "fuente.pdf", "content": "doc recuperado", "url": None}
-        ]
-    }
+def test_project_turns_carries_context_source_and_expected() -> None:
     messages = [
         {
             "turn": 1,
             "role": "user",
             "content": "pregunta",
-            "retrieved_context": context,
+            "retrieved_context_source": "fuente (https://h/a.pdf#page=1)",
             "expected_output": "respuesta ideal",
         },
         {"turn": 1, "role": "model", "content": "respuesta"},
@@ -196,20 +191,12 @@ def test_project_turns_carries_context_and_expected() -> None:
 
     turns = project_turns(messages)
 
-    assert turns[0]["retrieved_context"] == context
+    assert turns[0]["retrieved_context_source"] == "fuente (https://h/a.pdf#page=1)"
     assert turns[0]["expected_output"] == "respuesta ideal"
 
 
-def test_ingest_decouples_context_into_retrieved_document_rows(session: Session) -> None:
-    cell = json.dumps(
-        {
-            "documents": [
-                {"name": "a", "document": "d1.pdf", "content": "uno", "url": "http://x"},
-                {"name": "b", "document": "d2.pdf", "content": "dos", "url": None},
-            ]
-        },
-        ensure_ascii=False,
-    )
+def test_ingest_stores_raw_context_source_without_extracting(session: Session) -> None:
+    cell = "manual (https://ejemplo.com/manual.pdf#page=3)"
     content = _xlsx_bytes(
         ["turn", "role", "content", "retrieved_context"],
         [
@@ -225,17 +212,13 @@ def test_ingest_decouples_context_into_retrieved_document_rows(session: Session)
 
     ingest_evaluation("claude", files, session=session)
 
-    docs = session.execute(
-        select(RetrievedContextDocument).order_by(RetrievedContextDocument.rank)
-    ).scalars().all()
-    assert [(d.rank, d.document, d.content, d.url) for d in docs] == [
-        (0, "d1.pdf", "uno", "http://x"),
-        (1, "d2.pdf", "dos", None),
-    ]
-    # All rows hang off the one turn; no JSON column remains on Turn.
+    # Ingest stores the raw cell and does NOT extract documents — that is the retrieval
+    # stage's job (run later by the worker).
+    docs = session.execute(select(RetrievedContextDocument)).scalars().all()
+    assert docs == []
     turn = session.execute(select(Turn)).scalars().one()
-    assert [d.rank for d in turn.retrieved_documents] == [0, 1]
-    assert not hasattr(turn, "retrieved_context")
+    assert turn.retrieved_context_source == cell
+    assert turn.retrieved_documents == []
 
 
 def test_project_turns_joins_multiple_same_role_messages() -> None:
@@ -439,13 +422,22 @@ def test_endpoint_ingests_enqueues_and_returns_run_id(monkeypatch) -> None:
         return "run-123"
 
     monkeypatch.setattr(evaluation, "ingest_evaluation", fake_ingest)
-    monkeypatch.setattr(tasks, "enqueue_score_run", lambda run_id: captured.update(enqueued=run_id))
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
 
     with TestClient(app) as client:
         response = client.post(
             "/evaluations",
             files=[("files", ("esc1.xlsx", _conversation_bytes(), "application/octet-stream"))],
-            data={"payload": _payload(files={"esc1.xlsx": {"scenario_id": "custom", "use_case": "web_search"}})},
+            data={
+                "payload": _payload(
+                    files={
+                        "esc1.xlsx": {
+                            "scenario_id": "custom",
+                            "use_case": "faithfulness_ragas",
+                        }
+                    }
+                )
+            },
         )
 
     # 202 Accepted with the run id; scoring was enqueued, not run inline.
@@ -457,7 +449,7 @@ def test_endpoint_ingests_enqueues_and_returns_run_id(monkeypatch) -> None:
     assert captured["platform"] == "claude"
     upload = captured["files"][0]
     assert upload.scenario_id == "custom"
-    assert upload.use_case == "web_search"
+    assert upload.use_case == "faithfulness_ragas"
     assert upload.platform is None  # no per-file platform → falls back to payload
 
 
@@ -470,7 +462,7 @@ def test_endpoint_per_file_platform_override(monkeypatch) -> None:
         return "run-9"
 
     monkeypatch.setattr(evaluation, "ingest_evaluation", fake_ingest)
-    monkeypatch.setattr(tasks, "enqueue_score_run", lambda run_id: None)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: None)
 
     with TestClient(app) as client:
         response = client.post(
@@ -496,7 +488,7 @@ def test_endpoint_defaults_scenario_id_to_stem(monkeypatch) -> None:
         "ingest_evaluation",
         lambda platform, files, **kw: captured.update(files=files) or "run-x",
     )
-    monkeypatch.setattr(tasks, "enqueue_score_run", lambda run_id: None)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: None)
 
     with TestClient(app) as client:
         response = client.post(

@@ -50,6 +50,7 @@ class DocType(StrEnum):
     """The kind of document a source URL points at."""
 
     PDF = "pdf"
+    DOCX = "docx"  # Word (.docx); legacy binary .doc is not supported.
     HTML = "html"
     UNKNOWN = "unknown"
 
@@ -123,6 +124,7 @@ class FetchedDocument(BaseModel):
     doc_type: DocType
     body: bytes
     content_type: str | None = None  # HTTP ``Content-Type`` header, if present.
+    cached: bool = False  # True when served from the local cache (no network fetch).
 
 
 class ExtractedContent(BaseModel):
@@ -130,6 +132,23 @@ class ExtractedContent(BaseModel):
 
     text: str
     page: int | None = None
+
+    def to_document(
+        self, source: "SourceRef", locator: "DocumentLocator"
+    ) -> RetrievedDocument:
+        """Assemble a ``RetrievedDocument`` from this content and its source reference.
+
+        Pure field mapping (Assemble stage). ``name`` is the reference label; ``document`` is a
+        human source ref (the filename, falling back to the label then the URL); ``content`` is
+        the extracted markdown; ``url`` keeps ``source.url`` so any ``#page=N`` citation anchor
+        survives (unlike the fragment-stripped ``document_url`` fetch key).
+        """
+        return RetrievedDocument(
+            name=source.name,
+            document=locator.filename or source.name or locator.document_url,
+            content=self.text,
+            url=source.url or None,
+        )
 
 
 class RetrievalOutcome(BaseModel):
@@ -146,6 +165,37 @@ class RetrievalOutcome(BaseModel):
     document: RetrievedDocument | None = None
     error: str | None = None
 
+    @classmethod
+    def assembled(
+        cls,
+        source: SourceRef,
+        locator: DocumentLocator,
+        extracted: ExtractedContent,
+        *,
+        auth: AuthDecision | None = None,
+    ) -> "RetrievalOutcome":
+        """Assemble one reference's terminal outcome from its extract result.
+
+        Non-blank markdown → ``RETRIEVED`` carrying the assembled ``RetrievedDocument``; blank
+        text → ``EMPTY_CONTENT`` with no document (so ``to_context`` drops it). ``locator`` and
+        the optional ``auth`` are threaded through for the orchestrator.
+        """
+        if extracted.text.strip():
+            return cls(
+                source=source,
+                status=RetrievalStatus.RETRIEVED,
+                locator=locator,
+                auth=auth,
+                document=extracted.to_document(source, locator),
+            )
+        return cls(
+            source=source,
+            status=RetrievalStatus.EMPTY_CONTENT,
+            locator=locator,
+            auth=auth,
+            error="contenido vacío",
+        )
+
 
 class RetrievalReport(BaseModel):
     """The result of running the pipeline over one ``retrieved_context`` cell."""
@@ -156,8 +206,10 @@ class RetrievalReport(BaseModel):
     def to_context(self) -> RetrievedContext:
         """Assemble the successfully-retrieved documents into a ``RetrievedContext``.
 
-        Keeps the outcomes' order (retriever rank) and includes only outcomes whose
-        ``status`` is ``RETRIEVED`` with a populated ``document``. Pure assembly — no I/O.
+        Keeps the outcomes' order — assemble assumes they are supplied in retriever-rank order
+        (as the parser/orchestrator produce them) — and includes only outcomes whose ``status``
+        is ``RETRIEVED`` with a populated ``document`` (built by ``RetrievalOutcome.assembled``).
+        Duplicate references to the same URL are preserved as separate documents. Pure — no I/O.
         """
         return RetrievedContext(
             documents=[
