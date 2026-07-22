@@ -14,27 +14,47 @@ are documented in the [Metrics catalog](metrics-catalog.md).
 
 ## The big picture
 
-```
-ScenarioResult.use_case ──▶ scenario_metrics table ──▶ metric names
-                                    ▲                        │
-                        sync_selection() reads          resolve() instantiates
-                        @register(scenarios=…)                │
-                                                              ▼
-        Turn ──▶ TurnView ──▶ Metric.evaluate(turn, judge) ──▶ MetricResult
-                                         │                        │
-                                       Judge                 persisted as
-                                   (LLM seam)                 MetricScore rows
-                                                                  │
-                                                          rollup: weighted,
-                                                          normalized turn_score
+```mermaid
+flowchart TD
+    subgraph sel["Selection — which metrics run"]
+        reg["@register(scenarios=…)<br/>on each Metric class"]
+        tbl[("scenario_metrics<br/>table")]
+        uc["ScenarioResult.use_case"]
+        inst["Metric instances"]
+        reg -- "sync_selection()" --> tbl
+        uc -- "resolve_scenario()" --> tbl
+        tbl --> inst
+    end
+
+    subgraph score["Scoring — one turn"]
+        turn["Turn<br/>+ retrieved_documents<br/>+ expected_output<br/>+ running history"]
+        view["TurnView<br/>(ORM-free projection)"]
+        ev["Metric.evaluate(turn, judge)"]
+        judge["Judge<br/>(LLM seam)"]
+        res["MetricResult"]
+        turn --> view --> ev
+        ev -- "score() · structured() · embed()" --> judge
+        judge -- "JudgeVerdict / schema" --> ev
+        ev --> res
+    end
+
+    inst --> ev
+    res --> rows[("MetricScore rows")]
+    rows -- "turn_score(): weighted mean<br/>of normalized scores" --> ts["Turn.turn_score"]
+    ts -- "average()" --> sa["ScenarioResult.average_score"]
+    sa -- "average()" --> pa["PlatformExecution.average_score"]
 ```
 
 - A metric declares which scenarios it applies to with a decorator; that mapping
   is materialized into the `scenario_metrics` table.
-- The scoring runner reads a scenario's `use_case`, resolves its metric subset,
-  and runs each metric's `evaluate()` against the turn.
+- The scoring runner reads a scenario's `use_case` (a comma-separated list whose
+  metric sets are unioned), resolves its metric subset, and runs each metric's
+  `evaluate()` against the turn — the metrics of a turn evaluate concurrently.
+- `evaluate()` sees only a `TurnView`: prompt, response, conversation history,
+  the turn's retrieved context, and the expected output.
 - Each result becomes a `MetricScore` row; rollup turns them into a per-turn
-  score (see [Data model](data-model.md)).
+  score and then into scenario and platform averages (see
+  [Data model](data-model.md)).
 
 ## Core concepts
 

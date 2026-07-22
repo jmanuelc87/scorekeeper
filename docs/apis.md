@@ -1,11 +1,12 @@
 # HTTP APIs
 
 The HTTP API (`scorekeeper.api`, run with `scorekeeper-api`) serves the results
-dashboard and triggers evaluations. This page documents every endpoint; add new
-ones as their own `##` section below. For the models these endpoints read and
-write, see the [Data model](data-model.md); for how metrics are chosen and scored,
-see [Evaluation metrics](evaluation-metrics.md). The same results are also exposed
-over the Model Context Protocol — see [MCP tools](mcp.md).
+dashboard, triggers evaluations, and manages the retrieval credential store. This page
+documents every endpoint; add new ones as their own `##` section below. For the models these
+endpoints read and write, see the [Data model](data-model.md); for how metrics are chosen and
+scored, see [Evaluation metrics](evaluation-metrics.md); for the credential store, see
+[Retrieval credentials](retrieval-credentials.md). The same results are also exposed over the
+Model Context Protocol — see [MCP tools](mcp.md).
 
 | Method & path                | Purpose |
 |------------------------------|---------|
@@ -13,6 +14,11 @@ over the Model Context Protocol — see [MCP tools](mcp.md).
 | `POST /evaluations`          | Ingest conversation `.xlsx` files and **enqueue** them for scoring (per-file platform, defaulting to the payload platform). |
 | `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity (HTTP twin of the MCP `retrieve` tool). |
+| `GET /auth-providers`        | List the retrieval credential store's provider rows (optional filters). |
+| `POST /auth-providers`       | Create a credential provider row (write-only `private_key`, stored encrypted). |
+| `GET /auth-providers/{id}`   | Fetch one credential provider by UUID. |
+| `PATCH /auth-providers/{id}` | Partially update a credential provider (rotate/clear its key). |
+| `DELETE /auth-providers/{id}`| Delete a credential provider row. |
 
 ## Architecture: API enqueues, worker scores
 
@@ -225,6 +231,43 @@ shape.
 |--------|------|
 | `400`  | `granularity` is not one of the three accepted values, or `start_date`/`end_date` is not a valid ISO-8601 date. No-match filters are **not** errors — they return `[]`. |
 
+## Auth providers CRUD
+
+Manage the retrieval pipeline's credential store — the [`auth_providers`](data-model.md#authproviderconfig)
+table read by the authorize stage (see [Retrieval credentials](retrieval-credentials.md)). One
+enabled row per gated `host` configures how that host is authenticated.
+
+> **Secrets are write-only.** The certificate `private_key` (a PEM) is accepted on create /
+> update, stored **encrypted** (per-row salt), and **never returned** — reads expose only a
+> `has_private_key` boolean. These endpoints handle secrets and carry **no built-in auth**;
+> restrict them at the network / deployment layer.
+
+| Method & path | Purpose | Success |
+|---|---|---|
+| `GET /auth-providers` | List providers; optional `provider`, `host`, `enabled` query filters (AND-combined). | `200` — array of provider views |
+| `POST /auth-providers` | Create a provider row. | `201` — the created view |
+| `GET /auth-providers/{id}` | Fetch one provider by UUID. | `200` |
+| `PATCH /auth-providers/{id}` | Partial update; only the supplied fields change. Sending `private_key` rotates the stored key (a `null`/empty value clears it); omitting it leaves the key untouched. | `200` — the updated view |
+| `DELETE /auth-providers/{id}` | Delete a provider row. | `204` — no content |
+
+**Body (create / update).** `provider` (kind, e.g. `"sharepoint"` or `"oauth2"`) and `host`
+are required on create; `enabled` (default `true`), `tenant_id`, `client_id`, `thumbprint`,
+`site_url`, `settings` (JSON), and the write-only `private_key` are optional. `provider` must
+be a registered kind. `private_key` carries **that kind's secret** — a certificate private key
+for `sharepoint`, an OAuth2 client secret for `oauth2` — and kind-specific non-secret config
+(e.g. the OAuth2 `token_url` / `scope`) goes in `settings`.
+
+**Read view.** `id`, `provider`, `host`, `enabled`, the SharePoint identifiers,
+`has_private_key`, `settings`, `created_at`, `updated_at`.
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | Unknown `{id}` on get / update / delete. |
+| `409`  | Create / update would duplicate an existing `(provider, host)` pair. |
+| `422`  | Unknown `provider` kind; a `private_key` supplied while `AUTH_ENCRYPTION_KEY` is unset; an empty `PATCH` body; a malformed UUID or missing required field. |
+
 ## Examples
 
 Enqueue (defaults, single file) → returns a `run_id`:
@@ -265,6 +308,25 @@ curl -X POST http://localhost:8001/evaluations \
       }'
 ```
 
+Configure a SharePoint credential provider, then list it (note the key is not echoed back):
+
+```bash
+curl -X POST http://localhost:8001/auth-providers \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "provider": "sharepoint",
+        "host": "cognitactix-my.sharepoint.com",
+        "tenant_id": "<tenant-guid>",
+        "client_id": "<app-client-id>",
+        "thumbprint": "<cert-thumbprint>",
+        "site_url": "https://cognitactix-my.sharepoint.com/sites/x",
+        "private_key": "-----BEGIN PRIVATE KEY-----\n…"
+      }'
+# {"id":"7d3e…","provider":"sharepoint","has_private_key":true, … }  (no private_key field)
+
+curl http://localhost:8001/auth-providers
+```
+
 ## Running the worker
 
 ```bash
@@ -280,6 +342,7 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Endpoint & request/response models — `src/scorekeeper/api.py`
 - Ingest / score split + polling — `src/scorekeeper/evaluation.py`
   (`ingest_evaluation`, `score_run`, `get_run_summary`, `run_evaluation`)
+- Auth-provider CRUD service — `src/scorekeeper/retrieval/credentials/service.py`
 - Celery app & task — `src/scorekeeper/celery_app.py`, `src/scorekeeper/tasks.py`
 - Parsing — `src/scorekeeper/importer.py`
 - Scoring — `src/scorekeeper/runner.py`

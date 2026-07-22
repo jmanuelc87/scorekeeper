@@ -126,7 +126,7 @@ def _fill_placeholders(template: str, turn: TurnView) -> str:
             _SafeDict(
                 prompt=turn.prompt,
                 response=turn.response,
-                context=turn.retrieved_context,
+                context=turn.retrieved_context.render(),
             )
         )
     except (ValueError, IndexError, KeyError):
@@ -148,9 +148,9 @@ def render_prompt(instructions: str, turn: TurnView) -> str:
         for i, (prompt, response) in enumerate(turn.history, start=1):
             parts.append(f"  [{i}] Usuario: {prompt}")
             parts.append(f"      Asistente: {response}")
-    if turn.retrieved_context:
+    if not turn.retrieved_context.is_empty:
         parts.append("--- Contexto recuperado ---")
-        parts.append(turn.retrieved_context)
+        parts.append(turn.retrieved_context.render())
     parts.append(f"Usuario: {turn.prompt}")
     parts.append(f"Asistente: {turn.response}")
     return "\n".join(parts)

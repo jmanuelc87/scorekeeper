@@ -27,6 +27,7 @@ from scorekeeper.database import (
     BenchmarkRun,
     MetricScore,
     PlatformExecution,
+    RetrievedContextDocument,
     ScenarioResult,
     SourceFile,
     Turn,
@@ -177,12 +178,17 @@ def test_project_turns_missing_side_becomes_empty_string() -> None:
 
 
 def test_project_turns_carries_context_and_expected() -> None:
+    context = {
+        "documents": [
+            {"name": "", "document": "fuente.pdf", "content": "doc recuperado", "url": None}
+        ]
+    }
     messages = [
         {
             "turn": 1,
             "role": "user",
             "content": "pregunta",
-            "retrieved_context": "doc recuperado",
+            "retrieved_context": context,
             "expected_output": "respuesta ideal",
         },
         {"turn": 1, "role": "model", "content": "respuesta"},
@@ -190,8 +196,46 @@ def test_project_turns_carries_context_and_expected() -> None:
 
     turns = project_turns(messages)
 
-    assert turns[0]["retrieved_context"] == "doc recuperado"
+    assert turns[0]["retrieved_context"] == context
     assert turns[0]["expected_output"] == "respuesta ideal"
+
+
+def test_ingest_decouples_context_into_retrieved_document_rows(session: Session) -> None:
+    cell = json.dumps(
+        {
+            "documents": [
+                {"name": "a", "document": "d1.pdf", "content": "uno", "url": "http://x"},
+                {"name": "b", "document": "d2.pdf", "content": "dos", "url": None},
+            ]
+        },
+        ensure_ascii=False,
+    )
+    content = _xlsx_bytes(
+        ["turn", "role", "content", "retrieved_context"],
+        [
+            [1, "user", "pregunta", cell],
+            [1, "model", "respuesta", ""],
+        ],
+    )
+    files = [
+        UploadedFile(
+            filename="esc.xlsx", content=content, scenario_id="esc", use_case="default"
+        )
+    ]
+
+    ingest_evaluation("claude", files, session=session)
+
+    docs = session.execute(
+        select(RetrievedContextDocument).order_by(RetrievedContextDocument.rank)
+    ).scalars().all()
+    assert [(d.rank, d.document, d.content, d.url) for d in docs] == [
+        (0, "d1.pdf", "uno", "http://x"),
+        (1, "d2.pdf", "dos", None),
+    ]
+    # All rows hang off the one turn; no JSON column remains on Turn.
+    turn = session.execute(select(Turn)).scalars().one()
+    assert [d.rank for d in turn.retrieved_documents] == [0, 1]
+    assert not hasattr(turn, "retrieved_context")
 
 
 def test_project_turns_joins_multiple_same_role_messages() -> None:

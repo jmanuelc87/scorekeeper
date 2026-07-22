@@ -1,5 +1,8 @@
 import logging
+from datetime import datetime
 from pathlib import Path
+from typing import Any
+from uuid import UUID
 
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
@@ -8,6 +11,11 @@ from pydantic import BaseModel, Field
 
 from scorekeeper import evaluation, tasks
 from scorekeeper.config import get_settings
+from scorekeeper.retrieval.credentials import service as auth_providers
+from scorekeeper.retrieval.credentials.service import (
+    ProviderConflictError,
+    ProviderValidationError,
+)
 
 # Surface app (INFO) logs in the container output; uvicorn only configures its own
 # loggers, so without this our progress logs would be swallowed.
@@ -24,7 +32,7 @@ app = FastAPI(title="Scorekeeper Results API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -196,6 +204,119 @@ def list_runs(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# --- Auth provider CRUD ---------------------------------------------------------------
+#
+# Manage the retrieval pipeline's credential store (the ``auth_providers`` table). The
+# certificate ``private_key`` is **write-only**: it is accepted on create/update, stored
+# encrypted, and never returned — reads expose only ``has_private_key``. These endpoints
+# manage secrets and carry no built-in auth, so restrict them at the network/deployment layer.
+
+
+class AuthProviderCreate(BaseModel):
+    """Body for ``POST /auth-providers``. ``private_key`` is a PEM, stored encrypted."""
+
+    provider: str = Field(..., min_length=1, description="Provider kind, e.g. 'sharepoint'.")
+    host: str = Field(..., min_length=1, description="Gated host this row authorizes.")
+    enabled: bool = True
+    tenant_id: str | None = None
+    client_id: str | None = None
+    thumbprint: str | None = None
+    site_url: str | None = None
+    settings: dict[str, Any] | None = None
+    # Write-only certificate private key (PEM); encrypted at rest, never returned.
+    private_key: str | None = None
+
+
+class AuthProviderUpdate(BaseModel):
+    """Body for ``PATCH /auth-providers/{id}``. Only the fields present are changed.
+
+    Sending ``private_key`` rotates the stored key (a falsy value clears it); omitting it
+    leaves the key untouched.
+    """
+
+    provider: str | None = Field(None, min_length=1)
+    host: str | None = Field(None, min_length=1)
+    enabled: bool | None = None
+    tenant_id: str | None = None
+    client_id: str | None = None
+    thumbprint: str | None = None
+    site_url: str | None = None
+    settings: dict[str, Any] | None = None
+    private_key: str | None = None
+
+
+class AuthProviderRead(BaseModel):
+    """Safe read view of an ``auth_providers`` row — no secret material."""
+
+    id: str
+    provider: str
+    host: str
+    enabled: bool
+    tenant_id: str | None
+    client_id: str | None
+    thumbprint: str | None
+    site_url: str | None
+    # Whether an (encrypted) certificate private key is stored; the key itself is never emitted.
+    has_private_key: bool
+    settings: dict[str, Any] | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@app.get("/auth-providers", response_model=list[AuthProviderRead])
+def list_auth_providers(
+    provider: str | None = Query(None, description="Filtra por tipo de proveedor."),
+    host: str | None = Query(None, description="Coincidencia exacta de host."),
+    enabled: bool | None = Query(None, description="Filtra por estado habilitado."),
+) -> list[dict[str, Any]]:
+    """List configured credential providers (filters optional, AND-combined)."""
+    return auth_providers.list_providers(provider=provider, host=host, enabled=enabled)
+
+
+@app.post("/auth-providers", response_model=AuthProviderRead, status_code=201)
+def create_auth_provider(body: AuthProviderCreate) -> dict[str, Any]:
+    """Create a credential provider row. ``409`` on a duplicate ``(provider, host)``."""
+    try:
+        return auth_providers.create_provider(body.model_dump())
+    except ProviderValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProviderConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/auth-providers/{provider_id}", response_model=AuthProviderRead)
+def get_auth_provider(provider_id: UUID) -> dict[str, Any]:
+    """Return one credential provider. ``404`` when the id is unknown."""
+    row = auth_providers.get_provider(provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"El proveedor {provider_id} no existe.")
+    return row
+
+
+@app.patch("/auth-providers/{provider_id}", response_model=AuthProviderRead)
+def update_auth_provider(provider_id: UUID, body: AuthProviderUpdate) -> dict[str, Any]:
+    """Partially update a credential provider. ``404`` unknown; ``409`` on a duplicate key."""
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="No hay campos para actualizar.")
+    try:
+        row = auth_providers.update_provider(provider_id, changes)
+    except ProviderValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProviderConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"El proveedor {provider_id} no existe.")
+    return row
+
+
+@app.delete("/auth-providers/{provider_id}", status_code=204)
+def delete_auth_provider(provider_id: UUID) -> None:
+    """Delete a credential provider. ``404`` when the id is unknown."""
+    if not auth_providers.delete_provider(provider_id):
+        raise HTTPException(status_code=404, detail=f"El proveedor {provider_id} no existe.")
 
 
 def main() -> None:

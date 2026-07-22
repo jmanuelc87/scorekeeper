@@ -7,25 +7,16 @@ from scorekeeper.metrics.catalog.hallucination import (
     Hallucination,
     NLIJudgment,
     NLILabel,
-    split_context_docs,
 )
+from scorekeeper.retrieved_context import RetrievedContext
 
 
 def _turn(context: str) -> TurnView:
     return TurnView(
         prompt="¿Cuál es la política de devoluciones?",
         response="Puedes devolver en 30 días con recibo.",
-        retrieved_context=context,
+        retrieved_context=RetrievedContext.from_blob(context),
     )
-
-
-def test_split_context_docs_on_blank_lines() -> None:
-    assert split_context_docs("doc uno\ncon dos líneas\n\ndoc dos") == [
-        "doc uno\ncon dos líneas",
-        "doc dos",
-    ]
-    assert split_context_docs("  \n  ") == []
-    assert split_context_docs("único documento") == ["único documento"]
 
 
 def test_no_contradictions_is_zero_hallucination(make_judge) -> None:

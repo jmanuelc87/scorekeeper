@@ -23,7 +23,6 @@ The NLI judgment is a *classification* step, so it goes through the judge's
 
 from __future__ import annotations
 
-import re
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -119,18 +118,6 @@ HIPÓTESIS (respuesta del asistente):
 """
 
 
-def split_context_docs(context: str) -> list[str]:
-    """Split a free-form ``retrieved_context`` blob into individual documents.
-
-    The context is stored as an undelimited text blob, so we treat blank-line
-    separated blocks as separate documents (keeping multi-line documents intact)
-    and fall back to the whole trimmed blob as a single document. Empty input
-    yields no documents.
-    """
-    docs = [block.strip() for block in re.split(r"\n\s*\n", context)]
-    return [doc for doc in docs if doc]
-
-
 @register(scenarios=["hallucination"])
 class Hallucination(MultiStepMetric):
     """Fraction of retrieved documents the answer contradicts."""
@@ -144,7 +131,7 @@ class Hallucination(MultiStepMetric):
     weight = 1.0
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
-        docs = split_context_docs(turn.retrieved_context)
+        docs = turn.retrieved_context.node_texts()
 
         if not docs:
             # No retrieved context to contradict: nothing to hallucinate.

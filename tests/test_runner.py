@@ -19,6 +19,7 @@ from scorekeeper.database import (
     BenchmarkRun,
     MetricScore,
     PlatformExecution,
+    RetrievedContextDocument,
     ScenarioMetric,
     ScenarioResult,
     Turn,
@@ -167,6 +168,31 @@ def _seed_scenario(
 
 
 # --- Tests --------------------------------------------------------------------
+
+
+def test_to_turn_view_rebuilds_context_from_child_rows(session: Session) -> None:
+    _, _, scenario = _seed_scenario(session, [("hola", "respuesta")])
+    turn = scenario.turns[0]
+    # Insert out of order to prove the ordered relationship sorts by rank.
+    turn.retrieved_documents.append(
+        RetrievedContextDocument(rank=1, name="b", document="d2.pdf", content="dos", url=None)
+    )
+    turn.retrieved_documents.append(
+        RetrievedContextDocument(rank=0, name="a", document="d1.pdf", content="uno", url="http://x")
+    )
+    session.flush()
+
+    view = EvalRunner(session, RecordingJudge())._to_turn_view(turn, [])
+
+    assert [d.content for d in view.retrieved_context.documents] == ["uno", "dos"]
+    assert view.retrieved_context.documents[0].url == "http://x"
+    assert view.retrieved_context.node_texts() == ["d1.pdf\nuno", "d2.pdf\ndos"]
+
+
+def test_to_turn_view_empty_context_when_no_child_rows(session: Session) -> None:
+    _, _, scenario = _seed_scenario(session, [("hola", "respuesta")])
+    view = EvalRunner(session, RecordingJudge())._to_turn_view(scenario.turns[0], [])
+    assert view.retrieved_context.is_empty
 
 
 def test_happy_path_scores_and_rolls_up(session: Session, registry) -> None:

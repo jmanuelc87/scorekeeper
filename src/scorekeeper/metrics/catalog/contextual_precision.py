@@ -20,8 +20,9 @@ It works in two stages:
   A relevant node at a high rank contributes a larger precision term, so front-
   loading relevant nodes maximizes the score.
 
-Nodes come from the turn's ``retrieved_context`` blob, split into ordered,
-blank-line-separated blocks (the same node convention the hallucination metric
+Nodes come from the turn's structured ``retrieved_context`` documents, in retriever
+rank order, each rendered to node text (source ``document`` + ``content``) by
+``RetrievedContext.node_texts`` (the same node convention the hallucination metric
 uses). Labeling is a *classification* step, so it goes through the judge's
 ``structured()`` seam rather than ``score()``. With no relevant node (or no
 retrieved context at all) the score is ``0.0``. All prompts and justification
@@ -39,7 +40,6 @@ from scorekeeper.metrics.base import (
     TurnView,
 )
 from scorekeeper.metrics.category import MetricCategory
-from scorekeeper.metrics.catalog.hallucination import split_context_docs
 from scorekeeper.metrics.judge import Judge, JudgeStep
 from scorekeeper.metrics.registry import register
 from scorekeeper.metrics.scale import Unit
@@ -94,7 +94,7 @@ class ContextualPrecision(MultiStepMetric):
     strict_mode: bool = False
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
-        nodes = split_context_docs(turn.retrieved_context)
+        nodes = turn.retrieved_context.node_texts()
 
         if not nodes:
             # No retrieved nodes to rank: nothing relevant was retrieved.

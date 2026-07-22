@@ -81,8 +81,19 @@ erDiagram
         Integer turn_number
         Text prompt
         Text response
+        Text expected_output
         Integer response_time_ms
         Float turn_score
+    }
+
+    RetrievedDocument {
+        UUID id PK
+        UUID turn_id FK
+        Float rank
+        Text name
+        Text document
+        Text content
+        Text url
     }
 
     MetricScore {
@@ -101,15 +112,34 @@ erDiagram
         String metric_name
     }
 
+    AuthProviderConfig {
+        UUID id PK
+        String provider UK
+        String host UK
+        Boolean enabled
+        String tenant_id
+        String client_id
+        String thumbprint
+        String site_url
+        Text private_key_encrypted
+        Text private_key_salt
+        JSON settings
+        DateTime created_at
+        DateTime updated_at
+    }
+
     SourceFile ||--o{ BenchmarkRun : "seeds"
     BenchmarkRun ||--o{ PlatformExecution : "has"
     PlatformExecution ||--o{ ScenarioResult : "has"
     ScenarioResult ||--o{ Turn : "has"
+    Turn ||--o{ RetrievedDocument : "grounded on"
     Turn ||--o{ MetricScore : "has"
 ```
 
-`ScenarioMetric` is a standalone selection table (no FK into the run hierarchy):
-it is joined to scenarios by matching `use_case`.
+`ScenarioMetric` and `AuthProviderConfig` are standalone tables (no FK into the run
+hierarchy). `ScenarioMetric` is joined to scenarios by matching `use_case`;
+`AuthProviderConfig` is read by the retrieval pipeline's authorize stage, keyed by `host`
+(unique together with `provider`).
 
 ## Entities
 
@@ -176,8 +206,38 @@ One user/model exchange within a conversation, evaluated on its own.
 | `turn_number` | Integer | Order of the turn within the conversation. |
 | `prompt` | Text | User message. |
 | `response` | Text | Model response. |
+| `expected_output` | Text | Ground-truth answer for reference-based metrics (e.g. contextual precision); `NULL` when no reference is available. |
 | `response_time_ms` | Integer | Response latency, if available. |
 | `turn_score` | Float | Composite score for the turn; mean of its `MetricScore` values. |
+
+The documents a RAG answer was grounded on are stored as `RetrievedDocument` child
+rows (below), not on the turn itself.
+
+### RetrievedDocument
+
+One document a RAG answer was grounded on, for groundedness metrics. Decoupled from the
+turn into its own table — one row per document, ordered within a turn by `rank`
+(retriever order). The in-memory `RetrievedContext` (`scorekeeper.retrieved_context`) is
+assembled from these rows; a turn with no rows has no retrieved context.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `turn_id` | UUID | FK → `turns.id`, `ON DELETE CASCADE` (indexed). |
+| `rank` | Float | Retriever order within the turn (integer or float; 0-based); `contextual_precision` relies on it. |
+| `name` | Text | Short label/title for the retrieved item. |
+| `document` | Text | Source document reference (filename, title, id). |
+| `content` | Text | The retrieved text. |
+| `url` | Text | Source URL for retrieved web documents; `NULL` otherwise. |
+
+Groundedness metrics evaluate each document's *node text* — its `document` plus
+`content` — via `RetrievedContext.node_texts()`. Legacy plain-text spreadsheet cells
+still import: `RetrievedContext.from_blob` blank-line-splits them into content-only
+documents.
+
+Real source cells hold *source references* (label + URL), not document text. Turning
+those into these rows — parse → locate → authorize → fetch → filter → extract →
+assemble — is the [retrieval pipeline](retrieval-pipeline.md).
 
 ### MetricScore
 
@@ -204,6 +264,30 @@ scenarios, materialized by `scorekeeper.metrics.selection.sync_selection`.
 | `id` | UUID | Primary key. |
 | `use_case` | String(128) | Scenario type the metric applies to (indexed). `"default"` is the fallback set used when a `use_case` has no rows. |
 | `metric_name` | String(128) | Metric name, validated against the code registry at resolve time (no FK). Unique together with `use_case`. |
+
+### AuthProviderConfig
+
+Per-provider authentication settings for the retrieval pipeline's authorize stage
+(`table auth_providers`). A single table with a `provider` discriminator backs the
+credential taxonomy in `scorekeeper.retrieval.credentials`: one enabled row per gated
+`host` supplies the settings its `CredentialProvider` needs to build an authenticated
+client. Standalone — no FK into the run hierarchy. The provider's secret (a certificate
+private key or an OAuth2 client secret) is stored **encrypted** (Fernet token + per-row salt),
+decrypted with `AUTH_ENCRYPTION_KEY` only when a client is built; the other columns hold
+non-secret identifiers. Shipped kinds: `sharepoint` (client certificate) and `oauth2`
+(client-credentials bearer token).
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `provider` | String(64) | Credential-provider *kind* (`sharepoint`, `oauth2`). Unique together with `host`. |
+| `host` | String(256) | Gated host this row authorizes (indexed). Matches a locator host equal to it or a subdomain of it. |
+| `enabled` | Boolean | Whether the row is active (default `true`). Disabled rows are ignored. |
+| `tenant_id` / `client_id` / `thumbprint` / `site_url` | String | Non-secret identifiers. SharePoint uses all four; `oauth2` uses `client_id`. Nullable per kind. |
+| `private_key_encrypted` | Text | The row's encrypted secret (Fernet token) — cert private key or OAuth2 client secret; `NULL` when none stored. |
+| `private_key_salt` | Text | Per-row base64 salt used to derive the encryption key. |
+| `settings` | JSON / JSONB | Kind-specific non-secret config (e.g. OAuth2 `token_url` / `scope`) and overflow for fields that don't map onto the columns above. |
+| `created_at` / `updated_at` | DateTime (tz) | Row timestamps (`updated_at` refreshes on change). |
 
 ## Cascade behavior
 

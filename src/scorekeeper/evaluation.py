@@ -41,12 +41,14 @@ from sqlalchemy.orm import Session, selectinload
 from scorekeeper.database import (
     BenchmarkRun,
     PlatformExecution,
+    RetrievedContextDocument,
     ScenarioResult,
     SessionLocal,
     SourceFile,
     Turn,
 )
 from scorekeeper.importer import parse_conversation
+from scorekeeper.retrieved_context import RetrievedContext
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.selection import sync_selection
 from scorekeeper.runner import (
@@ -104,7 +106,7 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         turn = message.get("turn", 1)
         bucket = grouped.setdefault(
             turn,
-            {"prompt": [], "response": [], "retrieved_context": "", "expected_output": ""},
+            {"prompt": [], "response": [], "retrieved_context": None, "expected_output": ""},
         )
         role = message.get("role")
         content = message.get("content", "")
@@ -112,10 +114,18 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             bucket["prompt"].append(content)
         elif role == "model":
             bucket["response"].append(content)
-        for key in ("retrieved_context", "expected_output"):
-            value = message.get(key)
-            if value and not bucket[key]:
-                bucket[key] = value
+        # Keep the first non-empty context (a ``{"documents": [...]}`` dict) and
+        # the first non-empty expected output (a string) seen for the turn.
+        context = message.get("retrieved_context")
+        if (
+            isinstance(context, dict)
+            and context.get("documents")
+            and not bucket["retrieved_context"]
+        ):
+            bucket["retrieved_context"] = context
+        expected = message.get("expected_output")
+        if expected and not bucket["expected_output"]:
+            bucket["expected_output"] = expected
 
     turns: list[dict[str, Any]] = []
     for turn_number in sorted(grouped):
@@ -125,7 +135,7 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "turn_number": turn_number,
                 "prompt": "\n".join(bucket["prompt"]),
                 "response": "\n".join(bucket["response"]),
-                "retrieved_context": bucket["retrieved_context"] or None,
+                "retrieved_context": bucket["retrieved_context"],
                 "expected_output": bucket["expected_output"] or None,
             }
         )
@@ -207,15 +217,21 @@ def ingest_evaluation(
                 platform_execution=platform_exec,
             )
             for turn in project_turns(messages):
-                scenario.turns.append(
-                    Turn(
-                        turn_number=turn["turn_number"],
-                        prompt=turn["prompt"],
-                        response=turn["response"],
-                        retrieved_context=turn["retrieved_context"],
-                        expected_output=turn["expected_output"],
-                    )
+                turn_row = Turn(
+                    turn_number=turn["turn_number"],
+                    prompt=turn["prompt"],
+                    response=turn["response"],
+                    expected_output=turn["expected_output"],
                 )
+                # Decouple the retrieved context into one child row per document,
+                # preserving retriever rank (array order).
+                if turn["retrieved_context"]:
+                    context = RetrievedContext.model_validate(turn["retrieved_context"])
+                    for rank, doc in enumerate(context.documents):
+                        turn_row.retrieved_documents.append(
+                            RetrievedContextDocument.from_document(doc, rank)
+                        )
+                scenario.turns.append(turn_row)
 
         db.add(run)
         db.commit()

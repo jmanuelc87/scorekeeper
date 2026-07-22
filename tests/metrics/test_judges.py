@@ -29,6 +29,7 @@ from scorekeeper.metrics.judges.base import (
     scale_spec,
 )
 from scorekeeper.metrics.scale import Boolean, Likert, Unit
+from scorekeeper.retrieved_context import RetrievedContext, RetrievedDocument
 
 
 class Claims(BaseModel):
@@ -106,23 +107,36 @@ def test_render_prompt_includes_retrieved_context() -> None:
     turn = TurnView(
         prompt="¿Cuál es la política de devoluciones?",
         response="30 días.",
-        retrieved_context="Devoluciones en 30 días. Requiere recibo.",
+        retrieved_context=RetrievedContext(
+            documents=[
+                RetrievedDocument(
+                    name="Política de devoluciones",
+                    document="manual.pdf",
+                    content="Devoluciones en 30 días. Requiere recibo.",
+                    url="https://ejemplo.com/manual",
+                )
+            ]
+        ),
     )
     rendered = render_prompt("Evalúa la fidelidad.", turn)
 
     assert "--- Contexto recuperado ---" in rendered
+    # The rendered context surfaces the content plus its label and source metadata.
     assert "Devoluciones en 30 días. Requiere recibo." in rendered
+    assert "Política de devoluciones" in rendered
+    assert "manual.pdf" in rendered
+    assert "https://ejemplo.com/manual" in rendered
 
 
 def test_render_prompt_substitutes_context_placeholder() -> None:
     turn = TurnView(
         prompt="p",
         response="r",
-        retrieved_context="pasaje A\npasaje B",
+        retrieved_context=RetrievedContext.from_blob("pasaje A\npasaje B"),
     )
     rendered = render_prompt("Contexto: {context}", turn)
 
-    # The {context} placeholder expands to the retrieved-context blob.
+    # The {context} placeholder expands to the rendered retrieved context.
     assert "Contexto: pasaje A\npasaje B" in rendered
 
 

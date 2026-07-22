@@ -135,7 +135,8 @@ def test_columns_override(tmp_path: Path) -> None:
     assert [m["content"] for m in result] == ["Hola", "Adiós"]
 
 
-def test_retrieved_context_column_is_parsed(tmp_path: Path) -> None:
+def test_retrieved_context_plaintext_cell_falls_back_to_documents(tmp_path: Path) -> None:
+    # A plain-text cell (no JSON) becomes content-only documents, blank-line split.
     path = _write_xlsx(
         tmp_path / "with_context.xlsx",
         ["turn", "role", "content", "contexto recuperado"],
@@ -148,14 +149,63 @@ def test_retrieved_context_column_is_parsed(tmp_path: Path) -> None:
     result = parse_conversation(path)
 
     assert result == [
-        {"turn": 1, "role": "user", "content": "¿Política de devoluciones?", "retrieved_context": ""},
+        {
+            "turn": 1,
+            "role": "user",
+            "content": "¿Política de devoluciones?",
+            "retrieved_context": {"documents": []},
+        },
         {
             "turn": 1,
             "role": "model",
             "content": "30 días con recibo.",
-            "retrieved_context": "Devoluciones en 30 días. Requiere recibo.",
+            "retrieved_context": {
+                "documents": [
+                    {
+                        "name": "",
+                        "document": "",
+                        "content": "Devoluciones en 30 días. Requiere recibo.",
+                        "url": None,
+                    }
+                ]
+            },
         },
     ]
+
+
+def test_retrieved_context_json_cell_is_parsed(tmp_path: Path) -> None:
+    # A JSON cell matching the schema is preserved with all fields.
+    cell = json.dumps(
+        {
+            "documents": [
+                {
+                    "name": "Política de reembolsos §3",
+                    "document": "manual_v2.pdf",
+                    "content": "El reembolso se procesa en 30 días.",
+                    "url": "https://ejemplo.com/manual",
+                }
+            ]
+        },
+        ensure_ascii=False,
+    )
+    path = _write_xlsx(
+        tmp_path / "json_context.xlsx",
+        ["role", "content", "contexto recuperado"],
+        [["model", "R", cell]],
+    )
+
+    result = parse_conversation(path)
+
+    assert result[0]["retrieved_context"] == {
+        "documents": [
+            {
+                "name": "Política de reembolsos §3",
+                "document": "manual_v2.pdf",
+                "content": "El reembolso se procesa en 30 días.",
+                "url": "https://ejemplo.com/manual",
+            }
+        ]
+    }
 
 
 def test_retrieved_context_absent_omits_key(tmp_path: Path) -> None:
@@ -202,7 +252,9 @@ def test_retrieved_context_and_expected_output_together(tmp_path: Path) -> None:
 
     result = parse_conversation(path)
 
-    assert result[0]["retrieved_context"] == "ctx"
+    assert result[0]["retrieved_context"] == {
+        "documents": [{"name": "", "document": "", "content": "ctx", "url": None}]
+    }
     assert result[0]["expected_output"] == "ref"
 
 

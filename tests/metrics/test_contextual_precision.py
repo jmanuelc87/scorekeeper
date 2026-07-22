@@ -14,6 +14,7 @@ from scorekeeper.metrics.catalog.contextual_precision import (
     ContextualPrecision,
     RelevanceVerdict,
 )
+from scorekeeper.retrieved_context import RetrievedContext
 
 
 def _verdicts(*relevant: bool):
@@ -28,7 +29,7 @@ def _turn(context: str, *, expected_output: str = "La respuesta correcta.") -> T
     return TurnView(
         prompt="¿Cuál es la política de devoluciones?",
         response="Puedes devolver en 30 días con recibo.",
-        retrieved_context=context,
+        retrieved_context=RetrievedContext.from_blob(context),
         expected_output=expected_output,
     )
 

@@ -4,9 +4,9 @@ The source spreadsheet stores a conversation as **one message per row** (a user
 or model message with, optionally, a turn number). This module reads such a
 file with ``openpyxl`` and projects it into a JSON-serializable list of message
 dicts with the keys ``turn``, ``role`` and ``content`` (plus an optional
-``retrieved_context`` and/or ``expected_output`` when the sheet carries those
-columns) — the raw conversation shape that ``ScenarioResult.raw_conversation``
-is documented to hold. Turn rows
+``retrieved_context`` — a structured ``{"documents": [...]}`` object — and/or
+``expected_output`` when the sheet carries those columns) — the raw conversation
+shape that ``ScenarioResult.raw_conversation`` is documented to hold. Turn rows
 for evaluation are derived from this projection in a later step; this module
 only parses.
 
@@ -23,6 +23,8 @@ from pathlib import Path
 from typing import Any
 
 from openpyxl import load_workbook
+
+from scorekeeper.retrieved_context import RetrievedContext
 
 # Header aliases (normalized: stripped + lowercased) -> canonical field name.
 _HEADER_ALIASES: dict[str, str] = {
@@ -70,6 +72,28 @@ def _normalize(value: Any) -> str:
     return str(value).strip().lower()
 
 
+def _parse_context(cell: str) -> dict[str, Any]:
+    """Parse a ``retrieved_context`` cell into the canonical JSON document shape.
+
+    A cell holding JSON is validated against the ``RetrievedContext`` schema; any
+    other (plain-text) cell falls back to blank-line splitting into content-only
+    documents. Returns the ``{"documents": [...]}`` dict (empty when the cell is).
+    """
+    if cell:
+        try:
+            payload = json.loads(cell)
+        except (ValueError, TypeError):
+            context = RetrievedContext.from_blob(cell)
+        else:
+            try:
+                context = RetrievedContext.model_validate(payload)
+            except ValueError:
+                context = RetrievedContext.from_blob(cell)
+    else:
+        context = RetrievedContext()
+    return context.model_dump()
+
+
 def _map_columns(header: list[Any], override: dict[str, str] | None) -> dict[str, int]:
     """Map canonical field names to their 0-based column index in ``header``.
 
@@ -110,8 +134,9 @@ def parse_conversation(
     """Parse an ``.xlsx`` conversation file into raw message dicts.
 
     Returns a list of ``{"turn": int, "role": str, "content": str}`` in sheet
-    order; each dict also carries ``retrieved_context`` and/or ``expected_output``
-    (strings) when the sheet has those columns. Roles are normalized to canonical
+    order; each dict also carries ``retrieved_context`` (a ``{"documents": [...]}``
+    dict per ``scorekeeper.retrieved_context``) and/or ``expected_output`` (a
+    string) when the sheet has those columns. Roles are normalized to canonical
     values
     (``user``/``model``) when recognized, otherwise passed through normalized.
     When the sheet has no turn column, turn numbers are derived: each ``user``
@@ -169,9 +194,9 @@ def parse_conversation(
 
             message: dict[str, Any] = {"turn": turn, "role": role, "content": content}
             if has_context_col:
-                message["retrieved_context"] = _cell(
-                    row, col["retrieved_context"]
-                ).strip()
+                message["retrieved_context"] = _parse_context(
+                    _cell(row, col["retrieved_context"]).strip()
+                )
             if has_expected_col:
                 message["expected_output"] = _cell(
                     row, col["expected_output"]
