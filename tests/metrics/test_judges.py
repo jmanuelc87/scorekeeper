@@ -8,6 +8,8 @@ passthrough, ``structured()`` return type, and factory selection/errors.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from pydantic import BaseModel
 
@@ -23,8 +25,10 @@ from scorekeeper.metrics.judges import (
 from scorekeeper.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
     StepModels,
+    UsageAccumulator,
     _ScoreResponse,
     clamp,
+    collect_usage,
     render_prompt,
     scale_spec,
 )
@@ -40,47 +44,67 @@ class Claims(BaseModel):
 
 
 class FakeAnthropicMessages:
-    def __init__(self, parsed: object) -> None:
+    def __init__(self, parsed: object, usage: object | None = None) -> None:
         self._parsed = parsed
+        self._usage = usage
         self.calls: list[dict] = []
 
     def parse(self, **kwargs):
         self.calls.append(kwargs)
-        return type("Message", (), {"parsed_output": self._parsed})()
+        attrs: dict[str, object] = {"parsed_output": self._parsed}
+        # Only attach `usage` when configured, so tests that omit it exercise the
+        # getattr-safe path (no usage recorded).
+        if self._usage is not None:
+            attrs["usage"] = self._usage
+        return type("Message", (), attrs)()
 
 
 class FakeAnthropicClient:
-    def __init__(self, parsed: object) -> None:
-        self.messages = FakeAnthropicMessages(parsed)
+    def __init__(self, parsed: object, usage: object | None = None) -> None:
+        self.messages = FakeAnthropicMessages(parsed, usage)
 
 
 class FakeCompletions:
-    def __init__(self, parsed: object) -> None:
+    def __init__(self, parsed: object, usage: object | None = None) -> None:
         self._parsed = parsed
+        self._usage = usage
         self.calls: list[dict] = []
 
     def parse(self, **kwargs):
         self.calls.append(kwargs)
         message = type("Msg", (), {"parsed": self._parsed})()
         choice = type("Choice", (), {"message": message})()
-        return type("Completion", (), {"choices": [choice]})()
+        attrs: dict[str, object] = {"choices": [choice]}
+        if self._usage is not None:
+            attrs["usage"] = self._usage
+        return type("Completion", (), attrs)()
 
 
 class FakeEmbeddings:
-    def __init__(self, vectors: list[list[float]]) -> None:
+    def __init__(self, vectors: list[list[float]], usage: object | None = None) -> None:
         self._vectors = vectors
+        self._usage = usage
         self.calls: list[dict] = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
         data = [type("Emb", (), {"embedding": v})() for v in self._vectors]
-        return type("Response", (), {"data": data})()
+        attrs: dict[str, object] = {"data": data}
+        if self._usage is not None:
+            attrs["usage"] = self._usage
+        return type("Response", (), attrs)()
 
 
 class FakeOpenAIClient:
-    def __init__(self, parsed: object, embeddings: list[list[float]] | None = None) -> None:
-        self.chat = type("Chat", (), {"completions": FakeCompletions(parsed)})()
-        self.embeddings = FakeEmbeddings(embeddings or [])
+    def __init__(
+        self,
+        parsed: object,
+        embeddings: list[list[float]] | None = None,
+        usage: object | None = None,
+        embed_usage: object | None = None,
+    ) -> None:
+        self.chat = type("Chat", (), {"completions": FakeCompletions(parsed, usage)})()
+        self.embeddings = FakeEmbeddings(embeddings or [], embed_usage)
 
 
 # --- base helpers -------------------------------------------------------------
@@ -552,3 +576,69 @@ def test_make_judge_builds_step_models_from_settings(
     assert step_models.for_step(JudgeStep.VERIFY) == "claude-strong"
     assert step_models.for_step(JudgeStep.SCORE) == "claude-strong"
     assert step_models.for_step(None) == "claude-strong"
+
+
+# --- Token-usage recording ----------------------------------------------------
+
+
+def test_anthropic_records_input_output_usage(turn: TurnView) -> None:
+    # score() and structured() each record the response's input/output tokens onto
+    # the active accumulator.
+    client = FakeAnthropicClient(
+        _ScoreResponse(score=3.0, justification="ok"),
+        usage=SimpleNamespace(input_tokens=12, output_tokens=5),
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+    acc = UsageAccumulator()
+    with collect_usage(acc):
+        judge.score(rubric="r", turn=turn, scale=Likert())
+    snap = acc.snapshot()
+    assert (snap.input_tokens, snap.output_tokens) == (12, 5)
+    assert snap.total_tokens == 17
+
+
+def test_anthropic_without_usage_records_nothing(turn: TurnView) -> None:
+    # A response with no `usage` (the default fake) contributes 0 — getattr-safe.
+    client = FakeAnthropicClient(_ScoreResponse(score=3.0, justification="ok"))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+    acc = UsageAccumulator()
+    with collect_usage(acc):
+        judge.score(rubric="r", turn=turn, scale=Likert())
+    assert acc.snapshot() == UsageAccumulator().snapshot()  # still 0/0
+
+
+def test_openai_maps_prompt_completion_to_input_output(turn: TurnView) -> None:
+    client = FakeOpenAIClient(
+        _ScoreResponse(score=1.0, justification="ok"),
+        usage=SimpleNamespace(prompt_tokens=20, completion_tokens=8),
+    )
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
+    acc = UsageAccumulator()
+    with collect_usage(acc):
+        judge.score(rubric="r", turn=turn, scale=Boolean())
+    snap = acc.snapshot()
+    assert (snap.input_tokens, snap.output_tokens) == (20, 8)  # prompt→input, completion→output
+
+
+def test_openai_embed_records_prompt_tokens_as_input() -> None:
+    client = FakeOpenAIClient(
+        None, embeddings=[[1.0, 0.0]], embed_usage=SimpleNamespace(prompt_tokens=7)
+    )
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
+    acc = UsageAccumulator()
+    with collect_usage(acc):
+        judge.embed(texts=["a"])
+    snap = acc.snapshot()
+    assert (snap.input_tokens, snap.output_tokens) == (7, 0)  # embeddings have no output side
+
+
+def test_usage_not_recorded_outside_a_collect_scope(turn: TurnView) -> None:
+    # Without an active accumulator, recording is a silent no-op (judges stay usable
+    # standalone). The call still succeeds.
+    client = FakeAnthropicClient(
+        _ScoreResponse(score=2.0, justification="ok"),
+        usage=SimpleNamespace(input_tokens=9, output_tokens=3),
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+    verdict = judge.score(rubric="r", turn=turn, scale=Likert())  # no collect_usage
+    assert verdict.score == 2.0

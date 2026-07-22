@@ -189,6 +189,32 @@ Tests inject a stub that satisfies this Protocol (see
 [Testing](#testing)). The real implementation is added later (see
 [Going live](#going-live)).
 
+### Token usage
+
+The LLM tokens each judge call consumes are captured **transparently** — metrics
+do nothing, and the `Judge` Protocol is unchanged (its return types — `JudgeVerdict`,
+a bare schema, bare vectors — carry no usage envelope). Instead the concrete judges
+push each call's usage into an *ambient* accumulator:
+
+- The judges read the SDK response's usage `getattr`-safely and call
+  `record_usage(...)` (`scorekeeper.metrics.judges.base`), normalizing providers to
+  input/output (Anthropic `input`/`output_tokens`, OpenAI
+  `prompt`/`completion_tokens`; embeddings report input only). A response without
+  usage — or any judge stub that never calls `record_usage` — contributes `0`.
+- The scoring runner activates one accumulator per turn with `collect_usage(...)`,
+  a `contextvars`-scoped context manager. Because metrics evaluate on their own
+  threads (one per metric) and a `ThreadPoolExecutor` worker does **not** inherit
+  the caller's context, the runner enters the scope *inside each worker* and resets
+  it on exit, so nothing leaks across the reused threads. Every judge call — across
+  every metric and every internal step — adds to that one thread-safe accumulator.
+- After scoring, the per-turn total is persisted as a
+  [`TurnTokenUsage`](data-model.md#turntokenusage) row (1:1 with `Turn`).
+
+This is **persistence only**: token counts are stored in the database but are not
+surfaced by the read APIs. A standalone judge used outside the runner (no active
+accumulator) records nothing — `record_usage` is a no-op — so judges stay usable
+on their own.
+
 ## Registry and the `@register` decorator
 
 Concrete metrics register themselves with `@register`

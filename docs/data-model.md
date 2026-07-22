@@ -11,7 +11,9 @@ A **SourceFile** is an imported `.xlsx` of interactions that seeds one or more
 **BenchmarkRun** rows. Each run fans out into one **PlatformExecution** per
 platform, whose conversations are stored as **ScenarioResult** rows. Every
 conversation is split into **Turn** rows (one user/model exchange each), and
-each turn is scored by an LLM-as-a-judge into multiple **MetricScore** rows.
+each turn is scored by an LLM-as-a-judge into multiple **MetricScore** rows. The
+LLM tokens consumed while scoring a turn are summed into a **TurnTokenUsage** row
+(one per turn).
 
 Scores flow upward:
 
@@ -102,6 +104,13 @@ erDiagram
         JSON steps
     }
 
+    TurnTokenUsage {
+        UUID id PK
+        UUID turn_id FK
+        Integer input_tokens
+        Integer output_tokens
+    }
+
     ScenarioMetric {
         UUID id PK
         String use_case
@@ -113,6 +122,7 @@ erDiagram
     PlatformExecution ||--o{ ScenarioResult : "has"
     ScenarioResult ||--o{ Turn : "has"
     Turn ||--o{ MetricScore : "has"
+    Turn ||--|| TurnTokenUsage : "has"
     MetricScore ||--|| MetricTrace : "has"
 ```
 
@@ -189,6 +199,9 @@ One user/model exchange within a conversation, evaluated on its own.
 | `response_time_ms` | Integer | Response latency, if available. |
 | `turn_score` | Float | Composite score for the turn; mean of its `MetricScore` values. |
 
+The LLM token usage spent scoring the turn lives in a separate `TurnTokenUsage`
+entity (below), not a column.
+
 ### MetricScore
 
 An LLM-as-a-judge score for a single metric on a single turn. A turn has many.
@@ -216,6 +229,27 @@ The structured record of what a metric produced for one turn — its own entity,
 | `metric_score_id` | UUID | FK → `metric_scores.id`, `ON DELETE CASCADE`, unique (enforces 1:1). |
 | `steps` | JSON (JSONB on PostgreSQL) | The list of steps (each `label`/`summary`/`entries`, entries carrying typed `value`/`justification`/`metadata`). |
 
+### TurnTokenUsage
+
+The LLM token usage spent scoring one turn — its own entity, 1:1 with `Turn`
+(`ON DELETE CASCADE`). Counts are **summed across every judge call every metric
+made** while scoring the turn, with provider counts normalized to input/output
+(Anthropic `input`/`output`, OpenAI `prompt`/`completion`). Kept out of the hot
+`turns` row so cost/usage accounting can grow independently. The total is derived
+(`input + output`), not stored. See
+[Evaluation metrics → Token usage](evaluation-metrics.md#token-usage) for how the
+counts are collected.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `turn_id` | UUID | FK → `turns.id`, `ON DELETE CASCADE`, unique (enforces 1:1). |
+| `input_tokens` | Integer | Prompt/input tokens summed over the turn's judge calls (`0` when the judge reports none). |
+| `output_tokens` | Integer | Completion/output tokens summed over the turn's judge calls (embeddings contribute input only). |
+
+Re-scoring a turn updates the existing row in place, so there is always exactly
+one row per turn.
+
 ### ScenarioMetric
 
 Which metric applies to which scenario `use_case`. The metric taxonomy lives in
@@ -232,7 +266,8 @@ scenarios, materialized by `scorekeeper.metrics.selection.sync_selection`.
 
 The `BenchmarkRun` subtree uses `ON DELETE CASCADE` and SQLAlchemy
 `cascade="all, delete-orphan"`, so deleting a `BenchmarkRun` removes its entire
-subtree of executions, scenarios, turns, scores, and each score's `MetricTrace`.
+subtree of executions, scenarios, turns, each turn's `TurnTokenUsage`, its scores,
+and each score's `MetricTrace`.
 
 The `SourceFile → BenchmarkRun` link uses `ON DELETE SET NULL` instead: deleting
 a source file leaves its runs and their results intact, only clearing their

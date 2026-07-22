@@ -22,6 +22,7 @@ from scorekeeper.database import (
     ScenarioMetric,
     ScenarioResult,
     Turn,
+    TurnTokenUsage,
 )
 from scorekeeper.metrics.base import (
     Metric,
@@ -33,6 +34,7 @@ from scorekeeper.metrics.base import (
 )
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import JudgeVerdict
+from scorekeeper.metrics.judges.base import record_usage
 from scorekeeper.metrics.registry import MetricRegistry
 from scorekeeper.metrics.scale import Unit
 from scorekeeper.runner import (
@@ -78,6 +80,26 @@ class RecordingJudge:
 
     def embed(self, *, texts):  # pragma: no cover - unused here
         raise NotImplementedError
+
+
+class TokenRecordingJudge(RecordingJudge):
+    """A ``RecordingJudge`` that also records fixed token usage on each ``score``.
+
+    Simulates what a real concrete judge does (``record_usage`` from the SDK
+    response's usage), so runner tests can assert the per-turn accumulation and
+    persistence without any SDK fakes.
+    """
+
+    def __init__(self, *, input_tokens: int, output_tokens: int, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self._input_tokens = input_tokens
+        self._output_tokens = output_tokens
+
+    def score(self, *, rubric, turn, scale, rubric_version=None, step=None) -> JudgeVerdict:
+        record_usage(input_tokens=self._input_tokens, output_tokens=self._output_tokens)
+        return super().score(
+            rubric=rubric, turn=turn, scale=scale, rubric_version=rubric_version, step=step
+        )
 
 
 class _JudgeMetric(Metric):
@@ -383,3 +405,53 @@ def test_comma_separated_use_case_unions_metrics(session: Session, registry) -> 
     turn = scenario.turns[0]
     assert {ms.metric_name for ms in turn.metric_scores} == {"utilidad", "correccion"}
     assert turn.turn_score == pytest.approx(0.9)
+
+
+# --- Token usage persistence --------------------------------------------------
+
+
+def test_persists_summed_token_usage_per_turn(session: Session, registry) -> None:
+    _select_metrics(session, ["utilidad", "correccion"])
+    _, _, scenario = _seed_scenario(session, [("hola", "qué tal"), ("adiós", "chao")])
+    judge = TokenRecordingJudge(input_tokens=10, output_tokens=4)
+
+    EvalRunner(session, judge).run_scenario(scenario)
+    session.commit()
+
+    # One row per turn; each turn ran 2 metrics × one score() call = 2 × (10, 4).
+    assert session.execute(select(func.count()).select_from(TurnTokenUsage)).scalar_one() == 2
+    for turn in scenario.turns:
+        assert turn.token_usage is not None
+        assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (20, 8)
+
+
+def test_token_usage_row_is_zero_when_judge_records_nothing(
+    session: Session, registry
+) -> None:
+    # The plain RecordingJudge never calls record_usage, so the turn still gets a
+    # row, summed to 0/0 (the accumulator with no adds).
+    _select_metrics(session, ["utilidad"])
+    _, _, scenario = _seed_scenario(session, [("hola", "qué tal")])
+
+    EvalRunner(session, RecordingJudge()).run_scenario(scenario)
+    session.commit()
+
+    turn = scenario.turns[0]
+    assert turn.token_usage is not None
+    assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (0, 0)
+
+
+def test_rescoring_updates_single_token_usage_row(session: Session, registry) -> None:
+    _select_metrics(session, ["utilidad"])
+    _, _, scenario = _seed_scenario(session, [("hola", "qué tal")])
+    runner = EvalRunner(session, TokenRecordingJudge(input_tokens=5, output_tokens=2))
+
+    runner.run_scenario(scenario)
+    session.commit()
+    runner.run_scenario(scenario)
+    session.commit()
+
+    # Re-scoring updates the existing row in place — still exactly one per turn.
+    assert session.execute(select(func.count()).select_from(TurnTokenUsage)).scalar_one() == 1
+    turn = scenario.turns[0]
+    assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (5, 2)

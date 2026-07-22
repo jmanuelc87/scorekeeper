@@ -19,6 +19,7 @@ from scorekeeper.metrics.judges.base import (
     _ScoreResponse,
     clamp,
     owned_model,
+    record_usage,
     render_prompt,
     scale_spec,
 )
@@ -94,6 +95,19 @@ class AnthropicJudge:
         return self.model_for(step)
 
     @staticmethod
+    def _record_usage(message: Any) -> None:
+        """Record the Anthropic response's token usage on the active accumulator.
+
+        ``getattr``-safe: a response (or a test fake) without ``usage`` records
+        nothing. Anthropic reports ``input_tokens``/``output_tokens``.
+        """
+        usage = getattr(message, "usage", None)
+        record_usage(
+            input_tokens=getattr(usage, "input_tokens", None),
+            output_tokens=getattr(usage, "output_tokens", None),
+        )
+
+    @staticmethod
     def _thinking_kwargs(model: str) -> dict[str, Any]:
         """Per-model ``thinking`` for ``messages.parse``.
 
@@ -127,6 +141,7 @@ class AnthropicJudge:
             messages=[{"role": "user", "content": content}],
             output_format=_ScoreResponse,
         )
+        self._record_usage(message)
         parsed: _ScoreResponse = message.parsed_output
         return JudgeVerdict(
             score=clamp(parsed.score, spec),
@@ -152,6 +167,7 @@ class AnthropicJudge:
             messages=[{"role": "user", "content": render_prompt(instruction, turn)}],
             output_format=schema,
         )
+        self._record_usage(message)
         return message.parsed_output
 
     def embed(self, *, texts: list[str], model: str | None = None) -> list[list[float]]:

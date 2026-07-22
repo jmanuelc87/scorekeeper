@@ -9,7 +9,10 @@ Anthropic and OpenAI judges stay thin wrappers over their respective clients.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+import contextlib
+import contextvars
+import threading
+from collections.abc import Callable, Iterator, Mapping
 from typing import NamedTuple
 
 from pydantic import BaseModel
@@ -26,6 +29,99 @@ DEFAULT_SYSTEM_PROMPT = (
     "numérica junto con una justificación breve. Sé objetivo y responde siempre "
     "en español."
 )
+
+
+# --- Token-usage collection ---------------------------------------------------
+# Every judge call the SDKs make returns token counts, but the return types on the
+# ``Judge`` seam (``JudgeVerdict`` / a bare schema / bare vectors) have nowhere to
+# carry them. Rather than change the Protocol and every metric/stub, the concrete
+# judges push each call's usage into an *ambient* accumulator via ``record_usage``.
+# A caller (the runner) activates an accumulator for a scope with ``collect_usage``;
+# outside any scope ``record_usage`` is a no-op, so judges stay usable standalone.
+
+
+class TokenUsage(BaseModel):
+    """Provider-neutral token counts for one or more LLM calls.
+
+    Anthropic reports ``input_tokens``/``output_tokens``; OpenAI reports
+    ``prompt_tokens``/``completion_tokens`` — both are normalized to input/output
+    here. ``total_tokens`` is derived, never stored.
+    """
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        return TokenUsage(
+            input_tokens=self.input_tokens + other.input_tokens,
+            output_tokens=self.output_tokens + other.output_tokens,
+        )
+
+
+class UsageAccumulator:
+    """A thread-safe running sum of :class:`TokenUsage`.
+
+    One accumulator is shared by all the metric-evaluation threads of a single turn
+    (see ``scorekeeper.runner``); each judge call adds to it under a lock, so the
+    snapshot is the turn's total across every concurrent metric and every call each
+    metric made.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._usage = TokenUsage()
+
+    def add(self, *, input_tokens: int, output_tokens: int) -> None:
+        with self._lock:
+            self._usage = self._usage + TokenUsage(
+                input_tokens=input_tokens, output_tokens=output_tokens
+            )
+
+    def snapshot(self) -> TokenUsage:
+        with self._lock:
+            return self._usage.model_copy()
+
+
+# The accumulator active on the current context, if any. Default None → recording is
+# a no-op. A ``ContextVar`` (not a plain global) so concurrent turns/threads can each
+# scope their own accumulator; note ThreadPoolExecutor workers do NOT inherit the
+# submitter's context, so the value must be set *inside* the worker (see
+# ``collect_usage`` and its use in the runner).
+_usage_var: contextvars.ContextVar[UsageAccumulator | None] = contextvars.ContextVar(
+    "scorekeeper_usage_accumulator", default=None
+)
+
+
+def record_usage(*, input_tokens: int | None, output_tokens: int | None) -> None:
+    """Add one call's tokens to the active accumulator; no-op when none is active.
+
+    ``None`` counts are treated as 0 so a provider (or a test fake) that omits
+    ``usage`` contributes nothing rather than raising.
+    """
+    accumulator = _usage_var.get()
+    if accumulator is None:
+        return
+    accumulator.add(input_tokens=int(input_tokens or 0), output_tokens=int(output_tokens or 0))
+
+
+@contextlib.contextmanager
+def collect_usage(accumulator: UsageAccumulator) -> Iterator[UsageAccumulator]:
+    """Activate ``accumulator`` for judge calls made inside the ``with`` block.
+
+    MUST be entered inside the thread that will make the judge calls (a
+    ThreadPoolExecutor worker starts with an empty context and does not inherit the
+    submitter's). Resets the context var on exit so the accumulator does not leak to
+    later work scheduled on a reused worker thread.
+    """
+    token = _usage_var.set(accumulator)
+    try:
+        yield accumulator
+    finally:
+        _usage_var.reset(token)
 
 
 class StepModels:

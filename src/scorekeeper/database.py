@@ -161,6 +161,12 @@ class Turn(Base):
         back_populates="turn",
         cascade="all, delete-orphan",
     )
+    # LLM token usage for scoring this turn, as its own 1:1 entity.
+    token_usage: Mapped[TurnTokenUsage | None] = relationship(
+        back_populates="turn",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
 
 
 class MetricScore(Base):
@@ -206,6 +212,29 @@ class MetricTrace(Base):
     steps: Mapped[list[Any] | None] = mapped_column(JsonColumn, default=None)
 
     metric_score: Mapped[MetricScore] = relationship(back_populates="trace")
+
+
+class TurnTokenUsage(Base):
+    """LLM token usage for scoring one turn (1:1 with ``Turn``).
+
+    Summed across every judge call every metric made while scoring the turn, with
+    provider counts normalized to input/output (Anthropic ``input``/``output``,
+    OpenAI ``prompt``/``completion``). Kept as its own entity — mirroring
+    ``MetricTrace`` — so token/cost accounting stays out of the hot ``turns`` row and
+    can grow later (e.g. cost, cached tokens) without widening it. Total is derived
+    (``input + output``), never stored.
+    """
+
+    __tablename__ = "turn_token_usage"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    turn_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("turns.id", ondelete="CASCADE"), unique=True, index=True
+    )
+    input_tokens: Mapped[int] = mapped_column(Integer, default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, default=0)
+
+    turn: Mapped[Turn] = relationship(back_populates="token_usage")
 
 
 class ScenarioMetric(Base):

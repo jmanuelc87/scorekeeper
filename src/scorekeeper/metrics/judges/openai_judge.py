@@ -18,6 +18,7 @@ from scorekeeper.metrics.judges.base import (
     _ScoreResponse,
     clamp,
     owned_model,
+    record_usage,
     render_prompt,
     scale_spec,
 )
@@ -91,6 +92,20 @@ class OpenAIJudge:
             return owned_model(model, owns=self._owns, provider=PROVIDER)
         return self.model_for(step)
 
+    @staticmethod
+    def _record_chat_usage(completion: Any) -> None:
+        """Record a chat completion's token usage on the active accumulator.
+
+        ``getattr``-safe: a response (or a test fake) without ``usage`` records
+        nothing. OpenAI reports ``prompt_tokens``/``completion_tokens``, mapped to
+        input/output.
+        """
+        usage = getattr(completion, "usage", None)
+        record_usage(
+            input_tokens=getattr(usage, "prompt_tokens", None),
+            output_tokens=getattr(usage, "completion_tokens", None),
+        )
+
     def score(
         self,
         *,
@@ -112,6 +127,7 @@ class OpenAIJudge:
             ],
             response_format=_ScoreResponse,
         )
+        self._record_chat_usage(completion)
         parsed: _ScoreResponse = completion.choices[0].message.parsed
         return JudgeVerdict(
             score=clamp(parsed.score, spec),
@@ -136,6 +152,7 @@ class OpenAIJudge:
             ],
             response_format=schema,
         )
+        self._record_chat_usage(completion)
         return completion.choices[0].message.parsed
 
     def embed(self, *, texts: list[str], model: str | None = None) -> list[list[float]]:
@@ -152,4 +169,7 @@ class OpenAIJudge:
             else self.embedding_model
         )
         response = self._client.embeddings.create(model=embedding_model, input=texts)
+        # Embeddings usage carries only prompt_tokens (no completion side).
+        usage = getattr(response, "usage", None)
+        record_usage(input_tokens=getattr(usage, "prompt_tokens", None), output_tokens=None)
         return [item.embedding for item in response.data]
