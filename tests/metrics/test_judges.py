@@ -140,6 +140,33 @@ def test_render_prompt_substitutes_context_placeholder() -> None:
     assert "Contexto: pasaje A\npasaje B" in rendered
 
 
+def test_render_prompt_renders_web_citations_as_readable_docs() -> None:
+    # Web citations captured from a chat UI (a name and a url, no fetched content) reach
+    # the judge as readable label/url blocks — the retrieval pipeline has already parsed
+    # them out of any raw JSON, so the judge never sees the JSON itself.
+    turn = TurnView(
+        prompt="¿Cuál es la política de devoluciones?",
+        response="30 días.",
+        retrieved_context=RetrievedContext(
+            documents=[
+                RetrievedDocument(
+                    name="Política", document="", content="", url="https://a/pol"
+                ),
+                RetrievedDocument(
+                    name="", document="", content="", url="https://b/x"
+                ),
+            ]
+        ),
+    )
+    rendered = render_prompt("Contexto: {context}", turn)
+
+    assert "--- Contexto recuperado ---" in rendered
+    assert "Política" in rendered
+    assert "https://a/pol" in rendered
+    assert "https://b/x" in rendered
+    assert '{"name"' not in rendered  # raw JSON never reaches the judge.
+
+
 def test_render_prompt_omits_context_section_when_absent(turn: TurnView) -> None:
     # The default fixture has no retrieved_context, so no section is emitted.
     rendered = render_prompt("Evalúa (1-5): {prompt}", turn)

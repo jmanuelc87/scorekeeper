@@ -12,6 +12,7 @@ Model Context Protocol — see [MCP tools](mcp.md).
 |------------------------------|---------|
 | `GET /health`                | Liveness probe. |
 | `POST /evaluations`          | Ingest conversation `.xlsx` files and **enqueue** them for scoring (per-file platform, defaulting to the payload platform). |
+| `POST /captures`             | Ingest conversations captured from a chat UI as JSON and **enqueue** them for scoring (the browser extension's entry point). |
 | `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity (HTTP twin of the MCP `retrieve` tool). |
 | `GET /auth-providers`        | List the retrieval credential store's provider rows (optional filters). |
@@ -19,6 +20,7 @@ Model Context Protocol — see [MCP tools](mcp.md).
 | `GET /auth-providers/{id}`   | Fetch one credential provider by UUID. |
 | `PATCH /auth-providers/{id}` | Partially update a credential provider (rotate/clear its key). |
 | `DELETE /auth-providers/{id}`| Delete a credential provider row. |
+| `GET /turns/{turn_id}/traces` | Retrieve the structured metric traces for a single turn. |
 
 ## Architecture: API enqueues, worker retrieves + scores
 
@@ -142,6 +144,64 @@ Poll `GET /evaluations/{run_id}` for progress and results (below).
 | `422`  | `payload` is not valid JSON or fails schema validation (e.g. empty `platform`). |
 | `400`  | An uploaded file is not `.xlsx`, is empty, has no `role`/`content` columns, or no file/platform was provided. Ingest rolls back — nothing is persisted and no job is enqueued. |
 
+## `POST /captures`
+
+Ingest conversations **captured from a chat UI** and enqueue them for scoring. The
+JSON twin of `POST /evaluations` for clients that already hold the turns and have no
+spreadsheet to upload — the [browser extension](../extension/README.md) scrapes them
+straight off Copilot, Gemini and Claude.
+
+Both endpoints converge immediately: the messages are normalized by
+`scorekeeper.importer.normalize_messages` (the same role aliasing and turn numbering
+the `.xlsx` parser uses) and persisted by the same `ingest_evaluation`, so a captured
+conversation is indistinguishable downstream from an uploaded one.
+
+- **Content type:** `application/json`
+
+| Field           | Type       | Required | Default     | Description |
+|-----------------|------------|----------|-------------|-------------|
+| `platform`      | `string`   | yes      | —           | The **default** platform for the request. Applies to every conversation that does not override it. |
+| `use_case`      | `string`   | no       | `"default"` | Default metric-selection use case. Comma-separated tokens are unioned. |
+| `conversations` | `array`    | yes      | —           | One or more captured conversations; **each is one scenario**. Must be non-empty. |
+
+Conversation object:
+
+| Field         | Type              | Required | Default            | Description |
+|---------------|-------------------|----------|--------------------|-------------|
+| `scenario_id` | `string`          | yes      | —                  | Identifier stored on the `ScenarioResult`. |
+| `messages`    | `array`           | yes      | —                  | The conversation, in order. Must be non-empty and at least one message must have content. |
+| `use_case`    | `string`          | no       | the payload `use_case` | Metric-selection use case for this conversation. |
+| `platform`    | `string`          | no       | the payload `platform` | Platform to score this conversation under. |
+| `source_ref`  | `string`          | no       | the `scenario_id`  | Where the capture came from (the chat URL); stored as the scenario's `source_ref`. |
+
+Message object:
+
+| Field                | Type     | Required | Description |
+|----------------------|----------|----------|-------------|
+| `role`               | `string` | yes      | `user` or `model`; the importer's aliases (`usuario`, `assistant`, `modelo`, …) are accepted. |
+| `content`            | `string` | no       | The message text. |
+| `turn`               | `int`    | no       | Explicit turn number. Omit it on **every** message to have turns derived — each `user` message following a non-user message opens a new turn, so a user+model pair shares one number. |
+| `retrieved_context`  | `string` | no       | Context the platform retrieved, when the client knows it. Free-form text, or a JSON array of `{name, url}` source records (what the browser extension sends) — each array element counts as one retrieved document. |
+| `expected_output`    | `string` | no       | Reference answer, when the client knows it. |
+
+Since there is no file to hash, the `SourceFile` provenance hash covers the
+serialized capture itself.
+
+### Response `202`
+
+Identical to `POST /evaluations` — poll `GET /evaluations/{run_id}` from here.
+
+```json
+{"run_id": "b1f2…", "status": "en_cola"}
+```
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `422`  | The body fails schema validation (empty `platform`, empty `conversations`, a conversation with no `messages`). |
+| `400`  | A conversation's messages are all blank, or ingest rejected the run. Nothing is persisted and no job is enqueued. |
+
 ## `GET /evaluations/{run_id}`
 
 Poll a run's current status and summary. Read the `status` to know where the run
@@ -204,8 +264,9 @@ The date range filters the **scoring window** (`PlatformExecution.started_at` /
 still-queued/in-progress runs. Results are ordered by run creation date. Granularity
 controls depth (each level adds to the one above): `platform_executions` → per-platform
 rollups; `scenario_results` → adds each scenario; `metric_scores` → adds each turn and
-its per-metric scores. See the [`retrieve` tool](mcp.md#retrieve) for the full response
-shape.
+its per-metric scores (`metric_name`, `score`, `judge_model`, `rubric_version`). Each
+score's structured `trace` is persisted on the `metric_traces` table but is not surfaced
+by either read path (this endpoint or the MCP [`retrieve` tool](mcp.md#retrieve)).
 
 ### Response `200`
 
@@ -274,6 +335,46 @@ for `sharepoint`, an OAuth2 client secret for `oauth2` — and kind-specific non
 | `409`  | Create / update would duplicate an existing `(provider, host)` pair. |
 | `422`  | Unknown `provider` kind; a `private_key` supplied while `AUTH_ENCRYPTION_KEY` is unset; an empty `PATCH` body; a malformed UUID or missing required field. |
 
+## `GET /turns/{turn_id}/traces`
+
+Retrieve the structured metric traces for a single turn — the full per-metric
+reasoning that the run/scenario read paths omit. The `turn_id` is the turn's UUID,
+discoverable from `GET /runs?granularity=metric_scores` (each turn carries a
+`turn_id`).
+
+| Query param  | Type      | Default | Notes |
+|--------------|-----------|---------|-------|
+| `provenance` | `boolean` | `true`  | When `true`, each entry also includes `judge_model` and `rubric_version`; `false` returns the minimal shape (`metric_name` + `trace`). |
+
+Returns one entry per metric scored on the turn (a turn with no scores yields `[]`):
+
+```json
+[
+  {
+    "metric_name": "utilidad",
+    "judge_model": "claude-opus-4-8",
+    "rubric_version": "v1",
+    "trace": {
+      "steps": [
+        {
+          "label": "Puntuación",
+          "summary": null,
+          "entries": [
+            {"label": "utilidad", "value": 0.8, "justification": "razón", "metadata": {}}
+          ]
+        }
+      ]
+    }
+  }
+]
+```
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | The `turn_id` is unknown or not a valid UUID. |
+
 ## Examples
 
 Enqueue (defaults, single file) → returns a `run_id`:
@@ -291,10 +392,37 @@ Poll until terminal:
 curl http://localhost:8001/evaluations/b1f2…
 ```
 
+Enqueue a conversation captured from a chat UI (what the browser extension sends):
+
+```bash
+curl -X POST http://localhost:8001/captures \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "platform": "claude",
+        "use_case": "default",
+        "conversations": [{
+          "scenario_id": "reseña-hotel-2026-07-22-11-30",
+          "source_ref": "https://claude.ai/chat/abc123",
+          "messages": [
+            {"role": "user",  "content": "¿Cuántos habitantes tiene Madrid?"},
+            {"role": "model", "content": "Madrid tiene unos 3,3 millones de habitantes."}
+          ]
+        }]
+      }'
+# {"run_id":"b1f2…","status":"en_cola"}
+```
+
 Retrieve full details for all `claude` runs scored in July, down to metric scores:
 
 ```bash
 curl 'http://localhost:8001/runs?platform=claude&start_date=2026-07-01&end_date=2026-07-31&granularity=metric_scores'
+```
+
+Retrieve one turn's metric traces (full, then minimal):
+
+```bash
+curl 'http://localhost:8001/turns/7c9e…/traces'
+curl 'http://localhost:8001/turns/7c9e…/traces?provenance=false'
 ```
 
 Multiple files with per-file overrides — `esc1` keeps the payload `claude` default;
@@ -352,6 +480,8 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Auth-provider CRUD service — `src/scorekeeper/retrieval/credentials/service.py`
 - Celery app & tasks — `src/scorekeeper/celery_app.py`, `src/scorekeeper/tasks.py`
   (`run_pipeline_task` = retrieval then scoring; `enqueue_run`)
-- Parsing — `src/scorekeeper/importer.py`
+- Parsing & message normalization — `src/scorekeeper/importer.py`
+  (`parse_conversation`, `normalize_messages`)
+- Browser capture client — `extension/` (see its [README](../extension/README.md))
 - Scoring — `src/scorekeeper/runner.py`
 - Metric selection — `src/scorekeeper/metrics/selection.py`

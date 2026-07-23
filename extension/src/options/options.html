@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Ajustes de Scorekeeper</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <main>
+      <h1>Scorekeeper Capture</h1>
+      <p class="lead">
+        Captura la conversación abierta en Copilot, Gemini o Claude y la envía a
+        Scorekeeper para que un worker la evalúe.
+      </p>
+      <p class="lead">
+        Estos ajustes se guardan solo en este navegador; no se sincronizan con
+        otros perfiles ni equipos.
+      </p>
+
+      <form id="form">
+        <label>
+          URL de la API
+          <input id="apiUrl" type="url" required placeholder="http://localhost:8001" />
+          <small>
+            Donde escucha <code>scorekeeper-api</code>. Cambiarla a otro host pide
+            permiso de acceso al guardar.
+          </small>
+        </label>
+
+        <label>
+          Caso de uso por defecto
+          <input id="useCase" required placeholder="default" />
+          <small>
+            Determina qué métricas se aplican. Separa varios con comas para unirlas
+            (p. ej. <code>document_retrieval,web_search</code>).
+          </small>
+        </label>
+
+        <div class="actions">
+          <button type="submit">Guardar</button>
+          <button id="test" type="button" class="secondary">Probar conexión</button>
+        </div>
+      </form>
+
+      <p id="status" class="notice" hidden></p>
+    </main>
+
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

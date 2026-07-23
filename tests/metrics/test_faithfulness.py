@@ -71,11 +71,21 @@ def test_ragas_mixed_is_fraction_supported(make_judge) -> None:
     assert result.raw_score == 0.5
     # Claims come from syntok (no extraction call); one confident bulk verdict each.
     assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
-    # Steps flattened into the single Spanish justification.
-    assert "### Extracción de afirmaciones de la respuesta" in result.justification
-    assert "### Verificación: Afirmación fundada aquí." in result.justification
-    assert "### Verificación: Afirmación inventada aquí." in result.justification
-    assert len(result.trace) == 3
+    # Structured trace: an extraction step (claims as entries) + a verification step
+    # (one typed entry per claim), no string joining.
+    assert len(result.trace.steps) == 2
+    extraction, verify = result.trace.steps
+    assert extraction.label == "Extracción de afirmaciones de la respuesta"
+    assert [e.label for e in extraction.entries] == [
+        "Afirmación fundada aquí.",
+        "Afirmación inventada aquí.",
+    ]
+    assert verify.label == "Verificación de afirmaciones"
+    assert [e.label for e in verify.entries] == [
+        "Afirmación fundada aquí.",
+        "Afirmación inventada aquí.",
+    ]
+    assert [e.value for e in verify.entries] == [True, False]
 
 
 def test_ragas_low_confidence_escalates_to_audit(make_judge) -> None:
@@ -101,10 +111,14 @@ def test_ragas_low_confidence_escalates_to_audit(make_judge) -> None:
     assert result.judge_model == (
         f"{FaithfulnessRagas.bulk_model} → {FaithfulnessRagas.audit_model}"
     )
-    # The escalation is flagged, and the surfaced rationale is the audit model's.
-    assert f"(escalado a {FaithfulnessRagas.audit_model})" in result.justification
-    assert "Confirmado" in result.justification
-    assert len(result.trace) == 2  # 1 claims step + 1 verification step
+    # The escalation is flagged in typed metadata, and the surfaced rationale is
+    # the audit model's — no glued-in "(escalado a …)" string.
+    assert len(result.trace.steps) == 2  # extraction step + verification step
+    entry = result.trace.steps[1].entries[0]
+    assert entry.value is True
+    assert entry.metadata["escalated"] is True
+    assert entry.metadata["model"] == FaithfulnessRagas.audit_model
+    assert entry.justification == "Confirmado"
 
 
 def test_ragas_no_statements_is_one(make_judge) -> None:
@@ -117,7 +131,7 @@ def test_ragas_no_statements_is_one(make_judge) -> None:
     assert result.judge_model is None
     # No sentences → the judge is never called at all.
     assert [kind for kind, _ in judge.calls] == []
-    assert len(result.trace) == 1
+    assert len(result.trace.steps) == 1
 
 
 # --- DeepEval -----------------------------------------------------------------
@@ -159,9 +173,13 @@ def test_deepeval_one_contradicted_lowers_score(make_judge) -> None:
     # not_contradicted / n = 2 / 3 (agreement and idk both pass; only the direct
     # contradiction fails).
     assert result.raw_score == 2 / 3
-    assert "### Veredicto: Contradice el manual." in result.justification
-    # 1 claims step + 1 truths step + 3 verdicts.
-    assert len(result.trace) == 5
+    # extraction step + truths step + verdict step (one typed entry per claim).
+    assert len(result.trace.steps) == 3
+    verdict_step = result.trace.steps[2]
+    assert verdict_step.label == "Veredicto por afirmación"
+    contra = next(e for e in verdict_step.entries if e.label == "Contradice el manual.")
+    assert contra.value is False
+    assert contra.justification == "Contradice directamente"
 
 
 def test_deepeval_empty_truths_is_zero(make_judge) -> None:
@@ -179,9 +197,9 @@ def test_deepeval_empty_truths_is_zero(make_judge) -> None:
     assert result.judge_model is None
     # Truths extraction runs, but no per-claim verdict call is made.
     assert [kind for kind, _ in judge.calls] == ["structured"]
-    assert "### Verdades vacías" in result.justification
-    # 1 claims step + 1 truths step + 1 empty-truths step.
-    assert len(result.trace) == 3
+    # extraction step + truths step + empty-truths step.
+    assert len(result.trace.steps) == 3
+    assert result.trace.steps[-1].label == "Verdades vacías"
 
 
 def test_deepeval_no_claims_skips_truths(make_judge) -> None:
@@ -194,7 +212,7 @@ def test_deepeval_no_claims_skips_truths(make_judge) -> None:
     assert result.judge_model is None
     # No claims → neither truths extraction nor any verdict call is made.
     assert [kind for kind, _ in judge.calls] == []
-    assert len(result.trace) == 1
+    assert len(result.trace.steps) == 1
 
 
 def test_deepeval_pins_models_per_call(make_judge) -> None:

@@ -46,8 +46,13 @@ def test_perfect_ranking_scores_one(make_judge) -> None:
     assert result.judge_model == "claude-x"
     # One structured (relevance) classification per node, no scoring calls.
     assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
-    assert "### Nodo 1 (rango 1): relevante" in result.justification
-    assert "### Precisión contextual" in result.justification
+    # Node relevance is a typed entry (value + rank metadata); result step summarizes.
+    label_step, result_step = result.trace.steps
+    assert label_step.label == "Relevancia por nodo"
+    assert label_step.entries[0].label == "Nodo 1"
+    assert label_step.entries[0].value is True
+    assert label_step.entries[0].metadata["rank"] == 1
+    assert result_step.label == "Precisión contextual"
 
 
 def test_relevant_first_beats_relevant_last(make_judge) -> None:
@@ -72,7 +77,7 @@ def test_average_precision_interleaved(make_judge) -> None:
     result = ContextualPrecision().evaluate(_turn("a\n\nb\n\nc"), judge)
 
     assert result.raw_score == pytest.approx((1.0 + 2 / 3) / 2)
-    assert "2 de 3 nodos son relevantes" in result.justification
+    assert "2 de 3 nodos son relevantes" in result.trace.steps[-1].summary
 
 
 def test_no_relevant_nodes_is_zero(make_judge) -> None:
@@ -84,7 +89,7 @@ def test_no_relevant_nodes_is_zero(make_judge) -> None:
     assert result.normalized_score == 0.0
     # Every node was still labeled before concluding zero.
     assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
-    assert "Ningún nodo recuperado es relevante" in result.justification
+    assert "Ningún nodo recuperado es relevante" in result.trace.steps[-1].summary
 
 
 def test_no_context_is_zero_without_judge_calls(make_judge) -> None:
@@ -94,7 +99,8 @@ def test_no_context_is_zero_without_judge_calls(make_judge) -> None:
 
     assert result.raw_score == 0.0
     assert judge.calls == []
-    assert "No hay nodos de contexto recuperado" in result.justification
+    assert len(result.trace.steps) == 1
+    assert "No hay nodos de contexto recuperado" in result.trace.steps[0].summary
 
 
 def test_strict_mode_collapses_imperfect_to_zero(make_judge) -> None:

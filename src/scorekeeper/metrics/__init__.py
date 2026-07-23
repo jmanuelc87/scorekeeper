@@ -9,9 +9,11 @@ from scorekeeper.metrics import catalog  # noqa: F401  (registers metrics on imp
 from scorekeeper.metrics.base import (
     Metric,
     MetricResult,
+    MetricTrace,
     MultiStepMetric,
     SingleRubricMetric,
-    StepTrace,
+    TraceEntry,
+    TraceStep,
     TurnView,
 )
 from scorekeeper.metrics.category import MetricCategory
@@ -28,10 +30,12 @@ __all__ = [
     "MetricCategory",
     "MetricRegistry",
     "MetricResult",
+    "MetricTrace",
     "MultiStepMetric",
     "Scale",
     "SingleRubricMetric",
-    "StepTrace",
+    "TraceEntry",
+    "TraceStep",
     "TurnView",
     "Unit",
     "register",

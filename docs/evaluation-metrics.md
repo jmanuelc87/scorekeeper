@@ -97,11 +97,17 @@ class MetricResult(BaseModel):
     metric_name: str
     raw_score: float          # in the metric's own scale
     normalized_score: float   # always [0, 1], used at rollup
-    justification: str        # Spanish rationale
+    trace: MetricTrace = MetricTrace()   # structured record, persisted as JSON
     judge_model: str | None = None
     rubric_version: str | None = None
-    trace: list[StepTrace] = []   # multi-step steps; NOT persisted
 ```
+
+The `trace` is a structured `MetricTrace` — a list of `TraceStep`s, each with a
+`label`, optional `summary`, and a list of typed `TraceEntry`s (`label`, `value`
+of bool/float/str, `justification`, `metadata`). It is persisted as its own
+`metric_traces` entity (1:1 with `MetricScore`, `steps` stored as JSON), so lists
+(claims, per-node verdicts, similarities) stay arrays instead of being flattened
+into one string.
 
 Two ready-made shapes cover almost everything.
 
@@ -123,9 +129,8 @@ class Correccion(SingleRubricMetric):
 ### `MultiStepMetric` — orchestrate several judge calls
 
 When a score needs more than one step (extract → verify → aggregate), subclass
-`MultiStepMetric` and implement `evaluate()`. Build a list of `StepTrace` entries
-and flatten them into the single Spanish `justification` with
-`render_justification()`.
+`MultiStepMetric` and implement `evaluate()`. Build a `MetricTrace` of `TraceStep`s
+whose `entries` keep the per-item detail as typed `TraceEntry`s.
 
 ```python
 @register(scenarios=["soporte_tecnico"])
@@ -136,26 +141,31 @@ class SeguridadFactual(MultiStepMetric):
     weight = 3.0
 
     def evaluate(self, turn, judge):
-        trace = []
+        steps = []
         extraction = judge.structured(
             instruction=EXTRAER_AFIRMACIONES, turn=turn, schema=Afirmaciones
         )
-        trace.append(StepTrace(label="Extracción de afirmaciones", detail=extraction.summary))
+        steps.append(TraceStep(
+            label="Extracción de afirmaciones", summary=extraction.summary,
+            entries=[TraceEntry(label=a) for a in extraction.afirmaciones],
+        ))
 
         verdicts = [
             judge.score(rubric=VERIFICAR.format(afirmacion=a), turn=turn,
                         scale=Boolean(), rubric_version=self.rubric_version)
             for a in extraction.afirmaciones
         ]
-        for a, v in zip(extraction.afirmaciones, verdicts, strict=True):
-            trace.append(StepTrace(label=f"Verificación: {a}", detail=v.justification))
+        steps.append(TraceStep(label="Verificación", entries=[
+            TraceEntry(label=a, value=bool(v.score), justification=v.justification)
+            for a, v in zip(extraction.afirmaciones, verdicts, strict=True)
+        ]))
 
         raw = sum(v.score for v in verdicts) / len(verdicts) if verdicts else 1.0
         return MetricResult(
             metric_name=self.name, raw_score=raw, normalized_score=self.normalize(raw),
-            justification=self.render_justification(trace),
+            trace=MetricTrace(steps=steps),
             judge_model=verdicts[0].model if verdicts else None,
-            rubric_version=self.rubric_version, trace=trace,
+            rubric_version=self.rubric_version,
         )
 ```
 
@@ -307,8 +317,9 @@ from scorekeeper.metrics.catalog import claridad  # noqa: F401
 
 Metric classes are testable with **no database and no LLM**. Inject a stub judge
 that satisfies the `Judge` Protocol and returns scripted verdicts; assert on the
-`MetricResult`. For multi-step metrics, assert the **call order/count** and that
-each step appears in the flattened `justification`. Selection tests run against an
+`MetricResult`. For multi-step metrics, assert the **call order/count** and the
+structured `trace.steps` / `entries` (labels, typed `value`s, `metadata`).
+Selection tests run against an
 in-memory SQLite session. See `tests/metrics/` for the patterns, including a
 `registered_metrics` fixture that isolates the global registry per test.
 

@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Scorekeeper</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Scorekeeper</h1>
+      <nav>
+        <a id="evaluations" href="#">Evaluaciones</a>
+        <a id="options" href="#" title="Ajustes">Ajustes</a>
+      </nav>
+    </header>
+
+    <p id="detection" class="notice">Leyendo la conversación…</p>
+
+    <form id="form" hidden>
+      <label>
+        Plataforma
+        <input id="platform" name="platform" required autocomplete="off" />
+      </label>
+      <label>
+        Escenario
+        <input id="scenario" name="scenario" required autocomplete="off" />
+      </label>
+      <label>
+        Caso de uso
+        <input id="useCase" name="useCase" required autocomplete="off" />
+        <small>Separa varios con comas para unir sus métricas.</small>
+      </label>
+      <button id="submit" type="submit">Enviar a Scorekeeper</button>
+    </form>
+
+    <p id="error" class="notice error" hidden></p>
+
+    <section id="run" hidden>
+      <h2>Última evaluación</h2>
+      <dl>
+        <dt>Estado</dt>
+        <dd><span id="runStatus" class="badge"></span></dd>
+        <dt>Escenario</dt>
+        <dd id="runScenario"></dd>
+        <dt>Avance</dt>
+        <dd id="runProgress">—</dd>
+        <dt>Promedio</dt>
+        <dd id="runAverage">—</dd>
+      </dl>
+      <p id="runError" class="notice error" hidden></p>
+      <p class="run-id">
+        <code id="runId"></code>
+        <button id="refresh" type="button" class="link">Actualizar</button>
+      </p>
+    </section>
+
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

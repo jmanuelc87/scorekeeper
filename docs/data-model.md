@@ -102,9 +102,14 @@ erDiagram
         UUID turn_id FK
         String metric_name
         Float score
-        Text justification
         String judge_model
         String rubric_version
+    }
+
+    MetricTrace {
+        UUID id PK
+        UUID metric_score_id FK
+        JSON steps
     }
 
     ScenarioMetric {
@@ -146,6 +151,7 @@ erDiagram
     ScenarioResult ||--o{ Turn : "has"
     Turn ||--o{ RetrievedDocument : "grounded on"
     Turn ||--o{ MetricScore : "has"
+    MetricScore ||--|| MetricTrace : "has"
 ```
 
 `ScenarioMetric`, `AuthProviderConfig`, and `DocumentCacheEntry` are standalone tables (no FK
@@ -264,9 +270,22 @@ An LLM-as-a-judge score for a single metric on a single turn. A turn has many.
 | `turn_id` | UUID | FK → `turns.id`, `ON DELETE CASCADE`. |
 | `metric_name` | String(128) | Name of the evaluated metric. |
 | `score` | Float | Numeric score for the metric. |
-| `justification` | Text | Judge's rationale for the score. |
 | `judge_model` | String(128) | Model that produced the score, for reproducibility. |
 | `rubric_version` | String(64) | Version of the scoring rubric used. |
+
+Its structured trace lives in a separate `MetricTrace` entity (below), not a column.
+
+### MetricTrace
+
+The structured record of what a metric produced for one turn — its own entity,
+1:1 with `MetricScore` (`ON DELETE CASCADE`). Replaces the former flattened
+`justification` string.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `metric_score_id` | UUID | FK → `metric_scores.id`, `ON DELETE CASCADE`, unique (enforces 1:1). |
+| `steps` | JSON (JSONB on PostgreSQL) | The list of steps (each `label`/`summary`/`entries`, entries carrying typed `value`/`justification`/`metadata`). |
 
 ### ScenarioMetric
 
@@ -327,7 +346,7 @@ run hierarchy; the bytes live on disk, not in the DB.
 
 The `BenchmarkRun` subtree uses `ON DELETE CASCADE` and SQLAlchemy
 `cascade="all, delete-orphan"`, so deleting a `BenchmarkRun` removes its entire
-subtree of executions, scenarios, turns, and scores.
+subtree of executions, scenarios, turns, scores, and each score's `MetricTrace`.
 
 The `SourceFile → BenchmarkRun` link uses `ON DELETE SET NULL` instead: deleting
 a source file leaves its runs and their results intact, only clearing their

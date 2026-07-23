@@ -14,13 +14,14 @@ from scorekeeper.config import get_settings
 from scorekeeper.metrics.judge import JudgeStep
 from scorekeeper.metrics.judges.anthropic_judge import AnthropicJudge
 from scorekeeper.metrics.judges.base import StepModels
+from scorekeeper.metrics.judges.lmstudio_judge import LMStudioJudge
 from scorekeeper.metrics.judges.openai_judge import OpenAIJudge
 
 if TYPE_CHECKING:
     from scorekeeper.config import Settings
     from scorekeeper.metrics.judge import Judge
 
-__all__ = ["AnthropicJudge", "OpenAIJudge", "make_judge"]
+__all__ = ["AnthropicJudge", "LMStudioJudge", "OpenAIJudge", "make_judge"]
 
 
 def _step_models(settings: Settings, default_model: str) -> StepModels:
@@ -86,7 +87,19 @@ def make_judge(settings: Settings | None = None) -> Judge:
             step_models=_step_models(settings, settings.openai_judge_model),
         )
 
+    if provider in ("lmstudio", "local", "lm-studio"):
+        # Local OpenAI-compatible server (LM Studio). No API key gate: it needs none.
+        # Remaps every requested/pinned model to the loaded local model, so all
+        # metrics run end-to-end (see LMStudioJudge).
+        return LMStudioJudge(
+            model=settings.lmstudio_judge_model,
+            base_url=settings.lmstudio_base_url,
+            api_key=settings.lmstudio_api_key,
+            system_prompt=settings.judge_system_prompt,
+            embedding_model=settings.lmstudio_embedding_model,
+        )
+
     raise ValueError(
         f"Proveedor de juez desconocido: {settings.judge_provider!r}. "
-        "Usa 'anthropic' u 'openai'."
+        "Usa 'anthropic', 'openai' o 'lmstudio'."
     )

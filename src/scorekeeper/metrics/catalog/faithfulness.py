@@ -39,8 +39,10 @@ from pydantic import BaseModel
 
 from scorekeeper.metrics.base import (
     MetricResult,
+    MetricTrace,
     MultiStepMetric,
-    StepTrace,
+    TraceEntry,
+    TraceStep,
     TurnView,
 )
 from scorekeeper.metrics.category import MetricCategory
@@ -65,12 +67,18 @@ def split_sentences(text: str) -> list[str]:
     return sentences
 
 
-def _describe_claims(claims: list[str]) -> str:
-    """Spanish trace detail listing the sentences taken as claims."""
-    if not claims:
-        return "No se extrajo ninguna afirmación de la respuesta."
-    listado = "\n".join(f"- {claim}" for claim in claims)
-    return f"{len(claims)} afirmación(es) extraída(s) de la respuesta:\n{listado}"
+def _extraction_step(claims: list[str]) -> TraceStep:
+    """Trace step recording the sentences taken as claims (as an array, not joined)."""
+    summary = (
+        f"{len(claims)} afirmación(es) extraída(s) de la respuesta"
+        if claims
+        else "No se extrajo ninguna afirmación de la respuesta."
+    )
+    return TraceStep(
+        label="Extracción de afirmaciones de la respuesta",
+        summary=summary,
+        entries=[TraceEntry(label=claim) for claim in claims],
+    )
 
 
 # --- Extraction schemas -------------------------------------------------------
@@ -188,17 +196,12 @@ class FaithfulnessRagas(MultiStepMetric):
         return audit.entailed, audit.justification, True
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
-        trace: list[StepTrace] = []
+        steps: list[TraceStep] = []
 
         # Decompose the answer into claims deterministically: one sentence = one
         # claim (syntok), replacing the former LLM extraction call.
         claims = split_sentences(turn.response)
-        trace.append(
-            StepTrace(
-                label="Extracción de afirmaciones de la respuesta",
-                detail=_describe_claims(claims),
-            )
-        )
+        steps.append(_extraction_step(claims))
 
         # Nothing to verify → nothing can be unfaithful.
         if not claims:
@@ -206,24 +209,33 @@ class FaithfulnessRagas(MultiStepMetric):
                 metric_name=self.name,
                 raw_score=1.0,
                 normalized_score=self.normalize(1.0),
-                justification=self.render_justification(trace),
+                trace=MetricTrace(steps=steps),
                 judge_model=None,
                 rubric_version=self.rubric_version,
-                trace=trace,
             )
 
         # Per-claim entailment via the Haiku→Opus cascade. Track which models
-        # actually ran so ``judge_model`` reflects the escalations.
+        # actually ran so ``judge_model`` reflects the escalations. Each claim is a
+        # typed entry; escalation and the deciding model become metadata, not glue.
         supported = 0
         escalated_any = False
+        verify_step = TraceStep(label="Verificación de afirmaciones")
         for claim in claims:
             entailed, justification, escalated = self._verify_claim(turn, judge, claim)
             supported += int(entailed)
             escalated_any = escalated_any or escalated
-            detail = justification
-            if escalated:
-                detail = f"{justification} (escalado a {self.audit_model})"
-            trace.append(StepTrace(label=f"Verificación: {claim}", detail=detail))
+            verify_step.entries.append(
+                TraceEntry(
+                    label=claim,
+                    value=entailed,
+                    justification=justification,
+                    metadata={
+                        "escalated": escalated,
+                        "model": self.audit_model if escalated else self.bulk_model,
+                    },
+                )
+            )
+        steps.append(verify_step)
 
         # Fraction of statements entailed by the context = supported / n.
         raw = supported / len(claims)
@@ -236,10 +248,9 @@ class FaithfulnessRagas(MultiStepMetric):
             metric_name=self.name,
             raw_score=raw,
             normalized_score=self.normalize(raw),
-            justification=self.render_justification(trace),
+            trace=MetricTrace(steps=steps),
             judge_model=judge_model,
             rubric_version=self.rubric_version,
-            trace=trace,
         )
 
 
@@ -263,26 +274,20 @@ class FaithfulnessDeepeval(MultiStepMetric):
     verdict_model: str = "claude-opus-4-8"
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
-        trace: list[StepTrace] = []
+        steps: list[TraceStep] = []
 
         # Split claims first so the "no claims" case short-circuits before we pay
         # for the (still LLM-based) truths extraction. One sentence = one claim.
         claims = split_sentences(turn.response)
-        trace.append(
-            StepTrace(
-                label="Extracción de afirmaciones de la respuesta",
-                detail=_describe_claims(claims),
-            )
-        )
+        steps.append(_extraction_step(claims))
         if not claims:
             return MetricResult(
                 metric_name=self.name,
                 raw_score=1.0,
                 normalized_score=self.normalize(1.0),
-                justification=self.render_justification(trace),
+                trace=MetricTrace(steps=steps),
                 judge_model=None,
                 rubric_version=self.rubric_version,
-                trace=trace,
             )
 
         truths = judge.structured(
@@ -292,9 +297,11 @@ class FaithfulnessDeepeval(MultiStepMetric):
             step=JudgeStep.EXTRACT,
             model=self.truths_model,
         )
-        trace.append(
-            StepTrace(
-                label="Extracción de verdades del contexto", detail=truths.summary
+        steps.append(
+            TraceStep(
+                label="Extracción de verdades del contexto",
+                summary=truths.summary,
+                entries=[TraceEntry(label=truth) for truth in truths.truths],
             )
         )
 
@@ -302,10 +309,10 @@ class FaithfulnessDeepeval(MultiStepMetric):
         # groundedness, so fail closed (0.0) rather than pass every claim as
         # "no verificable", which would silently score fabricated answers as perfect.
         if not truths.truths:
-            trace.append(
-                StepTrace(
+            steps.append(
+                TraceStep(
                     label="Verdades vacías",
-                    detail=(
+                    summary=(
                         "No se extrajeron verdades del contexto; sin base para "
                         "verificar las afirmaciones. Se asigna 0."
                     ),
@@ -315,10 +322,9 @@ class FaithfulnessDeepeval(MultiStepMetric):
                 metric_name=self.name,
                 raw_score=0.0,
                 normalized_score=self.normalize(0.0),
-                justification=self.render_justification(trace),
+                trace=MetricTrace(steps=steps),
                 judge_model=None,
                 rubric_version=self.rubric_version,
-                trace=trace,
             )
 
         truths_text = "\n".join(truths.truths)
@@ -333,10 +339,18 @@ class FaithfulnessDeepeval(MultiStepMetric):
             )
             for claim in claims
         ]
-        for claim, verdict in zip(claims, verdicts, strict=True):
-            trace.append(
-                StepTrace(label=f"Veredicto: {claim}", detail=verdict.justification)
-            )
+        verify_step = TraceStep(
+            label="Veredicto por afirmación",
+            entries=[
+                TraceEntry(
+                    label=claim,
+                    value=bool(verdict.score),
+                    justification=verdict.justification,
+                )
+                for claim, verdict in zip(claims, verdicts, strict=True)
+            ],
+        )
+        steps.append(verify_step)
 
         # Boolean scale → contradicted=0, otherwise 1; mean = not_contradicted / n.
         raw = sum(v.score for v in verdicts) / len(verdicts)
@@ -344,8 +358,7 @@ class FaithfulnessDeepeval(MultiStepMetric):
             metric_name=self.name,
             raw_score=raw,
             normalized_score=self.normalize(raw),
-            justification=self.render_justification(trace),
+            trace=MetricTrace(steps=steps),
             judge_model=verdicts[0].model,
             rubric_version=self.rubric_version,
-            trace=trace,
         )

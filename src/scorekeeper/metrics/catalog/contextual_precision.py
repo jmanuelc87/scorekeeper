@@ -35,8 +35,10 @@ from pydantic import BaseModel
 
 from scorekeeper.metrics.base import (
     MetricResult,
+    MetricTrace,
     MultiStepMetric,
-    StepTrace,
+    TraceEntry,
+    TraceStep,
     TurnView,
 )
 from scorekeeper.metrics.category import MetricCategory
@@ -98,7 +100,7 @@ class ContextualPrecision(MultiStepMetric):
 
         if not nodes:
             # No retrieved nodes to rank: nothing relevant was retrieved.
-            justification = (
+            summary = (
                 "No hay nodos de contexto recuperado que ordenar; la precisión "
                 "contextual es 0.000."
             )
@@ -106,16 +108,19 @@ class ContextualPrecision(MultiStepMetric):
                 metric_name=self.name,
                 raw_score=0.0,
                 normalized_score=self.normalize(0.0),
-                justification=justification,
+                trace=MetricTrace(
+                    steps=[TraceStep(label="Sin nodos recuperados", summary=summary)]
+                ),
                 rubric_version=self.rubric_version,
             )
 
         # Stage 1: label each node's relevance against the expected output, in the
         # retriever's original rank order. The node under evaluation is isolated in
         # its own view (empty response, no context blob) so the judge is not biased
-        # by the assistant's actual answer or by the other nodes.
-        trace: list[StepTrace] = []
+        # by the assistant's actual answer or by the other nodes. Each node is a
+        # typed entry: value=relevant, metadata carries its rank.
         verdicts: list[int] = []
+        label_step = TraceStep(label="Relevancia por nodo")
         node_view = TurnView(prompt=turn.prompt, response="")
         judge_model = judge.model_for(JudgeStep.EXTRACT)
         for k, node in enumerate(nodes, start=1):
@@ -130,31 +135,30 @@ class ContextualPrecision(MultiStepMetric):
             )
             r_k = 1 if verdict.relevant else 0
             verdicts.append(r_k)
-            etiqueta = "relevante" if r_k else "no relevante"
-            trace.append(
-                StepTrace(
-                    label=f"Nodo {k} (rango {k}): {etiqueta}",
-                    detail=verdict.justification,
+            label_step.entries.append(
+                TraceEntry(
+                    label=f"Nodo {k}",
+                    value=verdict.relevant,
+                    justification=verdict.justification,
+                    metadata={"rank": k},
                 )
             )
 
         total_relevant = sum(verdicts)
 
         if total_relevant == 0:
-            trace.append(
-                StepTrace(
-                    label="Precisión contextual",
-                    detail="Ningún nodo recuperado es relevante; precisión = 0.000.",
-                )
+            result_step = TraceStep(
+                label="Precisión contextual",
+                summary="Ningún nodo recuperado es relevante; precisión = 0.000.",
+                entries=[TraceEntry(label="precisión contextual", value=0.0)],
             )
             return MetricResult(
                 metric_name=self.name,
                 raw_score=0.0,
                 normalized_score=self.normalize(0.0),
-                justification=self.render_justification(trace),
+                trace=MetricTrace(steps=[label_step, result_step]),
                 judge_model=judge_model,
                 rubric_version=self.rubric_version,
-                trace=trace,
             )
 
         # Stage 2: weighted cumulative precision (Average Precision). Each relevant
@@ -173,21 +177,19 @@ class ContextualPrecision(MultiStepMetric):
             # Only a perfect ranking passes; anything less collapses to 0.0.
             raw = 1.0 if raw == 1.0 else 0.0
 
-        trace.append(
-            StepTrace(
-                label="Precisión contextual",
-                detail=(
-                    f"{total_relevant} de {len(nodes)} nodos son relevantes; "
-                    f"precisión contextual (Average Precision) = {raw:.3f}."
-                ),
-            )
+        result_step = TraceStep(
+            label="Precisión contextual",
+            summary=(
+                f"{total_relevant} de {len(nodes)} nodos son relevantes; "
+                f"precisión contextual (Average Precision) = {raw:.3f}."
+            ),
+            entries=[TraceEntry(label="precisión contextual", value=round(raw, 3))],
         )
         return MetricResult(
             metric_name=self.name,
             raw_score=raw,
             normalized_score=self.normalize(raw),
-            justification=self.render_justification(trace),
+            trace=MetricTrace(steps=[label_step, result_step]),
             judge_model=judge_model,
             rubric_version=self.rubric_version,
-            trace=trace,
         )

@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime
 from pathlib import Path
@@ -54,6 +55,38 @@ class EvaluationPayload(BaseModel):
     use_case: str = evaluation.DEFAULT_USE_CASE
     # Optional per-filename overrides; a file with no entry uses the defaults.
     files: dict[str, FileOverride] = Field(default_factory=dict)
+
+
+class CaptureMessage(BaseModel):
+    """One scraped chat bubble: who said it and what it said."""
+
+    role: str = Field(..., min_length=1)  # user | model (aliases are normalized)
+    content: str = ""
+    # Explicit turn number; omitted for every message means turns are derived
+    # (each user message following a non-user message opens a new turn).
+    turn: int | None = None
+    retrieved_context: str | None = None
+    expected_output: str | None = None
+
+
+class CaptureConversation(BaseModel):
+    """One captured conversation — the JSON twin of one uploaded ``.xlsx`` file."""
+
+    scenario_id: str = Field(..., min_length=1)
+    messages: list[CaptureMessage] = Field(..., min_length=1)
+    # Overrides the payload-level defaults for just this conversation.
+    use_case: str | None = None
+    platform: str | None = None
+    # Where the capture came from (e.g. the chat URL); stored as the source ref.
+    source_ref: str | None = None
+
+
+class CapturePayload(BaseModel):
+    """Body of ``POST /captures``: conversations scraped from a chat UI."""
+
+    platform: str = Field(..., min_length=1)
+    use_case: str = evaluation.DEFAULT_USE_CASE
+    conversations: list[CaptureConversation] = Field(..., min_length=1)
 
 
 class PlatformSummary(BaseModel):
@@ -158,6 +191,62 @@ def create_evaluation(
     return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_EN_COLA)
 
 
+@app.post("/captures", response_model=EvaluationEnqueuedResponse, status_code=202)
+def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
+    """Ingest conversations captured from a chat UI and enqueue them for scoring.
+
+    The JSON twin of ``POST /evaluations`` for clients that already hold the turns
+    and have no spreadsheet to upload — the browser extension in ``extension/``
+    scrapes them off Copilot, Gemini and Claude. Each entry in ``conversations`` is
+    one scenario and follows the same platform rules as an uploaded file: its own
+    ``platform`` when set, otherwise the payload-level one.
+
+    Returns ``202`` with a ``run_id``; poll ``GET /evaluations/{run_id}`` for
+    progress and results, exactly as with an upload.
+    """
+    logger.info(
+        "POST /captures: %d conversación(es), plataforma=%s",
+        len(payload.conversations),
+        payload.platform,
+    )
+
+    uploads: list[evaluation.UploadedFile] = []
+    for conversation in payload.conversations:
+        messages = [
+            message.model_dump(exclude_none=True) for message in conversation.messages
+        ]
+        if not any(message.get("content", "").strip() for message in messages):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"La conversación {conversation.scenario_id!r} no tiene "
+                    "mensajes con contenido."
+                ),
+            )
+        source_ref = conversation.source_ref or conversation.scenario_id
+        uploads.append(
+            evaluation.UploadedFile(
+                filename=source_ref,
+                # No file bytes to hash, so the capture itself is the provenance.
+                content=json.dumps(messages, ensure_ascii=False).encode("utf-8"),
+                scenario_id=conversation.scenario_id,
+                use_case=conversation.use_case or payload.use_case,
+                platform=conversation.platform,
+                messages=messages,
+            )
+        )
+
+    try:
+        run_id = evaluation.ingest_evaluation(payload.platform, uploads)
+    except ValueError as exc:
+        logger.warning("POST /captures rechazado: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    tasks.enqueue_run(run_id)
+    logger.info("POST /captures en cola: run_id=%s", run_id)
+    return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_EN_COLA)
+
+
 @app.get("/evaluations/{run_id}", response_model=EvaluationResponse)
 def get_evaluation(run_id: str) -> EvaluationResponse:
     """Return a run's current status and summary (poll this after ``POST``).
@@ -170,6 +259,26 @@ def get_evaluation(run_id: str) -> EvaluationResponse:
     if summary is None:
         raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
     return EvaluationResponse.model_validate(summary)
+
+
+@app.get("/turns/{turn_id}/traces")
+def get_turn_traces(
+    turn_id: str,
+    provenance: bool = Query(
+        True, description="Incluir judge_model y rubric_version por métrica."
+    ),
+) -> list[dict]:
+    """Return the structured metric traces for one turn.
+
+    One entry per metric scored on the turn: its ``metric_name`` and ``trace``
+    (``{"steps": [...]}`` or ``null``). ``provenance=true`` (default) also includes
+    ``judge_model`` and ``rubric_version``; ``provenance=false`` returns the minimal
+    shape. ``404`` when the ``turn_id`` is unknown or malformed.
+    """
+    traces = evaluation.retrieve_turn_traces(turn_id, include_provenance=provenance)
+    if traces is None:
+        raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
+    return traces
 
 
 @app.get("/runs")
@@ -194,6 +303,9 @@ def list_runs(
     ``scenario_results`` → ``metric_scores``). Returns a list ordered by creation date;
     an unknown ``run_id`` yields ``[]``. ``400`` for an unknown ``granularity`` or an
     unparseable date.
+
+    Metric scores are returned without their structured ``trace``, which is
+    persisted for direct inspection but not surfaced through this API.
     """
     try:
         return evaluation.retrieve_runs(

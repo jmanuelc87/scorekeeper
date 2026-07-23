@@ -32,16 +32,26 @@ from scorekeeper.database import (
     SourceFile,
     Turn,
 )
+from scorekeeper.database import MetricTrace as MetricTraceRow
 from scorekeeper.evaluation import (
     UploadedFile,
     get_run_summary,
     ingest_evaluation,
     project_turns,
     retrieve_runs,
+    retrieve_turn_traces,
     run_evaluation,
     score_run,
 )
-from scorekeeper.metrics.base import Metric, MetricResult, TurnView
+from scorekeeper.metrics.base import (
+    Metric,
+    MetricResult,
+    MetricTrace,
+    TraceEntry,
+    TraceStep,
+    TurnView,
+)
+from scorekeeper.metrics.catalog.hallucination import split_context_docs
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry
@@ -79,7 +89,20 @@ class _FakeMetric(Metric):
             metric_name=self.name,
             raw_score=verdict.score,
             normalized_score=self.normalize(verdict.score),
-            justification=verdict.justification,
+            trace=MetricTrace(
+                steps=[
+                    TraceStep(
+                        label="Puntuación",
+                        entries=[
+                            TraceEntry(
+                                label=self.name,
+                                value=verdict.score,
+                                justification=verdict.justification,
+                            )
+                        ],
+                    )
+                ]
+            ),
             judge_model=verdict.model,
             rubric_version=self.rubric_version,
         )
@@ -708,11 +731,98 @@ def test_retrieve_metric_granularity_adds_turns_and_scores(session: Session, reg
     scenario = runs[0]["platforms"][0]["scenario_results"][0]
     turns = scenario["turns"]
     assert [t["turn_number"] for t in turns] == [1, 2]
+    # Each serialized turn carries its id so clients can reach /turns/{id}/traces.
+    assert all(uuid.UUID(t["turn_id"]) for t in turns)
     scores = turns[0]["metric_scores"]
     assert len(scores) == 1
     assert scores[0]["metric_name"] == "utilidad"
     assert scores[0]["score"] == pytest.approx(0.8)
     assert scores[0]["judge_model"] == "judge-test"
+    # The structured trace is never surfaced (nor the old flattened justification),
+    # even though a trace row is persisted per metric score for direct inspection.
+    assert "trace" not in scores[0]
+    assert "justification" not in scores[0]
+    trace_rows = session.execute(select(func.count()).select_from(MetricTraceRow)).scalar_one()
+    metric_rows = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
+    assert trace_rows == metric_rows
+
+
+# --- retrieve_turn_traces + /turns/{turn_id}/traces ---------------------------
+
+
+def test_retrieve_turn_traces_with_provenance(session: Session, registry) -> None:
+    _score_one(session)
+    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+
+    traces = retrieve_turn_traces(str(turn.id), session=session)
+
+    assert len(traces) == 1
+    entry = traces[0]
+    assert entry["metric_name"] == "utilidad"
+    assert entry["judge_model"] == "judge-test"
+    assert entry["rubric_version"] == "v1"
+    # The full structured trace is surfaced here (unlike the general read paths).
+    assert entry["trace"]["steps"][0]["entries"][0]["value"] == pytest.approx(0.8)
+
+
+def test_retrieve_turn_traces_minimal_omits_provenance(session: Session, registry) -> None:
+    _score_one(session)
+    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+
+    traces = retrieve_turn_traces(str(turn.id), include_provenance=False, session=session)
+
+    entry = traces[0]
+    assert set(entry) == {"metric_name", "trace"}
+    assert entry["metric_name"] == "utilidad"
+    assert entry["trace"]["steps"][0]["entries"][0]["value"] == pytest.approx(0.8)
+
+
+def test_retrieve_turn_traces_unknown_or_malformed_is_none(session: Session, registry) -> None:
+    _score_one(session)
+
+    assert retrieve_turn_traces("not-a-uuid", session=session) is None
+    assert (
+        retrieve_turn_traces(
+            "00000000-0000-0000-0000-000000000000", session=session
+        )
+        is None
+    )
+
+
+def test_turn_traces_endpoint_forwards_and_returns(monkeypatch) -> None:
+    captured: dict = {}
+    payload = [{"metric_name": "utilidad", "trace": {"steps": []}}]
+
+    def fake(turn_id, **kwargs):
+        captured["turn_id"] = turn_id
+        captured.update(kwargs)
+        return payload
+
+    monkeypatch.setattr(evaluation, "retrieve_turn_traces", fake)
+
+    with TestClient(app) as client:
+        response = client.get("/turns/abc/traces", params={"provenance": "false"})
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    assert captured == {"turn_id": "abc", "include_provenance": False}
+
+
+def test_turn_traces_endpoint_unknown_turn_404(monkeypatch) -> None:
+    monkeypatch.setattr(evaluation, "retrieve_turn_traces", lambda *a, **k: None)
+
+    with TestClient(app) as client:
+        response = client.get("/turns/nope/traces")
+
+    assert response.status_code == 404
+
+
+def test_mcp_retrieve_turn_traces_coalesces_none(monkeypatch) -> None:
+    from scorekeeper import server
+
+    monkeypatch.setattr(evaluation, "retrieve_turn_traces", lambda *a, **k: None)
+    # The MCP tool never 404s: an unknown turn becomes an empty list.
+    assert server.retrieve_turn_traces("nope") == []
 
 
 def test_retrieve_default_granularity_is_scenario(session: Session, registry) -> None:
@@ -781,3 +891,179 @@ def test_retrieve_invalid_granularity_raises(session: Session) -> None:
 def test_retrieve_invalid_date_raises(session: Session) -> None:
     with pytest.raises(ValueError):
         retrieve_runs(start_date="ayer", session=session)
+
+
+# --- POST /captures -----------------------------------------------------------
+
+
+def test_captures_endpoint_ingests_and_enqueues(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_ingest(platform, files, *, session=None):
+        captured["platform"] = platform
+        captured["files"] = files
+        return "run-cap"
+
+    monkeypatch.setattr(evaluation, "ingest_evaluation", fake_ingest)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/captures",
+            json={
+                "platform": "gemini",
+                "use_case": "web_search",
+                "conversations": [
+                    {
+                        "scenario_id": "esc-navegador",
+                        "source_ref": "https://gemini.google.com/app/abc",
+                        "messages": [
+                            {"role": "user", "content": "¿Cuál es la capital?"},
+                            {"role": "model", "content": "Madrid."},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {"run_id": "run-cap", "status": "en_cola"}
+    assert captured["enqueued"] == "run-cap"
+    assert captured["platform"] == "gemini"
+    upload = captured["files"][0]
+    assert upload.scenario_id == "esc-navegador"
+    assert upload.use_case == "web_search"  # payload default, no per-conversation one
+    assert upload.filename == "https://gemini.google.com/app/abc"
+    assert upload.messages == [
+        {"role": "user", "content": "¿Cuál es la capital?"},
+        {"role": "model", "content": "Madrid."},
+    ]
+    # No file bytes exist, so the provenance hash covers the capture itself.
+    assert json.loads(upload.content.decode()) == upload.messages
+
+
+def test_captures_endpoint_per_conversation_overrides(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(
+        evaluation,
+        "ingest_evaluation",
+        lambda platform, files, **kw: captured.update(files=files) or "run-cap",
+    )
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: None)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/captures",
+            json={
+                "platform": "claude",
+                "conversations": [
+                    {
+                        "scenario_id": "esc1",
+                        "platform": "copilot",
+                        "use_case": "document_retrieval",
+                        "messages": [{"role": "user", "content": "Hola"}],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 202
+    upload = captured["files"][0]
+    assert upload.platform == "copilot"
+    assert upload.use_case == "document_retrieval"
+    # Without a source_ref the scenario id names the "file".
+    assert upload.filename == "esc1"
+
+
+def test_captures_endpoint_rejects_contentless_conversation() -> None:
+    with TestClient(app) as client:
+        response = client.post(
+            "/captures",
+            json={
+                "platform": "claude",
+                "conversations": [
+                    {"scenario_id": "vacio", "messages": [{"role": "user", "content": "  "}]}
+                ],
+            },
+        )
+
+    assert response.status_code == 400
+    assert "vacio" in response.json()["detail"]
+
+
+def test_captures_endpoint_requires_conversations() -> None:
+    with TestClient(app) as client:
+        response = client.post("/captures", json={"platform": "claude", "conversations": []})
+
+    assert response.status_code == 422
+
+
+def test_captured_messages_reach_turns_without_a_spreadsheet(session: Session) -> None:
+    """An UploadedFile carrying messages skips the .xlsx parser end to end."""
+    run_id = ingest_evaluation(
+        "claude",
+        [
+            UploadedFile(
+                filename="https://claude.ai/chat/abc",
+                content=b"{}",
+                scenario_id="esc-captura",
+                messages=[
+                    {"role": "user", "content": "Hola"},
+                    {"role": "model", "content": "¿Qué tal?"},
+                    {"role": "user", "content": "Adiós"},
+                    {"role": "model", "content": "Hasta luego"},
+                ],
+            )
+        ],
+        session=session,
+    )
+
+    scenario = session.scalars(select(ScenarioResult)).one()
+    assert scenario.scenario_id == "esc-captura"
+    assert scenario.source_ref == "https://claude.ai/chat/abc"
+    # Turns were derived from role alternation: two user+model pairs.
+    turns = sorted(scenario.turns, key=lambda t: t.turn_number)
+    assert [(t.turn_number, t.prompt, t.response) for t in turns] == [
+        (1, "Hola", "¿Qué tal?"),
+        (2, "Adiós", "Hasta luego"),
+    ]
+    assert scenario.raw_conversation["messages"][0]["turn"] == 1
+    assert str(session.get(BenchmarkRun, uuid.UUID(run_id)).status) == "en_cola"
+
+
+def test_captured_citations_reach_turn_context(session: Session) -> None:
+    """Sources scraped off a chat UI land on the turn as ``retrieved_context_source``.
+
+    Mirrors what the extension's Copilot adapter produces: a turn whose answer
+    arrives in two model messages (an interstitial, then the real answer) with the
+    citations attached to the second one.
+    """
+    context = (
+        "eleconomista.com.mx\nhttps://www.eleconomista.com.mx/tags/grupo-mexico-861"
+        "\n\nforbes.com\nhttps://www.forbes.com/lists/global2000/"
+    )
+
+    ingest_evaluation(
+        "copilot",
+        [
+            UploadedFile(
+                filename="https://m365.cloud.microsoft/chat/",
+                content=b"{}",
+                scenario_id="esc-citas",
+                messages=[
+                    {"role": "user", "content": "Noticias sobre Grupo México"},
+                    {"role": "model", "content": "Conectar para continuar"},
+                    {"role": "model", "content": "Tres noticias", "retrieved_context": context},
+                ],
+            )
+        ],
+        session=session,
+    )
+
+    turn = session.scalars(select(ScenarioResult)).one().turns[0]
+    # Both model messages joined into one response, and the context survived even
+    # though it hung off the second of them.
+    assert turn.response == "Conectar para continuar\nTres noticias"
+    assert turn.retrieved_context_source == context
+    # Two blank-line-separated blocks, so the metrics see two retrieved documents.
+    assert len(split_context_docs(turn.retrieved_context_source)) == 2

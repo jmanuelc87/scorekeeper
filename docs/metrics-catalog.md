@@ -18,8 +18,9 @@ All rubrics, prompts and justifications are in Spanish.
 | [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination — worse raw score, but `Inverted` normalizes it to higher-is-better faithfulness | `hallucination` |
 
 Every metric here is a `MultiStepMetric` — it orchestrates several `Judge` calls
-and flattens their per-step `StepTrace`s into a single Spanish `justification`.
-None import an LLM SDK: they depend only on the `Judge` seam.
+and records what each step produced as a structured `MetricTrace` (`steps` → typed
+`entries`), persisted on the `metric_traces` table (1:1 with `MetricScore`). None
+import an LLM SDK: they depend only on the `Judge` seam.
 
 Every metric declares the `use_case`(s) it applies to via `@register(scenarios=…)`,
 and each one applies to a single use case named after itself
@@ -149,8 +150,8 @@ This is a `MultiStepMetric`: one judge call per node, no single rubric.
    Precision: at each rank where a relevant node appears, add
    `precision@k = (relevant seen so far) / k`, then divide by the total relevant
    count.
-4. Each node's verdict, plus a summary line, is recorded as a `StepTrace` and
-   flattened into the single Spanish `justification`.
+4. Each node's verdict is a typed `TraceEntry` (`value` = relevant, `metadata.rank`),
+   with a summary `TraceStep` for the Average Precision result.
 
 **No relevant nodes / no context.** If nothing relevant was retrieved (or
 `retrieved_context` is empty), the metric short-circuits to `raw_score = 0.0` —
@@ -364,8 +365,8 @@ This is a `MultiStepMetric`: one judge call per document, no single rubric.
    than `score()`. `NLIJudgment` carries the `NLILabel` and a Spanish
    justification.
 3. Count `contradiction` labels; `raw_score = contradicted / len(docs)`.
-4. Each document's verdict, plus a summary line, is recorded as a `StepTrace` and
-   flattened into the single Spanish `justification`.
+4. Each document's verdict is a typed `TraceEntry` (`value` = the NLI label,
+   `justification` = the Spanish rationale), with a summary `TraceStep` for the rate.
 
 **No-context turns.** When `retrieved_context` is empty there is nothing to
 contradict, so the metric short-circuits to `raw_score = 0.0` (no hallucination)

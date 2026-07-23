@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Evaluaciones · Scorekeeper</title>
+    <link rel="stylesheet" href="evaluations.css" />
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>Evaluaciones</h1>
+        <a id="options" href="#" title="Ajustes">Ajustes</a>
+      </header>
+
+      <p id="empty" class="notice">Aún no has enviado ninguna evaluación.</p>
+
+      <table id="table" hidden>
+        <thead>
+          <tr>
+            <th>Escenario</th>
+            <th>Plataforma</th>
+            <th>Estado</th>
+            <th>Avance</th>
+            <th>Promedio</th>
+            <th>Origen</th>
+            <th><span class="sr-only">Actualizar</span></th>
+          </tr>
+        </thead>
+        <tbody id="body"></tbody>
+      </table>
+    </main>
+
+    <script type="module" src="evaluations.js"></script>
+  </body>
+</html>

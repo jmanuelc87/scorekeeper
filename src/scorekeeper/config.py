@@ -19,7 +19,7 @@ class Settings(BaseSettings):
     celery_broker_url: str | None = None
 
     # LLM-as-a-judge configuration (see scorekeeper.metrics.judges).
-    judge_provider: str = "anthropic"  # "anthropic" | "openai"
+    judge_provider: str = "anthropic"  # "anthropic" | "openai" | "lmstudio"
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
     # Override the OpenAI API base URL (e.g. an OpenAI-compatible gateway or a local
@@ -29,6 +29,15 @@ class Settings(BaseSettings):
     anthropic_judge_model: str = "claude-opus-4-8"
     openai_judge_model: str = "gpt-5.6-sol"
     judge_max_tokens: int = 16384
+    # Local LM Studio judge (judge_provider="lmstudio"): an OpenAI-compatible server
+    # for end-to-end testing with no API key or external cost. It remaps every
+    # requested/pinned model to lmstudio_judge_model (the one loaded model), so all
+    # metrics run against whatever LM Studio has loaded. answer_relevance also needs
+    # an embedding model loaded (lmstudio_embedding_model).
+    lmstudio_base_url: str = "http://localhost:1234/v1"
+    lmstudio_judge_model: str = "local-model"  # set to the exact id shown in LM Studio
+    lmstudio_api_key: str = "lm-studio"  # ignored by LM Studio; the SDK needs non-empty
+    lmstudio_embedding_model: str = "text-embedding-nomic-embed-text-v1.5"
     # Per-step model overrides. Metrics label each judge call with a JudgeStep and
     # these route that step to a specific model of the active provider, so bulk
     # extraction (EXTRACT) can run on a cheaper/faster model than the decisive rubric

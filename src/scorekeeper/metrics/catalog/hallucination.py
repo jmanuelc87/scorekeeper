@@ -29,9 +29,12 @@ from pydantic import BaseModel
 
 from scorekeeper.metrics.base import (
     MetricResult,
+    MetricTrace,
     MultiStepMetric,
-    StepTrace,
+    TraceEntry,
+    TraceStep,
     TurnView,
+    context_documents,
 )
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import Judge, JudgeStep
@@ -118,6 +121,16 @@ HIPÓTESIS (respuesta del asistente):
 """
 
 
+def split_context_docs(context: str) -> list[str]:
+    """Split a ``retrieved_context`` value into individual retrieved documents.
+
+    Thin alias over :func:`context_documents`, which handles both the extension's
+    JSON citation array and the spreadsheet text blob. Kept as a named export for
+    the metrics (and tests) that document their dependency on document splitting.
+    """
+    return context_documents(context)
+
+
 @register(scenarios=["hallucination"])
 class Hallucination(MultiStepMetric):
     """Fraction of retrieved documents the answer contradicts."""
@@ -135,7 +148,7 @@ class Hallucination(MultiStepMetric):
 
         if not docs:
             # No retrieved context to contradict: nothing to hallucinate.
-            justification = (
+            summary = (
                 "No hay contexto recuperado para verificar; la respuesta no "
                 "presenta alucinación por defecto (tasa 0/0)."
             )
@@ -143,13 +156,16 @@ class Hallucination(MultiStepMetric):
                 metric_name=self.name,
                 raw_score=0.0,
                 normalized_score=self.normalize(0.0),
-                justification=justification,
+                trace=MetricTrace(
+                    steps=[TraceStep(label="Sin contexto recuperado", summary=summary)]
+                ),
                 rubric_version=self.rubric_version,
             )
 
-        trace: list[StepTrace] = []
+        # One NLI classification per document; the label is a typed entry value.
         contradicted = 0
         judge_model = judge.model_for(JudgeStep.EXTRACT)
+        nli_step = TraceStep(label="Clasificación NLI por documento")
         for i, doc in enumerate(docs, start=1):
             judgment = judge.structured(
                 instruction=NLI_PROMPT.format(documento=doc, response=turn.response),
@@ -160,29 +176,28 @@ class Hallucination(MultiStepMetric):
             )
             if judgment.label == NLILabel.CONTRADICTION:
                 contradicted += 1
-            trace.append(
-                StepTrace(
-                    label=f"Documento {i}: {judgment.label.value}",
-                    detail=judgment.justification,
+            nli_step.entries.append(
+                TraceEntry(
+                    label=f"Documento {i}",
+                    value=judgment.label.value,
+                    justification=judgment.justification,
                 )
             )
 
         raw = contradicted / len(docs)
-        trace.append(
-            StepTrace(
-                label="Resultado",
-                detail=(
-                    f"{contradicted} de {len(docs)} documentos contradicen la "
-                    f"respuesta (tasa de alucinación {raw:.2f})."
-                ),
-            )
+        result_step = TraceStep(
+            label="Resultado",
+            summary=(
+                f"{contradicted} de {len(docs)} documentos contradicen la "
+                f"respuesta (tasa de alucinación {raw:.2f})."
+            ),
+            entries=[TraceEntry(label="tasa de alucinación", value=round(raw, 4))],
         )
         return MetricResult(
             metric_name=self.name,
             raw_score=raw,
             normalized_score=self.normalize(raw),
-            justification=self.render_justification(trace),
+            trace=MetricTrace(steps=[nli_step, result_step]),
             judge_model=judge_model,
             rubric_version=self.rubric_version,
-            trace=trace,
         )

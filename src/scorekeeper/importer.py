@@ -15,11 +15,18 @@ Header names are matched case-insensitively against a small alias table so the
 parser tolerates either English or Spanish files (conversation content is in
 Spanish). Callers with an unusual layout can pass an explicit ``columns``
 mapping to override detection.
+
+The tail of that projection — role aliasing and turn numbering — is exposed on its
+own as :func:`normalize_messages`, because the spreadsheet is not the only source
+of a conversation: the browser extension scrapes messages off a chat UI and posts
+them to ``POST /captures``, which normalizes them the same way so both ingestion
+paths produce identical rows.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
 
@@ -103,6 +110,62 @@ def _map_columns(header: list[Any], override: dict[str, str] | None) -> dict[str
     return columns
 
 
+def normalize_messages(
+    rows: Iterable[dict[str, Any]],
+    *,
+    derive_turns: bool | None = None,
+) -> list[dict[str, Any]]:
+    """Normalize raw message dicts into the canonical conversation shape.
+
+    The shared tail of every ingestion path: the ``.xlsx`` parser feeds it one dict
+    per sheet row, and the browser extension's captures (``POST /captures``) feed it
+    one dict per scraped chat bubble, so both reach the database through the same
+    role aliasing and turn numbering.
+
+    Each input row may carry ``turn``, ``role``, ``content``, ``retrieved_context``
+    and ``expected_output``; the optional keys are carried through only when the
+    input actually has them. Rows with neither a role nor content are dropped.
+
+    ``derive_turns`` forces turn numbering: ``True`` always derives (each ``user``
+    message following a non-user message starts a new turn, so a user+model pair
+    shares a number), ``False`` always reads the row's ``turn`` (blank → ``1``), and
+    the default ``None`` derives only when no row carries a turn value at all.
+    """
+    rows = list(rows)
+    if derive_turns is None:
+        derive_turns = not any(str(row.get("turn") or "").strip() for row in rows)
+
+    messages: list[dict[str, Any]] = []
+    derived_turn = 0
+    prev_role: str | None = None
+
+    for row in rows:
+        content = _stringify(row.get("content")).strip()
+        role_raw = _stringify(row.get("role")).strip()
+        if not content and not role_raw:
+            continue  # Fully-empty row.
+
+        role = _ROLE_ALIASES.get(role_raw.lower(), role_raw.lower())
+
+        if derive_turns:
+            if role == "user" and prev_role != "user":
+                derived_turn += 1
+            elif derived_turn == 0:
+                derived_turn = 1
+            turn = derived_turn
+        else:
+            turn = _coerce_turn(_stringify(row.get("turn")))
+
+        message: dict[str, Any] = {"turn": turn, "role": role, "content": content}
+        for key in ("retrieved_context", "expected_output"):
+            if key in row:
+                message[key] = _stringify(row[key]).strip()
+        messages.append(message)
+        prev_role = role
+
+    return messages
+
+
 def parse_conversation(
     path: str | Path,
     *,
@@ -144,44 +207,29 @@ def parse_conversation(
 
         col = _map_columns(header, columns)
         has_turn_col = "turn" in col
-        has_context_col = "retrieved_context" in col
-        has_expected_col = "expected_output" in col
 
-        messages: list[dict[str, Any]] = []
-        derived_turn = 0
-        prev_role: str | None = None
-
+        # Project the sheet onto the raw dicts normalize_messages consumes: only the
+        # columns the sheet actually has, so absent optional columns stay absent.
+        raw_rows: list[dict[str, Any]] = []
         for raw in rows:
             row = list(raw)
-            content = _cell(row, col["content"]).strip()
-            role_raw = _cell(row, col["role"]).strip()
-            if not content and not role_raw:
-                continue  # Fully-empty row.
+            entry = {
+                "role": _cell(row, col["role"]),
+                "content": _cell(row, col["content"]),
+            }
+            for field in ("turn", "retrieved_context", "expected_output"):
+                if field in col:
+                    entry[field] = _cell(row, col[field])
+            raw_rows.append(entry)
 
-            role = _ROLE_ALIASES.get(role_raw.lower(), role_raw.lower())
-
-            if has_turn_col:
-                turn = _coerce_turn(_cell(row, col["turn"]))
-            else:
-                if role == "user" and prev_role != "user":
-                    derived_turn += 1
-                elif derived_turn == 0:
-                    derived_turn = 1
-                turn = derived_turn
-
-            message: dict[str, Any] = {"turn": turn, "role": role, "content": content}
-            if has_context_col:
-                # Store the raw cell verbatim; the retrieval pipeline interprets it later.
-                message["retrieved_context_source"] = _cell(
-                    row, col["retrieved_context"]
-                ).strip()
-            if has_expected_col:
-                message["expected_output"] = _cell(
-                    row, col["expected_output"]
-                ).strip()
-            messages.append(message)
-            prev_role = role
-
+        messages = normalize_messages(raw_rows, derive_turns=not has_turn_col)
+        # The .xlsx path exposes the raw context cell as ``retrieved_context_source``
+        # (the retrieval pipeline interprets it later); ``normalize_messages`` keeps the
+        # generic ``retrieved_context`` key the browser-capture path relies on, so rename
+        # it here to match the DB column.
+        for message in messages:
+            if "retrieved_context" in message:
+                message["retrieved_context_source"] = message.pop("retrieved_context")
         return messages
     finally:
         workbook.close()
@@ -199,6 +247,13 @@ def parse_conversation_json(
     return json.dumps(
         parse_conversation(path, columns=columns), ensure_ascii=False
     )
+
+
+def _stringify(value: Any) -> str:
+    """Return ``value`` as a string; ``None`` becomes ``""``."""
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _cell(row: list[Any], idx: int) -> str:
