@@ -28,6 +28,28 @@ def test_split_context_docs_on_blank_lines() -> None:
     assert split_context_docs("único documento") == ["único documento"]
 
 
+def test_split_context_docs_parses_json_citation_array() -> None:
+    # The browser extension stores its citations as a JSON array of {name, url}.
+    context = (
+        '[{"name": "Política", "url": "https://a/pol"}, '
+        '{"url": "https://b/sin-nombre"}]'
+    )
+    assert split_context_docs(context) == [
+        "Política\nhttps://a/pol",
+        "https://b/sin-nombre",  # no name → just the URL, one document each.
+    ]
+
+
+def test_split_context_docs_json_like_but_invalid_falls_back_to_text() -> None:
+    # A block that starts with '[' but is not valid JSON is treated as free-form text.
+    assert split_context_docs("[nota] documento uno\n\n[nota] documento dos") == [
+        "[nota] documento uno",
+        "[nota] documento dos",
+    ]
+    # A JSON string (not an array) is likewise text, not a structured citation list.
+    assert split_context_docs('"solo texto"') == ['"solo texto"']
+
+
 def test_no_contradictions_is_zero_hallucination(make_judge) -> None:
     judge = make_judge(
         extractions=[

@@ -23,7 +23,6 @@ The NLI judgment is a *classification* step, so it goes through the judge's
 
 from __future__ import annotations
 
-import re
 from enum import StrEnum
 
 from pydantic import BaseModel
@@ -35,6 +34,7 @@ from scorekeeper.metrics.base import (
     TraceEntry,
     TraceStep,
     TurnView,
+    context_documents,
 )
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import Judge, JudgeStep
@@ -122,15 +122,13 @@ HIPÓTESIS (respuesta del asistente):
 
 
 def split_context_docs(context: str) -> list[str]:
-    """Split a free-form ``retrieved_context`` blob into individual documents.
+    """Split a ``retrieved_context`` value into individual retrieved documents.
 
-    The context is stored as an undelimited text blob, so we treat blank-line
-    separated blocks as separate documents (keeping multi-line documents intact)
-    and fall back to the whole trimmed blob as a single document. Empty input
-    yields no documents.
+    Thin alias over :func:`context_documents`, which handles both the extension's
+    JSON citation array and the spreadsheet text blob. Kept as a named export for
+    the metrics (and tests) that document their dependency on document splitting.
     """
-    docs = [block.strip() for block in re.split(r"\n\s*\n", context)]
-    return [doc for doc in docs if doc]
+    return context_documents(context)
 
 
 @register(scenarios=["hallucination"])

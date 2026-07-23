@@ -116,8 +116,11 @@ class ScenarioResult(Base):
     use_case: Mapped[str] = mapped_column(
         String(128), default="default", server_default="default"
     )
-    # Reference into the source file: sheet name, conversation key, or row range.
-    source_ref: Mapped[str | None] = mapped_column(String(256), default=None)
+    # Provenance of the conversation: a sheet name, conversation key or row range
+    # for a file import, or the full chat URL for a live browser capture. Unbounded
+    # because a captured URL (Copilot threads carry request ids and origin params)
+    # runs well past any column width worth guessing at.
+    source_ref: Mapped[str | None] = mapped_column(Text, default=None)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     screenshot_path: Mapped[str | None] = mapped_column(String(512), default=None)
     average_score: Mapped[float | None] = mapped_column(Float, default=None)
