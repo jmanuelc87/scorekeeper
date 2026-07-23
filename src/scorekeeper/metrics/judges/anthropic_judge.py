@@ -18,8 +18,10 @@ from scorekeeper.metrics.judges.base import (
     StepModels,
     _ScoreResponse,
     clamp,
+    judge_call,
     owned_model,
     render_prompt,
+    require_parsed,
     scale_spec,
 )
 
@@ -119,15 +121,21 @@ class AnthropicJudge:
         spec = scale_spec(scale)
         model = self._resolve(step, model)
         content = f"{render_prompt(rubric, turn)}\n\n{spec.instruction_es}"
-        message = self._client.messages.parse(
+        with judge_call(provider=PROVIDER, model=model, action="la puntuación"):
+            message = self._client.messages.parse(
+                model=model,
+                max_tokens=self.max_tokens,
+                **self._thinking_kwargs(model),
+                system=self.system_prompt,
+                messages=[{"role": "user", "content": content}],
+                output_format=_ScoreResponse,
+            )
+        parsed = require_parsed(
+            message.parsed_output,
+            provider=PROVIDER,
             model=model,
-            max_tokens=self.max_tokens,
-            **self._thinking_kwargs(model),
-            system=self.system_prompt,
-            messages=[{"role": "user", "content": content}],
-            output_format=_ScoreResponse,
+            action="la puntuación",
         )
-        parsed: _ScoreResponse = message.parsed_output
         return JudgeVerdict(
             score=clamp(parsed.score, spec),
             justification=parsed.justification,
@@ -144,15 +152,23 @@ class AnthropicJudge:
         model: str | None = None,
     ) -> T:
         model = self._resolve(step, model)
-        message = self._client.messages.parse(
+        with judge_call(provider=PROVIDER, model=model, action="la extracción"):
+            message = self._client.messages.parse(
+                model=model,
+                max_tokens=self.max_tokens,
+                **self._thinking_kwargs(model),
+                system=self.system_prompt,
+                messages=[
+                    {"role": "user", "content": render_prompt(instruction, turn)}
+                ],
+                output_format=schema,
+            )
+        return require_parsed(
+            message.parsed_output,
+            provider=PROVIDER,
             model=model,
-            max_tokens=self.max_tokens,
-            **self._thinking_kwargs(model),
-            system=self.system_prompt,
-            messages=[{"role": "user", "content": render_prompt(instruction, turn)}],
-            output_format=schema,
+            action="la extracción",
         )
-        return message.parsed_output
 
     def embed(self, *, texts: list[str], model: str | None = None) -> list[list[float]]:
         """Embed ``texts`` via the configured embeddings backend.

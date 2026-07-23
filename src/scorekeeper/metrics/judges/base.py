@@ -9,8 +9,9 @@ Anthropic and OpenAI judges stay thin wrappers over their respective clients.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from typing import NamedTuple
+from collections.abc import Callable, Generator, Mapping
+from contextlib import contextmanager
+from typing import NamedTuple, TypeVar
 
 from pydantic import BaseModel
 
@@ -54,6 +55,63 @@ class StepModels:
         if step is None:
             return self.default
         return self._overrides.get(JudgeStep(step), self.default)
+
+
+T = TypeVar("T")
+
+
+class JudgeError(RuntimeError):
+    """A judge's model call failed in a way worth surfacing with full context.
+
+    Carries the provider, model, and the step being run so the message points at
+    the exact failing call instead of a bare SDK ``AttributeError``/transport error.
+    The message is Spanish, like every other user-facing error in the pipeline.
+    """
+
+
+@contextmanager
+def judge_call(*, provider: str, model: str, action: str) -> Generator[None]:
+    """Wrap an SDK call so any failure names the provider, model, and step.
+
+    A raw SDK/transport exception (auth, rate limit, network, 400 for a bad
+    parameter) otherwise propagates with no hint of *which* judge call failed.
+    Re-raises ``JudgeError`` untouched (already descriptive) and wraps everything
+    else, chaining the original via ``from`` so the traceback is preserved.
+    """
+    try:
+        yield
+    except JudgeError:
+        raise
+    except Exception as exc:
+        raise JudgeError(
+            f"Falló la llamada al juez de {provider} (modelo {model!r}) durante "
+            f"{action}: {type(exc).__name__}: {exc}"
+        ) from exc
+
+
+def require_parsed(
+    parsed: T | None,
+    *,
+    provider: str,
+    model: str,
+    action: str,
+    refusal: str | None = None,
+) -> T:
+    """Return ``parsed`` or raise a descriptive ``JudgeError`` when it is ``None``.
+
+    Structured-output calls return ``None`` when the model refuses or emits output
+    that does not satisfy the requested schema; reading ``.score`` off that ``None``
+    would raise an opaque ``AttributeError``. This turns it into an actionable
+    Spanish message that includes the model, the step, and any refusal text.
+    """
+    if parsed is not None:
+        return parsed
+    detail = f" El modelo rechazó la petición: {refusal}." if refusal else ""
+    raise JudgeError(
+        f"El juez de {provider} (modelo {model!r}) no devolvió una respuesta "
+        f"estructurada válida durante {action}. La salida del modelo no cumplió el "
+        f"esquema solicitado o la petición fue rechazada.{detail}"
+    )
 
 
 def owned_model(model: str, *, owns: Callable[[str], bool], provider: str) -> str:

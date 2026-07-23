@@ -17,11 +17,13 @@ from scorekeeper.metrics.judge import JudgeStep, JudgeVerdict
 from scorekeeper.metrics import judges as judges_pkg
 from scorekeeper.metrics.judges import (
     AnthropicJudge,
+    LMStudioJudge,
     OpenAIJudge,
     make_judge,
 )
 from scorekeeper.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
+    JudgeError,
     StepModels,
     _ScoreResponse,
     clamp,
@@ -41,28 +43,32 @@ class Claims(BaseModel):
 
 
 class FakeAnthropicMessages:
-    def __init__(self, parsed: object) -> None:
+    def __init__(self, parsed: object, raises: Exception | None = None) -> None:
         self._parsed = parsed
+        self._raises = raises
         self.calls: list[dict] = []
 
     def parse(self, **kwargs):
         self.calls.append(kwargs)
+        if self._raises is not None:
+            raise self._raises
         return type("Message", (), {"parsed_output": self._parsed})()
 
 
 class FakeAnthropicClient:
-    def __init__(self, parsed: object) -> None:
-        self.messages = FakeAnthropicMessages(parsed)
+    def __init__(self, parsed: object, raises: Exception | None = None) -> None:
+        self.messages = FakeAnthropicMessages(parsed, raises)
 
 
 class FakeCompletions:
-    def __init__(self, parsed: object) -> None:
+    def __init__(self, parsed: object, refusal: str | None = None) -> None:
         self._parsed = parsed
+        self._refusal = refusal
         self.calls: list[dict] = []
 
     def parse(self, **kwargs):
         self.calls.append(kwargs)
-        message = type("Msg", (), {"parsed": self._parsed})()
+        message = type("Msg", (), {"parsed": self._parsed, "refusal": self._refusal})()
         choice = type("Choice", (), {"message": message})()
         return type("Completion", (), {"choices": [choice]})()
 
@@ -78,9 +84,19 @@ class FakeEmbeddings:
         return type("Response", (), {"data": data})()
 
 
+class FakeChat:
+    def __init__(self, completions: FakeCompletions) -> None:
+        self.completions = completions
+
+
 class FakeOpenAIClient:
-    def __init__(self, parsed: object, embeddings: list[list[float]] | None = None) -> None:
-        self.chat = type("Chat", (), {"completions": FakeCompletions(parsed)})()
+    def __init__(
+        self,
+        parsed: object,
+        embeddings: list[list[float]] | None = None,
+        refusal: str | None = None,
+    ) -> None:
+        self.chat = FakeChat(FakeCompletions(parsed, refusal))
         self.embeddings = FakeEmbeddings(embeddings or [])
 
 
@@ -488,6 +504,59 @@ def test_openai_embed_model_override_validates(turn: TurnView) -> None:
     # A chat model is not a valid embedding model → Spanish ValueError.
     with pytest.raises(ValueError, match="no pertenece"):
         judge.embed(texts=["a"], model="gpt-5.6-sol")
+
+
+# --- Descriptive errors -------------------------------------------------------
+
+
+def test_anthropic_score_missing_output_raises_descriptive_error(turn: TurnView) -> None:
+    # The model returned nothing that satisfies the schema (parsed_output is None):
+    # instead of an opaque AttributeError, the judge names the provider, model, and step.
+    client = FakeAnthropicClient(None)
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError) as exc_info:
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+    message = str(exc_info.value)
+    assert "Anthropic" in message
+    assert "claude-opus-4-8" in message
+    assert "puntuación" in message
+
+
+def test_openai_refusal_surfaces_refusal_text(turn: TurnView) -> None:
+    # An OpenAI refusal (parsed is None, refusal set) reaches the caller verbatim.
+    client = FakeOpenAIClient(None, refusal="No puedo ayudar con eso.")
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
+
+    with pytest.raises(JudgeError, match="No puedo ayudar con eso."):
+        judge.score(rubric="verifica", turn=turn, scale=Boolean())
+
+
+def test_lmstudio_errors_name_its_own_provider(turn: TurnView) -> None:
+    # LMStudioJudge inherits OpenAIJudge's call methods; its descriptive errors must
+    # report "LM Studio", not the inherited "OpenAI", so the failing backend is clear.
+    client = FakeOpenAIClient(None)
+    judge = LMStudioJudge(model="local-model", client=client)
+
+    with pytest.raises(JudgeError) as exc_info:
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+    message = str(exc_info.value)
+    assert "LM Studio" in message
+    assert "OpenAI" not in message
+
+
+def test_anthropic_sdk_error_is_wrapped_with_call_context(turn: TurnView) -> None:
+    # A raw SDK/transport error is wrapped so the message names the failing call and
+    # chains the original exception rather than propagating it bare.
+    client = FakeAnthropicClient(None, raises=RuntimeError("429 rate limit"))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError) as exc_info:
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+    message = str(exc_info.value)
+    assert "claude-opus-4-8" in message
+    assert "429 rate limit" in message
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 # --- Factory ------------------------------------------------------------------
