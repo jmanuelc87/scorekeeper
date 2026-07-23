@@ -442,6 +442,36 @@ def retrieve_turn_traces(
             db.close()
 
 
+def retrieve_scenario_turns(
+    scenario_id: str,
+    *,
+    session: Session | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return one scenario's turns in ``turn_number`` order, or ``None`` if unknown.
+
+    ``scenario_id`` is a ``ScenarioResult`` id (its UUID) — the unique handle for one
+    conversation scored under one platform in one run; the human-readable
+    ``ScenarioResult.scenario_id`` label is *not* unique and is not accepted here.
+    Discover the UUID from ``GET /runs`` (each scenario carries its ``id``).
+
+    Each entry carries the turn's content (``prompt``/``response``/``expected_output``/
+    ``retrieved_context_source``), its rolled-up ``turn_score``, and per-metric scores
+    (without the structured ``trace`` — read that via :func:`retrieve_turn_traces`). A
+    malformed or unknown ``scenario_id`` yields ``None`` (the HTTP layer maps that to
+    ``404``); a scenario with no turns yields ``[]``.
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        scenario = _load_scenario(db, scenario_id)
+        if scenario is None:
+            return None
+        return [_serialize_scenario_turn(turn) for turn in scenario.turns]
+    finally:
+        if owns_session:
+            db.close()
+
+
 def retrieve_runs(
     *,
     run_id: str | None = None,
@@ -546,6 +576,25 @@ def _load_turn(db: Session, turn_id: str) -> Turn | None:
     except ValueError:
         return None
     return db.get(Turn, key)
+
+
+def _load_scenario(db: Session, scenario_id: str) -> ScenarioResult | None:
+    """Load a ``ScenarioResult`` by its string id, eager-loading turns + metric scores.
+
+    Returns ``None`` for an unknown/invalid id. Eager-loads the turn tree (turns
+    ordered by ``turn_number``, each with its metric scores) so serialization does
+    not N+1.
+    """
+    try:
+        key = uuid.UUID(scenario_id)
+    except ValueError:
+        return None
+    stmt = (
+        select(ScenarioResult)
+        .where(ScenarioResult.id == key)
+        .options(selectinload(ScenarioResult.turns).selectinload(Turn.metric_scores))
+    )
+    return db.execute(stmt).scalars().one_or_none()
 
 
 def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:
@@ -699,6 +748,9 @@ def _serialize_scenario(
     scenario: ScenarioResult, granularity: str
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
+        # The row's UUID — the handle GET /scenarios/{id}/turns takes (distinct from the
+        # human-readable, non-unique ``scenario_id`` label below).
+        "id": str(scenario.id),
         "scenario_id": scenario.scenario_id,
         "use_case": scenario.use_case,
         "status": scenario.status,
@@ -719,6 +771,36 @@ def _serialize_metric_trace(
         entry["rubric_version"] = score.rubric_version
     entry["trace"] = {"steps": score.trace.steps} if score.trace is not None else None
     return entry
+
+
+def _serialize_scenario_turn(turn: Turn) -> dict[str, Any]:
+    """Full turn view for the per-scenario turns endpoint: content + scores.
+
+    Unlike :func:`_serialize_turn` (the ``/runs`` metric-granularity projection, which
+    carries only ids/scores), this surfaces the conversation content — ``prompt``,
+    ``response``, ``expected_output`` and the raw ``retrieved_context_source`` — so a
+    caller can read the scenario's turns without re-uploading the source. The
+    structured metric ``trace`` is still not surfaced here (read it via
+    ``/turns/{turn_id}/traces``).
+    """
+    return {
+        "turn_id": str(turn.id),
+        "turn_number": turn.turn_number,
+        "prompt": turn.prompt,
+        "response": turn.response,
+        "expected_output": turn.expected_output,
+        "retrieved_context_source": turn.retrieved_context_source,
+        "turn_score": turn.turn_score,
+        "metric_scores": [
+            {
+                "metric_name": score.metric_name,
+                "score": score.score,
+                "judge_model": score.judge_model,
+                "rubric_version": score.rubric_version,
+            }
+            for score in turn.metric_scores
+        ],
+    }
 
 
 def _serialize_turn(turn: Turn) -> dict[str, Any]:

@@ -15,6 +15,7 @@ Model Context Protocol — see [MCP tools](mcp.md).
 | `POST /captures`             | Ingest conversations captured from a chat UI as JSON and **enqueue** them for scoring (the browser extension's entry point). |
 | `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity (HTTP twin of the MCP `retrieve` tool). |
+| `GET /scenarios/{scenario_id}/turns` | Retrieve one scenario's turns — conversation content plus per-metric scores. |
 | `GET /auth-providers`        | List the retrieval credential store's provider rows (optional filters). |
 | `POST /auth-providers`       | Create a credential provider row (write-only `private_key`, stored encrypted). |
 | `GET /auth-providers/{id}`   | Fetch one credential provider by UUID. |
@@ -263,10 +264,15 @@ The date range filters the **scoring window** (`PlatformExecution.started_at` /
 `finished_at`), which is `null` until a worker scores the run — so a bound excludes
 still-queued/in-progress runs. Results are ordered by run creation date. Granularity
 controls depth (each level adds to the one above): `platform_executions` → per-platform
-rollups; `scenario_results` → adds each scenario; `metric_scores` → adds each turn and
-its per-metric scores (`metric_name`, `score`, `judge_model`, `rubric_version`). Each
-score's structured `trace` is persisted on the `metric_traces` table but is not surfaced
-by either read path (this endpoint or the MCP [`retrieve` tool](mcp.md#retrieve)).
+rollups; `scenario_results` → adds each scenario (its `id`, `scenario_id`, `use_case`,
+`status`, `average_score`); `metric_scores` → adds each turn and its per-metric scores
+(`metric_name`, `score`, `judge_model`, `rubric_version`). Each score's structured `trace`
+is persisted on the `metric_traces` table but is not surfaced by either read path (this
+endpoint or the MCP [`retrieve` tool](mcp.md#retrieve)).
+
+Each scenario carries both an `id` (its `ScenarioResult` UUID — the unique handle
+[`GET /scenarios/{scenario_id}/turns`](#get-scenariosscenario_idturns) takes) and the
+human-readable, **non-unique** `scenario_id` label (e.g. the file stem).
 
 ### Response `200`
 
@@ -297,6 +303,49 @@ by either read path (this endpoint or the MCP [`retrieve` tool](mcp.md#retrieve)
 | Status | When |
 |--------|------|
 | `400`  | `granularity` is not one of the three accepted values, or `start_date`/`end_date` is not a valid ISO-8601 date. No-match filters are **not** errors — they return `[]`. |
+
+## `GET /scenarios/{scenario_id}/turns`
+
+Retrieve a single scenario's turns, in `turn_number` order — the conversation
+**content** (`prompt` / `response` / `expected_output` / `retrieved_context_source`)
+alongside each turn's rolled-up `turn_score` and per-metric scores. `GET /runs`
+(even at `metric_scores` granularity) omits the turn content; this endpoint surfaces it,
+so a caller can read what was actually scored without re-uploading the source.
+
+The `{scenario_id}` is a **`ScenarioResult` UUID** — the unique handle for one
+conversation scored under one platform in one run — discoverable as the `id` on each
+scenario in `GET /runs?granularity=scenario_results`. The human-readable, non-unique
+`ScenarioResult.scenario_id` label is **not** accepted here (it can match many
+scenarios). Takes no query parameters.
+
+Returns one entry per turn (a scenario with no turns yields `[]`):
+
+```json
+[
+  {
+    "turn_id": "7c9e…",
+    "turn_number": 1,
+    "prompt": "¿Cuántos habitantes tiene Madrid?",
+    "response": "Madrid tiene unos 3,3 millones de habitantes.",
+    "expected_output": null,
+    "retrieved_context_source": null,
+    "turn_score": 0.8,
+    "metric_scores": [
+      {"metric_name": "utilidad", "score": 0.8, "judge_model": "claude-opus-4-8", "rubric_version": "v1"}
+    ]
+  }
+]
+```
+
+Like the other read paths, the per-metric structured `trace` is not surfaced here —
+read it via [`GET /turns/{turn_id}/traces`](#get-turnsturn_idtraces) using each entry's
+`turn_id`.
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | The `scenario_id` is unknown or not a valid UUID. |
 
 ## Auth providers CRUD
 
@@ -418,6 +467,12 @@ Retrieve full details for all `claude` runs scored in July, down to metric score
 curl 'http://localhost:8001/runs?platform=claude&start_date=2026-07-01&end_date=2026-07-31&granularity=metric_scores'
 ```
 
+Read a scenario's turns (its `id` comes from `/runs?granularity=scenario_results`):
+
+```bash
+curl 'http://localhost:8001/scenarios/3f0a…/turns'
+```
+
 Retrieve one turn's metric traces (full, then minimal):
 
 ```bash
@@ -476,6 +531,8 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Endpoint & request/response models — `src/scorekeeper/api.py`
 - Ingest / retrieve / score split + polling — `src/scorekeeper/evaluation.py`
   (`ingest_evaluation`, `retrieve_run`, `score_run`, `get_run_summary`, `run_evaluation`)
+- Read paths — `src/scorekeeper/evaluation.py` (`retrieve_runs`, `retrieve_scenario_turns`,
+  `retrieve_turn_traces`)
 - Retrieval orchestrator — `src/scorekeeper/retrieval/pipeline.py` (`RetrievalOrchestrator`)
 - Auth-provider CRUD service — `src/scorekeeper/retrieval/credentials/service.py`
 - Celery app & tasks — `src/scorekeeper/celery_app.py`, `src/scorekeeper/tasks.py`

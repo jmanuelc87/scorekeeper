@@ -261,6 +261,49 @@ def get_evaluation(run_id: str) -> EvaluationResponse:
     return EvaluationResponse.model_validate(summary)
 
 
+class ScenarioTurnMetric(BaseModel):
+    """One metric's score on a turn (without its structured trace)."""
+
+    metric_name: str
+    score: float
+    judge_model: str | None = None
+    rubric_version: str | None = None
+
+
+class ScenarioTurn(BaseModel):
+    """One turn of a scenario: its conversation content plus per-metric scores."""
+
+    turn_id: str
+    turn_number: int
+    prompt: str
+    response: str
+    expected_output: str | None = None
+    retrieved_context_source: str | None = None
+    turn_score: float | None = None
+    metric_scores: list[ScenarioTurnMetric]
+
+
+@app.get("/scenarios/{scenario_id}/turns", response_model=list[ScenarioTurn])
+def get_scenario_turns(scenario_id: str) -> list[dict]:
+    """Return a scenario's turns, in ``turn_number`` order.
+
+    ``scenario_id`` is a ``ScenarioResult`` id (its UUID) — the unique handle for one
+    conversation scored under one platform in one run; it is surfaced as ``id`` on each
+    scenario in ``GET /runs``. The non-unique human-readable ``scenario_id`` label is
+    not accepted here.
+
+    Each turn carries its content (``prompt``/``response``/``expected_output``/
+    ``retrieved_context_source``), rolled-up ``turn_score`` and per-metric scores.
+    ``404`` when the ``scenario_id`` is unknown or malformed.
+    """
+    turns = evaluation.retrieve_scenario_turns(scenario_id)
+    if turns is None:
+        raise HTTPException(
+            status_code=404, detail=f"El escenario {scenario_id!r} no existe."
+        )
+    return turns
+
+
 @app.get("/turns/{turn_id}/traces")
 def get_turn_traces(
     turn_id: str,
