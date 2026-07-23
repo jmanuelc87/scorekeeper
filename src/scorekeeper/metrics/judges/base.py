@@ -14,7 +14,7 @@ from typing import NamedTuple
 
 from pydantic import BaseModel
 
-from scorekeeper.metrics.base import TurnView
+from scorekeeper.metrics.base import TurnView, context_blob
 from scorekeeper.metrics.judge import JudgeStep
 from scorekeeper.metrics.scale import Boolean, Likert, Scale, Unit
 
@@ -126,7 +126,7 @@ def _fill_placeholders(template: str, turn: TurnView) -> str:
             _SafeDict(
                 prompt=turn.prompt,
                 response=turn.response,
-                context=turn.retrieved_context,
+                context=context_blob(turn.retrieved_context),
             )
         )
     except (ValueError, IndexError, KeyError):
@@ -150,7 +150,7 @@ def render_prompt(instructions: str, turn: TurnView) -> str:
             parts.append(f"      Asistente: {response}")
     if turn.retrieved_context:
         parts.append("--- Contexto recuperado ---")
-        parts.append(turn.retrieved_context)
+        parts.append(context_blob(turn.retrieved_context))
     parts.append(f"Usuario: {turn.prompt}")
     parts.append(f"Asistente: {turn.response}")
     return "\n".join(parts)

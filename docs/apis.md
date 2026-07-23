@@ -11,6 +11,7 @@ over the Model Context Protocol — see [MCP tools](mcp.md).
 |------------------------------|---------|
 | `GET /health`                | Liveness probe. |
 | `POST /evaluations`          | Ingest conversation `.xlsx` files and **enqueue** them for scoring (per-file platform, defaulting to the payload platform). |
+| `POST /captures`             | Ingest conversations captured from a chat UI as JSON and **enqueue** them for scoring (the browser extension's entry point). |
 | `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity (HTTP twin of the MCP `retrieve` tool). |
 | `GET /turns/{turn_id}/traces` | Retrieve the structured metric traces for a single turn. |
@@ -130,6 +131,64 @@ Poll `GET /evaluations/{run_id}` for progress and results (below).
 |--------|------|
 | `422`  | `payload` is not valid JSON or fails schema validation (e.g. empty `platform`). |
 | `400`  | An uploaded file is not `.xlsx`, is empty, has no `role`/`content` columns, or no file/platform was provided. Ingest rolls back — nothing is persisted and no job is enqueued. |
+
+## `POST /captures`
+
+Ingest conversations **captured from a chat UI** and enqueue them for scoring. The
+JSON twin of `POST /evaluations` for clients that already hold the turns and have no
+spreadsheet to upload — the [browser extension](../extension/README.md) scrapes them
+straight off Copilot, Gemini and Claude.
+
+Both endpoints converge immediately: the messages are normalized by
+`scorekeeper.importer.normalize_messages` (the same role aliasing and turn numbering
+the `.xlsx` parser uses) and persisted by the same `ingest_evaluation`, so a captured
+conversation is indistinguishable downstream from an uploaded one.
+
+- **Content type:** `application/json`
+
+| Field           | Type       | Required | Default     | Description |
+|-----------------|------------|----------|-------------|-------------|
+| `platform`      | `string`   | yes      | —           | The **default** platform for the request. Applies to every conversation that does not override it. |
+| `use_case`      | `string`   | no       | `"default"` | Default metric-selection use case. Comma-separated tokens are unioned. |
+| `conversations` | `array`    | yes      | —           | One or more captured conversations; **each is one scenario**. Must be non-empty. |
+
+Conversation object:
+
+| Field         | Type              | Required | Default            | Description |
+|---------------|-------------------|----------|--------------------|-------------|
+| `scenario_id` | `string`          | yes      | —                  | Identifier stored on the `ScenarioResult`. |
+| `messages`    | `array`           | yes      | —                  | The conversation, in order. Must be non-empty and at least one message must have content. |
+| `use_case`    | `string`          | no       | the payload `use_case` | Metric-selection use case for this conversation. |
+| `platform`    | `string`          | no       | the payload `platform` | Platform to score this conversation under. |
+| `source_ref`  | `string`          | no       | the `scenario_id`  | Where the capture came from (the chat URL); stored as the scenario's `source_ref`. |
+
+Message object:
+
+| Field                | Type     | Required | Description |
+|----------------------|----------|----------|-------------|
+| `role`               | `string` | yes      | `user` or `model`; the importer's aliases (`usuario`, `assistant`, `modelo`, …) are accepted. |
+| `content`            | `string` | no       | The message text. |
+| `turn`               | `int`    | no       | Explicit turn number. Omit it on **every** message to have turns derived — each `user` message following a non-user message opens a new turn, so a user+model pair shares one number. |
+| `retrieved_context`  | `string` | no       | Context the platform retrieved, when the client knows it. Free-form text, or a JSON array of `{name, url}` source records (what the browser extension sends) — each array element counts as one retrieved document. |
+| `expected_output`    | `string` | no       | Reference answer, when the client knows it. |
+
+Since there is no file to hash, the `SourceFile` provenance hash covers the
+serialized capture itself.
+
+### Response `202`
+
+Identical to `POST /evaluations` — poll `GET /evaluations/{run_id}` from here.
+
+```json
+{"run_id": "b1f2…", "status": "en_cola"}
+```
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `422`  | The body fails schema validation (empty `platform`, empty `conversations`, a conversation with no `messages`). |
+| `400`  | A conversation's messages are all blank, or ingest rejected the run. Nothing is persisted and no job is enqueued. |
 
 ## `GET /evaluations/{run_id}`
 
@@ -284,6 +343,26 @@ Poll until terminal:
 curl http://localhost:8001/evaluations/b1f2…
 ```
 
+Enqueue a conversation captured from a chat UI (what the browser extension sends):
+
+```bash
+curl -X POST http://localhost:8001/captures \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "platform": "claude",
+        "use_case": "default",
+        "conversations": [{
+          "scenario_id": "reseña-hotel-2026-07-22-11-30",
+          "source_ref": "https://claude.ai/chat/abc123",
+          "messages": [
+            {"role": "user",  "content": "¿Cuántos habitantes tiene Madrid?"},
+            {"role": "model", "content": "Madrid tiene unos 3,3 millones de habitantes."}
+          ]
+        }]
+      }'
+# {"run_id":"b1f2…","status":"en_cola"}
+```
+
 Retrieve full details for all `claude` runs scored in July, down to metric scores:
 
 ```bash
@@ -330,6 +409,8 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Ingest / score split + polling — `src/scorekeeper/evaluation.py`
   (`ingest_evaluation`, `score_run`, `get_run_summary`, `run_evaluation`)
 - Celery app & task — `src/scorekeeper/celery_app.py`, `src/scorekeeper/tasks.py`
-- Parsing — `src/scorekeeper/importer.py`
+- Parsing & message normalization — `src/scorekeeper/importer.py`
+  (`parse_conversation`, `normalize_messages`)
+- Browser capture client — `extension/` (see its [README](../extension/README.md))
 - Scoring — `src/scorekeeper/runner.py`
 - Metric selection — `src/scorekeeper/metrics/selection.py`

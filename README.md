@@ -93,6 +93,15 @@ npm run dev
 
 Vite runs at `http://localhost:5173` and reads `VITE_API_URL` when provided.
 
+## Browser extension
+
+`extension/` is a Manifest V3 Chrome extension that captures the conversation open
+in Copilot, Gemini or Claude and posts it to `POST /captures` — the live-session
+alternative to uploading a conversation `.xlsx`. No build step: load the folder
+unpacked from `chrome://extensions` with **Developer mode** on. See
+[extension/README.md](extension/README.md) for the adapters it supports and how to
+update their selectors when a vendor reskins its chat.
+
 ## Checks
 
 ```bash

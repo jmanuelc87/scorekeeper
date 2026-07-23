@@ -17,6 +17,8 @@ Two shapes cover the space:
 
 from __future__ import annotations
 
+import json
+import re
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
@@ -25,6 +27,65 @@ from pydantic import BaseModel
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import Judge, JudgeStep
 from scorekeeper.metrics.scale import Scale
+
+
+def context_documents(raw: str) -> list[str]:
+    """Split a ``retrieved_context`` value into individual retrieved documents.
+
+    Two storage shapes are supported so metrics behave the same whichever ingest
+    path produced the turn:
+
+    * The browser extension stores a JSON array of ``{"name", "url"}`` records —
+      one array element per retrieved source. Each is rendered as a ``name\\nurl``
+      document (just the URL when unnamed).
+    * Spreadsheet imports store a free-form text blob, so blank-line separated
+      blocks are treated as separate documents (multi-line documents stay intact).
+
+    Empty input yields no documents.
+    """
+    docs = _documents_from_json(raw)
+    if docs is not None:
+        return docs
+    return [block.strip() for block in re.split(r"\n\s*\n", raw) if block.strip()]
+
+
+def _documents_from_json(raw: str) -> list[str] | None:
+    """Render a JSON citation array into documents, or ``None`` if not that shape.
+
+    Only a JSON *array* counts as the structured shape; anything else (a bare
+    string that happens to parse, a spreadsheet blob) falls back to text splitting.
+    """
+    text = raw.strip()
+    if not text.startswith("["):
+        return None
+    try:
+        parsed = json.loads(text)
+    except ValueError:
+        return None  # A ``[`` that isn't valid JSON — treat as free-form text.
+    if not isinstance(parsed, list):
+        return None
+
+    docs: list[str] = []
+    for item in parsed:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+            url = str(item.get("url") or "").strip()
+            doc = f"{name}\n{url}" if name and url else name or url
+        else:
+            doc = str(item).strip()
+        if doc:
+            docs.append(doc)
+    return docs
+
+
+def context_blob(raw: str) -> str:
+    """Render ``retrieved_context`` as the blank-line separated text a judge reads.
+
+    Round-trips a free-form text blob unchanged while turning the extension's JSON
+    citation array into the same readable ``name/url`` blocks, so rubrics see one
+    consistent shape regardless of how the turn was ingested.
+    """
+    return "\n\n".join(context_documents(raw))
 
 
 class TurnView(BaseModel):

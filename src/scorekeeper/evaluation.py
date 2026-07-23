@@ -47,7 +47,7 @@ from scorekeeper.database import (
     SourceFile,
     Turn,
 )
-from scorekeeper.importer import parse_conversation
+from scorekeeper.importer import normalize_messages, parse_conversation
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.selection import sync_selection
 from scorekeeper.runner import (
@@ -81,6 +81,11 @@ class UploadedFile:
     endpoint applies per-file overrides and defaults) before reaching the
     orchestrator. ``platform`` is an optional per-file override; when ``None`` the
     file falls back to the run-level platform passed to :func:`ingest_evaluation`.
+
+    ``messages`` carries an already-extracted conversation (the browser extension
+    scrapes turns straight off a chat UI, so there is no spreadsheet to parse). When
+    set, ``content`` is not parsed and only feeds the ``SourceFile`` hash — pass the
+    serialized capture so the provenance hash still identifies the input.
     """
 
     filename: str
@@ -88,6 +93,7 @@ class UploadedFile:
     scenario_id: str
     use_case: str = DEFAULT_USE_CASE
     platform: str | None = None
+    messages: list[dict[str, Any]] | None = None
 
 
 def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -464,7 +470,12 @@ def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:
 
     ``parse_conversation`` needs a filesystem path (openpyxl opens by path), so the
     in-memory upload is spilled to a short-lived temp file that is always removed.
+    An upload that already carries ``messages`` (a browser capture) skips the
+    spreadsheet entirely and is only normalized.
     """
+    if upload.messages is not None:
+        return normalize_messages(upload.messages)
+
     fd, path = tempfile.mkstemp(suffix=".xlsx")
     try:
         with os.fdopen(fd, "wb") as tmp:
