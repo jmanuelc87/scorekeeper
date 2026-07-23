@@ -22,6 +22,10 @@ class Settings(BaseSettings):
     judge_provider: str = "anthropic"  # "anthropic" | "openai" | "lmstudio"
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
+    # Override the OpenAI API base URL (e.g. an OpenAI-compatible gateway or a local
+    # proxy). None uses the SDK default (https://api.openai.com/v1). Consumed by the
+    # retrieval parser's direct OpenAI client (see scorekeeper.retrieval.parser).
+    openai_base_url: str | None = None
     anthropic_judge_model: str = "claude-opus-4-8"
     openai_judge_model: str = "gpt-5.6-sol"
     judge_max_tokens: int = 16384
@@ -50,6 +54,18 @@ class Settings(BaseSettings):
     openai_embedding_model: str = "text-embedding-3-small"
     # Override the judge system prompt at runtime; None uses the built-in default.
     judge_system_prompt: str | None = None
+
+    # Local filesystem directory for the retrieval pipeline's fetch cache. Fetched document
+    # bytes are stored here (indexed by the ``document_cache`` table) so a document is
+    # downloaded at most once across turns/runs (see scorekeeper.retrieval.fetch).
+    retrieval_cache_dir: str = "./retrieval-cache"
+
+    # Master secret for the retrieval pipeline's credential store. Certificate private
+    # keys configured per provider (the ``auth_providers`` table) are stored encrypted:
+    # a per-row salt derives a key from this secret (PBKDF2) to encrypt/decrypt the PEM
+    # (see scorekeeper.retrieval.credentials.secrets). Unset (None) → SharePoint providers
+    # cannot build a client and gated documents resolve to MISSING_CREDENTIALS.
+    auth_encryption_key: str | None = None
 
     # Pace scoring by pausing a random interval (seconds) between consecutive turns
     # of a scenario, to spread judge calls out over time. The pause is drawn

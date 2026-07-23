@@ -22,11 +22,12 @@ import re
 from abc import ABC, abstractmethod
 from typing import Any, ClassVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import Judge, JudgeStep
 from scorekeeper.metrics.scale import Scale
+from scorekeeper.retrieved_context import RetrievedContext
 
 
 def context_documents(raw: str) -> list[str]:
@@ -97,7 +98,7 @@ class TurnView(BaseModel):
     # Prior (prompt, response) exchanges, for metrics that need conversation context.
     history: list[tuple[str, str]] = []
     # Retrieved context a RAG answer was grounded on, for groundedness-style metrics.
-    retrieved_context: str = ""
+    retrieved_context: RetrievedContext = Field(default_factory=RetrievedContext)
     # Ground-truth answer for the turn, for reference-based metrics (e.g. contextual
     # precision judges retrieved nodes against this, not the generator's response).
     expected_output: str = ""

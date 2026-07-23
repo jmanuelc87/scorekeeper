@@ -4,11 +4,12 @@ The source spreadsheet stores a conversation as **one message per row** (a user
 or model message with, optionally, a turn number). This module reads such a
 file with ``openpyxl`` and projects it into a JSON-serializable list of message
 dicts with the keys ``turn``, ``role`` and ``content`` (plus an optional
-``retrieved_context`` and/or ``expected_output`` when the sheet carries those
-columns) — the raw conversation shape that ``ScenarioResult.raw_conversation``
-is documented to hold. Turn rows
+``retrieved_context_source`` — the **raw** ``retrieved_context`` cell, a ranked list
+of source references the retrieval pipeline later fetches/extracts — and/or
+``expected_output`` when the sheet carries those columns) — the raw conversation
+shape that ``ScenarioResult.raw_conversation`` is documented to hold. Turn rows
 for evaluation are derived from this projection in a later step; this module
-only parses.
+only parses, and does **not** interpret the ``retrieved_context`` cell.
 
 Header names are matched case-insensitively against a small alias table so the
 parser tolerates either English or Spanish files (conversation content is in
@@ -173,9 +174,10 @@ def parse_conversation(
     """Parse an ``.xlsx`` conversation file into raw message dicts.
 
     Returns a list of ``{"turn": int, "role": str, "content": str}`` in sheet
-    order; each dict also carries ``retrieved_context`` and/or ``expected_output``
-    (strings) when the sheet has those columns. Roles are normalized to canonical
-    values
+    order; each dict also carries ``retrieved_context_source`` (the raw context
+    cell string, interpreted later by the retrieval pipeline) and/or
+    ``expected_output`` (a string) when the sheet has those columns. Roles are
+    normalized to canonical values
     (``user``/``model``) when recognized, otherwise passed through normalized.
     When the sheet has no turn column, turn numbers are derived: each ``user``
     message that follows a non-user message starts a new turn, so a user+model
@@ -220,7 +222,15 @@ def parse_conversation(
                     entry[field] = _cell(row, col[field])
             raw_rows.append(entry)
 
-        return normalize_messages(raw_rows, derive_turns=not has_turn_col)
+        messages = normalize_messages(raw_rows, derive_turns=not has_turn_col)
+        # The .xlsx path exposes the raw context cell as ``retrieved_context_source``
+        # (the retrieval pipeline interprets it later); ``normalize_messages`` keeps the
+        # generic ``retrieved_context`` key the browser-capture path relies on, so rename
+        # it here to match the DB column.
+        for message in messages:
+            if "retrieved_context" in message:
+                message["retrieved_context_source"] = message.pop("retrieved_context")
+        return messages
     finally:
         workbook.close()
 

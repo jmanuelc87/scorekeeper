@@ -7,7 +7,7 @@ COPY pyproject.toml README.md ./
 COPY src ./src
 # Include the `judges` extra so the LLM-as-a-judge SDKs (anthropic/openai) are
 # available at runtime — the scoring runner imports them to build a judge.
-RUN pip install --no-cache-dir ".[judges]"
+RUN pip install --no-cache-dir ".[judges,retrieval]"
 
 # Alembic config + migration scripts for `alembic upgrade head` at deploy time.
 COPY alembic.ini ./

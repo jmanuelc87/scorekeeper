@@ -140,7 +140,8 @@ def test_columns_override(tmp_path: Path) -> None:
     assert [m["content"] for m in result] == ["Hola", "Adiós"]
 
 
-def test_retrieved_context_column_is_parsed(tmp_path: Path) -> None:
+def test_retrieved_context_cell_is_stored_raw(tmp_path: Path) -> None:
+    # The importer stores the raw cell verbatim; the retrieval pipeline interprets it later.
     path = _write_xlsx(
         tmp_path / "with_context.xlsx",
         ["turn", "role", "content", "contexto recuperado"],
@@ -153,14 +154,36 @@ def test_retrieved_context_column_is_parsed(tmp_path: Path) -> None:
     result = parse_conversation(path)
 
     assert result == [
-        {"turn": 1, "role": "user", "content": "¿Política de devoluciones?", "retrieved_context": ""},
+        {
+            "turn": 1,
+            "role": "user",
+            "content": "¿Política de devoluciones?",
+            "retrieved_context_source": "",
+        },
         {
             "turn": 1,
             "role": "model",
             "content": "30 días con recibo.",
-            "retrieved_context": "Devoluciones en 30 días. Requiere recibo.",
+            "retrieved_context_source": "Devoluciones en 30 días. Requiere recibo.",
         },
     ]
+
+
+def test_retrieved_context_json_cell_stored_verbatim(tmp_path: Path) -> None:
+    # A JSON source-reference cell is stored verbatim — parsing/fetching is the pipeline's job.
+    cell = json.dumps(
+        [{"index": "1", "url": "https://ejemplo.com/manual.pdf#page=3", "name": "manual"}],
+        ensure_ascii=False,
+    )
+    path = _write_xlsx(
+        tmp_path / "json_context.xlsx",
+        ["role", "content", "contexto recuperado"],
+        [["model", "R", cell]],
+    )
+
+    result = parse_conversation(path)
+
+    assert result[0]["retrieved_context_source"] == cell
 
 
 def test_retrieved_context_absent_omits_key(tmp_path: Path) -> None:
@@ -207,7 +230,7 @@ def test_retrieved_context_and_expected_output_together(tmp_path: Path) -> None:
 
     result = parse_conversation(path)
 
-    assert result[0]["retrieved_context"] == "ctx"
+    assert result[0]["retrieved_context_source"] == "ctx"
     assert result[0]["expected_output"] == "ref"
 
 

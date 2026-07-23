@@ -13,7 +13,7 @@ from typing import TYPE_CHECKING
 from scorekeeper.config import get_settings
 from scorekeeper.metrics.judge import JudgeStep
 from scorekeeper.metrics.judges.anthropic_judge import AnthropicJudge
-from scorekeeper.metrics.judges.base import StepModels
+from scorekeeper.metrics.judges.base import JudgeError, StepModels
 from scorekeeper.metrics.judges.lmstudio_judge import LMStudioJudge
 from scorekeeper.metrics.judges.openai_judge import OpenAIJudge
 
@@ -21,7 +21,13 @@ if TYPE_CHECKING:
     from scorekeeper.config import Settings
     from scorekeeper.metrics.judge import Judge
 
-__all__ = ["AnthropicJudge", "LMStudioJudge", "OpenAIJudge", "make_judge"]
+__all__ = [
+    "AnthropicJudge",
+    "JudgeError",
+    "LMStudioJudge",
+    "OpenAIJudge",
+    "make_judge",
+]
 
 
 def _step_models(settings: Settings, default_model: str) -> StepModels:

@@ -17,11 +17,13 @@ from scorekeeper.metrics.judge import JudgeStep, JudgeVerdict
 from scorekeeper.metrics import judges as judges_pkg
 from scorekeeper.metrics.judges import (
     AnthropicJudge,
+    LMStudioJudge,
     OpenAIJudge,
     make_judge,
 )
 from scorekeeper.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
+    JudgeError,
     StepModels,
     _ScoreResponse,
     clamp,
@@ -29,6 +31,7 @@ from scorekeeper.metrics.judges.base import (
     scale_spec,
 )
 from scorekeeper.metrics.scale import Boolean, Likert, Unit
+from scorekeeper.retrieved_context import RetrievedContext, RetrievedDocument
 
 
 class Claims(BaseModel):
@@ -40,28 +43,32 @@ class Claims(BaseModel):
 
 
 class FakeAnthropicMessages:
-    def __init__(self, parsed: object) -> None:
+    def __init__(self, parsed: object, raises: Exception | None = None) -> None:
         self._parsed = parsed
+        self._raises = raises
         self.calls: list[dict] = []
 
     def parse(self, **kwargs):
         self.calls.append(kwargs)
+        if self._raises is not None:
+            raise self._raises
         return type("Message", (), {"parsed_output": self._parsed})()
 
 
 class FakeAnthropicClient:
-    def __init__(self, parsed: object) -> None:
-        self.messages = FakeAnthropicMessages(parsed)
+    def __init__(self, parsed: object, raises: Exception | None = None) -> None:
+        self.messages = FakeAnthropicMessages(parsed, raises)
 
 
 class FakeCompletions:
-    def __init__(self, parsed: object) -> None:
+    def __init__(self, parsed: object, refusal: str | None = None) -> None:
         self._parsed = parsed
+        self._refusal = refusal
         self.calls: list[dict] = []
 
     def parse(self, **kwargs):
         self.calls.append(kwargs)
-        message = type("Msg", (), {"parsed": self._parsed})()
+        message = type("Msg", (), {"parsed": self._parsed, "refusal": self._refusal})()
         choice = type("Choice", (), {"message": message})()
         return type("Completion", (), {"choices": [choice]})()
 
@@ -77,9 +84,19 @@ class FakeEmbeddings:
         return type("Response", (), {"data": data})()
 
 
+class FakeChat:
+    def __init__(self, completions: FakeCompletions) -> None:
+        self.completions = completions
+
+
 class FakeOpenAIClient:
-    def __init__(self, parsed: object, embeddings: list[list[float]] | None = None) -> None:
-        self.chat = type("Chat", (), {"completions": FakeCompletions(parsed)})()
+    def __init__(
+        self,
+        parsed: object,
+        embeddings: list[list[float]] | None = None,
+        refusal: str | None = None,
+    ) -> None:
+        self.chat = FakeChat(FakeCompletions(parsed, refusal))
         self.embeddings = FakeEmbeddings(embeddings or [])
 
 
@@ -106,41 +123,62 @@ def test_render_prompt_includes_retrieved_context() -> None:
     turn = TurnView(
         prompt="¿Cuál es la política de devoluciones?",
         response="30 días.",
-        retrieved_context="Devoluciones en 30 días. Requiere recibo.",
+        retrieved_context=RetrievedContext(
+            documents=[
+                RetrievedDocument(
+                    name="Política de devoluciones",
+                    document="manual.pdf",
+                    content="Devoluciones en 30 días. Requiere recibo.",
+                    url="https://ejemplo.com/manual",
+                )
+            ]
+        ),
     )
     rendered = render_prompt("Evalúa la fidelidad.", turn)
 
     assert "--- Contexto recuperado ---" in rendered
+    # The rendered context surfaces the content plus its label and source metadata.
     assert "Devoluciones en 30 días. Requiere recibo." in rendered
+    assert "Política de devoluciones" in rendered
+    assert "manual.pdf" in rendered
+    assert "https://ejemplo.com/manual" in rendered
 
 
 def test_render_prompt_substitutes_context_placeholder() -> None:
     turn = TurnView(
         prompt="p",
         response="r",
-        retrieved_context="pasaje A\npasaje B",
+        retrieved_context=RetrievedContext.from_blob("pasaje A\npasaje B"),
     )
     rendered = render_prompt("Contexto: {context}", turn)
 
-    # The {context} placeholder expands to the retrieved-context blob.
+    # The {context} placeholder expands to the rendered retrieved context.
     assert "Contexto: pasaje A\npasaje B" in rendered
 
 
-def test_render_prompt_renders_json_context_as_readable_docs() -> None:
-    # Extension captures store retrieved_context as a JSON citation array; the judge
-    # must see readable name/url blocks, never the raw JSON string.
+def test_render_prompt_renders_web_citations_as_readable_docs() -> None:
+    # Web citations captured from a chat UI (a name and a url, no fetched content) reach
+    # the judge as readable label/url blocks — the retrieval pipeline has already parsed
+    # them out of any raw JSON, so the judge never sees the JSON itself.
     turn = TurnView(
         prompt="¿Cuál es la política de devoluciones?",
         response="30 días.",
-        retrieved_context=(
-            '[{"name": "Política", "url": "https://a/pol"}, '
-            '{"url": "https://b/x"}]'
+        retrieved_context=RetrievedContext(
+            documents=[
+                RetrievedDocument(
+                    name="Política", document="", content="", url="https://a/pol"
+                ),
+                RetrievedDocument(
+                    name="", document="", content="", url="https://b/x"
+                ),
+            ]
         ),
     )
     rendered = render_prompt("Contexto: {context}", turn)
 
     assert "--- Contexto recuperado ---" in rendered
-    assert "Política\nhttps://a/pol" in rendered
+    assert "Política" in rendered
+    assert "https://a/pol" in rendered
     assert "https://b/x" in rendered
     assert '{"name"' not in rendered  # raw JSON never reaches the judge.
 
@@ -466,6 +504,59 @@ def test_openai_embed_model_override_validates(turn: TurnView) -> None:
     # A chat model is not a valid embedding model → Spanish ValueError.
     with pytest.raises(ValueError, match="no pertenece"):
         judge.embed(texts=["a"], model="gpt-5.6-sol")
+
+
+# --- Descriptive errors -------------------------------------------------------
+
+
+def test_anthropic_score_missing_output_raises_descriptive_error(turn: TurnView) -> None:
+    # The model returned nothing that satisfies the schema (parsed_output is None):
+    # instead of an opaque AttributeError, the judge names the provider, model, and step.
+    client = FakeAnthropicClient(None)
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError) as exc_info:
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+    message = str(exc_info.value)
+    assert "Anthropic" in message
+    assert "claude-opus-4-8" in message
+    assert "puntuación" in message
+
+
+def test_openai_refusal_surfaces_refusal_text(turn: TurnView) -> None:
+    # An OpenAI refusal (parsed is None, refusal set) reaches the caller verbatim.
+    client = FakeOpenAIClient(None, refusal="No puedo ayudar con eso.")
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
+
+    with pytest.raises(JudgeError, match="No puedo ayudar con eso."):
+        judge.score(rubric="verifica", turn=turn, scale=Boolean())
+
+
+def test_lmstudio_errors_name_its_own_provider(turn: TurnView) -> None:
+    # LMStudioJudge inherits OpenAIJudge's call methods; its descriptive errors must
+    # report "LM Studio", not the inherited "OpenAI", so the failing backend is clear.
+    client = FakeOpenAIClient(None)
+    judge = LMStudioJudge(model="local-model", client=client)
+
+    with pytest.raises(JudgeError) as exc_info:
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+    message = str(exc_info.value)
+    assert "LM Studio" in message
+    assert "OpenAI" not in message
+
+
+def test_anthropic_sdk_error_is_wrapped_with_call_context(turn: TurnView) -> None:
+    # A raw SDK/transport error is wrapped so the message names the failing call and
+    # chains the original exception rather than propagating it bare.
+    client = FakeAnthropicClient(None, raises=RuntimeError("429 rate limit"))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError) as exc_info:
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+    message = str(exc_info.value)
+    assert "claude-opus-4-8" in message
+    assert "429 rate limit" in message
+    assert isinstance(exc_info.value.__cause__, RuntimeError)
 
 
 # --- Factory ------------------------------------------------------------------

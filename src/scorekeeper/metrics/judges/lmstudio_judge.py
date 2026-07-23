@@ -45,6 +45,10 @@ class LMStudioJudge(OpenAIJudge):
     call hits the single configured local model regardless of the requested id.
     """
 
+    # Report "LM Studio" (not the inherited "OpenAI") in the descriptive errors the
+    # inherited call methods raise, so a local-server failure names the right backend.
+    provider = PROVIDER
+
     def __init__(
         self,
         *,

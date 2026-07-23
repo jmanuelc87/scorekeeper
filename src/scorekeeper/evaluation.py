@@ -42,14 +42,19 @@ from scorekeeper.database import (
     BenchmarkRun,
     MetricScore,
     PlatformExecution,
+    RetrievedContextDocument,
     ScenarioResult,
     SessionLocal,
     SourceFile,
     Turn,
 )
+from scorekeeper.config import get_settings
 from scorekeeper.importer import normalize_messages, parse_conversation
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.selection import sync_selection
+from scorekeeper.retrieval.pipeline import RetrievalOrchestrator
+from scorekeeper.retrieval.protocols import RetrievalPipeline
+from scorekeeper.retrieval.types import STATUS_EN_RECUPERACION, RetrievalSummary
 from scorekeeper.runner import (
     STATUS_COMPLETADO,
     STATUS_FALLIDO,
@@ -103,15 +108,15 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     number (a user+model pair shares a number). This groups by that number and,
     per turn, joins the ``user`` messages into ``prompt`` and the ``model``
     messages into ``response`` (a missing side becomes ``""``), carrying through
-    ``retrieved_context`` / ``expected_output`` when the sheet provided them.
-    Turns are returned in ascending ``turn_number`` order.
+    the raw ``retrieved_context_source`` cell / ``expected_output`` when the sheet
+    provided them. Turns are returned in ascending ``turn_number`` order.
     """
     grouped: OrderedDict[int, dict[str, Any]] = OrderedDict()
     for message in messages:
         turn = message.get("turn", 1)
         bucket = grouped.setdefault(
             turn,
-            {"prompt": [], "response": [], "retrieved_context": "", "expected_output": ""},
+            {"prompt": [], "response": [], "retrieved_context_source": "", "expected_output": ""},
         )
         role = message.get("role")
         content = message.get("content", "")
@@ -119,10 +124,13 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
             bucket["prompt"].append(content)
         elif role == "model":
             bucket["response"].append(content)
-        for key in ("retrieved_context", "expected_output"):
-            value = message.get(key)
-            if value and not bucket[key]:
-                bucket[key] = value
+        # Keep the first non-empty raw context cell and expected output seen for the turn.
+        source = message.get("retrieved_context_source")
+        if source and not bucket["retrieved_context_source"]:
+            bucket["retrieved_context_source"] = source
+        expected = message.get("expected_output")
+        if expected and not bucket["expected_output"]:
+            bucket["expected_output"] = expected
 
     turns: list[dict[str, Any]] = []
     for turn_number in sorted(grouped):
@@ -132,7 +140,7 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "turn_number": turn_number,
                 "prompt": "\n".join(bucket["prompt"]),
                 "response": "\n".join(bucket["response"]),
-                "retrieved_context": bucket["retrieved_context"] or None,
+                "retrieved_context_source": bucket["retrieved_context_source"] or None,
                 "expected_output": bucket["expected_output"] or None,
             }
         )
@@ -214,15 +222,16 @@ def ingest_evaluation(
                 platform_execution=platform_exec,
             )
             for turn in project_turns(messages):
-                scenario.turns.append(
-                    Turn(
-                        turn_number=turn["turn_number"],
-                        prompt=turn["prompt"],
-                        response=turn["response"],
-                        retrieved_context=turn["retrieved_context"],
-                        expected_output=turn["expected_output"],
-                    )
+                # Store the raw context cell; the retrieval pipeline (score-time worker)
+                # fetches/extracts it into ``retrieved_documents`` — nothing is decoupled here.
+                turn_row = Turn(
+                    turn_number=turn["turn_number"],
+                    prompt=turn["prompt"],
+                    response=turn["response"],
+                    expected_output=turn["expected_output"],
+                    retrieved_context_source=turn["retrieved_context_source"],
                 )
+                scenario.turns.append(turn_row)
 
         db.add(run)
         db.commit()
@@ -295,23 +304,97 @@ def score_run(
             db.close()
 
 
+def retrieve_run(
+    run_id: str,
+    *,
+    session: Session | None = None,
+    pipeline: RetrievalPipeline | None = None,
+) -> dict[str, Any]:
+    """Run the retrieval pipeline over a queued run, populating each turn's context.
+
+    Loads the run, marks it ``en_recuperacion``, and for each turn parses/fetches/extracts its
+    raw ``retrieved_context_source`` cell into ``retrieved_documents`` — best-effort, so a
+    per-document failure is recorded in the pipeline report (and dropped from the context)
+    rather than raised. Commits **per scenario** so an interrupted job keeps finished scenarios;
+    a hard phase failure marks the run ``fallido`` and re-raises.
+
+    ``session`` defaults to ``SessionLocal()``; ``pipeline`` to a ``RetrievalOrchestrator`` bound
+    to that session (tests inject a fake). This is the retrieval half the worker runs before
+    scoring. Returns the run summary.
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        run = _load_run(db, run_id)
+        if run is None:
+            raise ValueError(f"El run {run_id} no existe.")
+
+        run.status = STATUS_EN_RECUPERACION
+        db.commit()
+
+        orchestrator = pipeline or RetrievalOrchestrator(
+            session=db, encryption_key=get_settings().auth_encryption_key
+        )
+        logger.info("Recuperando contexto para run %s…", run.id)
+        try:
+            for platform_exec in run.platform_executions:
+                for scenario in platform_exec.scenario_results:
+                    for turn in scenario.turns:
+                        _retrieve_turn(turn, orchestrator)
+                    db.commit()  # atomic-write unit: one scenario at a time
+        except Exception:
+            db.rollback()
+            run = _load_run(db, run_id)
+            if run is not None:
+                run.status = STATUS_FALLIDO
+                db.commit()
+            raise
+
+        logger.info("Recuperación completada para run %s", run.id)
+        return _summarize(run)
+    finally:
+        if owns_session:
+            db.close()
+
+
+def _retrieve_turn(turn: Turn, pipeline: RetrievalPipeline) -> None:
+    """Populate one turn's ``retrieved_documents`` from its raw context cell (best-effort)."""
+    turn.retrieved_documents.clear()  # idempotent when a run is retried
+    cell = (turn.retrieved_context_source or "").strip()
+    if not cell:
+        return
+    report = pipeline.run(cell)
+    for rank, document in enumerate(report.to_context().documents):
+        turn.retrieved_documents.append(RetrievedContextDocument.from_document(document, rank))
+    summary = RetrievalSummary.from_outcomes(report.outcomes)
+    logger.info(
+        "Turno %s: %d/%d documento(s) recuperado(s)",
+        turn.turn_number,
+        summary.retrieved,
+        summary.total,
+    )
+
+
 def run_evaluation(
     platform: str,
     files: list[UploadedFile],
     *,
     session: Session | None = None,
     judge: Judge | None = None,
+    pipeline: RetrievalPipeline | None = None,
 ) -> dict[str, Any]:
-    """Ingest ``files`` and score them under ``platform`` in one call.
+    """Ingest ``files``, retrieve their context, and score them under ``platform`` in one call.
 
-    The synchronous path: :func:`ingest_evaluation` followed by :func:`score_run` on
-    the same session. Kept for tests and in-process callers; the HTTP API instead
-    ingests inline and enqueues :func:`score_run` onto the Celery worker.
+    The synchronous path: :func:`ingest_evaluation` → :func:`retrieve_run` → :func:`score_run`
+    on the same session. Kept for tests and in-process callers; the HTTP API instead ingests
+    inline and enqueues the retrieval+scoring orchestrator onto the Celery worker. ``pipeline``
+    is injectable so tests avoid network/LLM calls.
     """
     owns_session = session is None
     db = SessionLocal() if session is None else session
     try:
         run_id = ingest_evaluation(platform, files, session=db)
+        retrieve_run(run_id, session=db, pipeline=pipeline)
         return score_run(run_id, session=db, judge=judge)
     finally:
         if owns_session:
@@ -354,6 +437,36 @@ def retrieve_turn_traces(
             _serialize_metric_trace(score, include_provenance)
             for score in turn.metric_scores
         ]
+    finally:
+        if owns_session:
+            db.close()
+
+
+def retrieve_scenario_turns(
+    scenario_id: str,
+    *,
+    session: Session | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return one scenario's turns in ``turn_number`` order, or ``None`` if unknown.
+
+    ``scenario_id`` is a ``ScenarioResult`` id (its UUID) — the unique handle for one
+    conversation scored under one platform in one run; the human-readable
+    ``ScenarioResult.scenario_id`` label is *not* unique and is not accepted here.
+    Discover the UUID from ``GET /runs`` (each scenario carries its ``id``).
+
+    Each entry carries the turn's content (``prompt``/``response``/``expected_output``/
+    ``retrieved_context_source``), its rolled-up ``turn_score``, and per-metric scores
+    (without the structured ``trace`` — read that via :func:`retrieve_turn_traces`). A
+    malformed or unknown ``scenario_id`` yields ``None`` (the HTTP layer maps that to
+    ``404``); a scenario with no turns yields ``[]``.
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        scenario = _load_scenario(db, scenario_id)
+        if scenario is None:
+            return None
+        return [_serialize_scenario_turn(turn) for turn in scenario.turns]
     finally:
         if owns_session:
             db.close()
@@ -465,6 +578,25 @@ def _load_turn(db: Session, turn_id: str) -> Turn | None:
     return db.get(Turn, key)
 
 
+def _load_scenario(db: Session, scenario_id: str) -> ScenarioResult | None:
+    """Load a ``ScenarioResult`` by its string id, eager-loading turns + metric scores.
+
+    Returns ``None`` for an unknown/invalid id. Eager-loads the turn tree (turns
+    ordered by ``turn_number``, each with its metric scores) so serialization does
+    not N+1.
+    """
+    try:
+        key = uuid.UUID(scenario_id)
+    except ValueError:
+        return None
+    stmt = (
+        select(ScenarioResult)
+        .where(ScenarioResult.id == key)
+        .options(selectinload(ScenarioResult.turns).selectinload(Turn.metric_scores))
+    )
+    return db.execute(stmt).scalars().one_or_none()
+
+
 def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:
     """Write ``upload`` to a temp ``.xlsx`` and parse it into raw messages.
 
@@ -474,7 +606,14 @@ def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:
     spreadsheet entirely and is only normalized.
     """
     if upload.messages is not None:
-        return normalize_messages(upload.messages)
+        messages = normalize_messages(upload.messages)
+        # Expose the captured context under the same ``retrieved_context_source`` key
+        # the .xlsx path uses (see ``parse_conversation``), so ``_group_turns`` stores
+        # it on the turn and the retrieval pipeline can interpret it later.
+        for message in messages:
+            if "retrieved_context" in message:
+                message["retrieved_context_source"] = message.pop("retrieved_context")
+        return messages
 
     fd, path = tempfile.mkstemp(suffix=".xlsx")
     try:
@@ -609,6 +748,9 @@ def _serialize_scenario(
     scenario: ScenarioResult, granularity: str
 ) -> dict[str, Any]:
     entry: dict[str, Any] = {
+        # The row's UUID — the handle GET /scenarios/{id}/turns takes (distinct from the
+        # human-readable, non-unique ``scenario_id`` label below).
+        "id": str(scenario.id),
         "scenario_id": scenario.scenario_id,
         "use_case": scenario.use_case,
         "status": scenario.status,
@@ -629,6 +771,36 @@ def _serialize_metric_trace(
         entry["rubric_version"] = score.rubric_version
     entry["trace"] = {"steps": score.trace.steps} if score.trace is not None else None
     return entry
+
+
+def _serialize_scenario_turn(turn: Turn) -> dict[str, Any]:
+    """Full turn view for the per-scenario turns endpoint: content + scores.
+
+    Unlike :func:`_serialize_turn` (the ``/runs`` metric-granularity projection, which
+    carries only ids/scores), this surfaces the conversation content — ``prompt``,
+    ``response``, ``expected_output`` and the raw ``retrieved_context_source`` — so a
+    caller can read the scenario's turns without re-uploading the source. The
+    structured metric ``trace`` is still not surfaced here (read it via
+    ``/turns/{turn_id}/traces``).
+    """
+    return {
+        "turn_id": str(turn.id),
+        "turn_number": turn.turn_number,
+        "prompt": turn.prompt,
+        "response": turn.response,
+        "expected_output": turn.expected_output,
+        "retrieved_context_source": turn.retrieved_context_source,
+        "turn_score": turn.turn_score,
+        "metric_scores": [
+            {
+                "metric_name": score.metric_name,
+                "score": score.score,
+                "judge_model": score.judge_model,
+                "rubric_version": score.rubric_version,
+            }
+            for score in turn.metric_scores
+        ],
+    }
 
 
 def _serialize_turn(turn: Turn) -> dict[str, Any]:

@@ -17,8 +17,10 @@ from scorekeeper.metrics.judges.base import (
     StepModels,
     _ScoreResponse,
     clamp,
+    judge_call,
     owned_model,
     render_prompt,
+    require_parsed,
     scale_spec,
 )
 
@@ -48,6 +50,11 @@ class OpenAIJudge:
     structured-outputs helper. Also serves as the project's embeddings backend
     (``embed()``) via the OpenAI embeddings endpoint.
     """
+
+    # Provider name used in error messages. A class attribute so a subclass pointed
+    # at a different backend (e.g. ``LMStudioJudge``) reports its own name instead of
+    # "OpenAI" in the descriptive errors raised by the inherited call methods.
+    provider: str = PROVIDER
 
     def __init__(
         self,
@@ -82,13 +89,13 @@ class OpenAIJudge:
     def model_for(self, step: JudgeStep | None = None) -> str:
         """Resolve (and validate) the chat model for ``step`` via the step router."""
         return owned_model(
-            self._step_models.for_step(step), owns=self._owns, provider=PROVIDER
+            self._step_models.for_step(step), owns=self._owns, provider=self.provider
         )
 
     def _resolve(self, step: JudgeStep | None, model: str | None) -> str:
         """An explicit ``model`` (validated) wins over ``step`` routing."""
         if model is not None:
-            return owned_model(model, owns=self._owns, provider=PROVIDER)
+            return owned_model(model, owns=self._owns, provider=self.provider)
         return self.model_for(step)
 
     def score(
@@ -104,15 +111,23 @@ class OpenAIJudge:
         spec = scale_spec(scale)
         model = self._resolve(step, model)
         content = f"{render_prompt(rubric, turn)}\n\n{spec.instruction_es}"
-        completion = self._client.chat.completions.parse(
+        with judge_call(provider=self.provider, model=model, action="la puntuación"):
+            completion = self._client.chat.completions.parse(
+                model=model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": content},
+                ],
+                response_format=_ScoreResponse,
+            )
+            message = completion.choices[0].message
+        parsed = require_parsed(
+            message.parsed,
+            provider=self.provider,
             model=model,
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": content},
-            ],
-            response_format=_ScoreResponse,
+            action="la puntuación",
+            refusal=getattr(message, "refusal", None),
         )
-        parsed: _ScoreResponse = completion.choices[0].message.parsed
         return JudgeVerdict(
             score=clamp(parsed.score, spec),
             justification=parsed.justification,
@@ -128,15 +143,24 @@ class OpenAIJudge:
         step: JudgeStep | None = None,
         model: str | None = None,
     ) -> T:
-        completion = self._client.chat.completions.parse(
-            model=self._resolve(step, model),
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": render_prompt(instruction, turn)},
-            ],
-            response_format=schema,
+        model = self._resolve(step, model)
+        with judge_call(provider=self.provider, model=model, action="la extracción"):
+            completion = self._client.chat.completions.parse(
+                model=model,
+                messages=[
+                    {"role": "system", "content": self.system_prompt},
+                    {"role": "user", "content": render_prompt(instruction, turn)},
+                ],
+                response_format=schema,
+            )
+            message = completion.choices[0].message
+        return require_parsed(
+            message.parsed,
+            provider=self.provider,
+            model=model,
+            action="la extracción",
+            refusal=getattr(message, "refusal", None),
         )
-        return completion.choices[0].message.parsed
 
     def embed(self, *, texts: list[str], model: str | None = None) -> list[list[float]]:
         """Embed ``texts`` via the OpenAI embeddings endpoint, order preserved.
@@ -147,9 +171,16 @@ class OpenAIJudge:
         if not texts:
             return []
         embedding_model = (
-            owned_model(model, owns=self._owns_embedding, provider=PROVIDER)
+            owned_model(model, owns=self._owns_embedding, provider=self.provider)
             if model is not None
             else self.embedding_model
         )
-        response = self._client.embeddings.create(model=embedding_model, input=texts)
+        with judge_call(
+            provider=self.provider,
+            model=embedding_model,
+            action="el cálculo de embeddings",
+        ):
+            response = self._client.embeddings.create(
+                model=embedding_model, input=texts
+            )
         return [item.embedding for item in response.data]

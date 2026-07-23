@@ -144,7 +144,7 @@ class Hallucination(MultiStepMetric):
     weight = 1.0
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
-        docs = split_context_docs(turn.retrieved_context)
+        docs = turn.retrieved_context.node_texts()
 
         if not docs:
             # No retrieved context to contradict: nothing to hallucinate.

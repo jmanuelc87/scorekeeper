@@ -9,13 +9,14 @@ from scorekeeper.metrics.catalog.hallucination import (
     NLILabel,
     split_context_docs,
 )
+from scorekeeper.retrieved_context import RetrievedContext
 
 
 def _turn(context: str) -> TurnView:
     return TurnView(
         prompt="¿Cuál es la política de devoluciones?",
         response="Puedes devolver en 30 días con recibo.",
-        retrieved_context=context,
+        retrieved_context=RetrievedContext.from_blob(context),
     )
 
 

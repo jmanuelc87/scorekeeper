@@ -1,0 +1,126 @@
+"""Local filesystem blob store for fetched documents, indexed by ``document_cache``.
+
+The fetch stage downloads a document at most once: bytes are written under a cache root and
+recorded in the ``document_cache`` table (one row per source ``url``). A later fetch of the
+same URL — even from a different turn or run — reads the blob off disk instead of the network.
+
+Blobs are sharded into subdirectories by the leading hex of the URL's SHA-256 to keep any one
+directory small; the DB row stores the path relative to the cache root, so the root can move.
+The store follows the codebase's session-injection convention (``session`` defaults to a fresh
+``SessionLocal()`` per operation; tests inject an in-memory session).
+"""
+
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from pathlib import Path
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from scorekeeper.database import DocumentCacheEntry, SessionLocal
+from scorekeeper.retrieval.types import DocType
+
+# Blob filename extension per document type (cosmetic; the SHA is the real key).
+_EXTENSIONS = {DocType.PDF: ".pdf", DocType.HTML: ".html", DocType.UNKNOWN: ".bin"}
+
+
+@dataclass
+class CachedBlob:
+    """A document's bytes plus its cache metadata."""
+
+    body: bytes
+    doc_type: DocType
+    content_type: str | None
+    sha256: str
+    size_bytes: int
+
+
+class DocumentStore:
+    """Filesystem blob cache indexed by the ``document_cache`` table."""
+
+    def __init__(self, root: str | Path, *, session: Session | None = None) -> None:
+        self._root = Path(root)
+        self._session = session
+
+    @contextmanager
+    def _session_scope(self) -> Iterator[Session]:
+        """Yield the injected session, or a fresh one closed afterwards."""
+        if self._session is not None:
+            yield self._session
+        else:
+            db = SessionLocal()
+            try:
+                yield db
+            finally:
+                db.close()
+
+    @staticmethod
+    def _sha(url: str) -> str:
+        return hashlib.sha256(url.encode("utf-8")).hexdigest()
+
+    def _relpath(self, sha: str, doc_type: DocType) -> str:
+        return f"{sha[:2]}/{sha}{_EXTENSIONS.get(doc_type, '.bin')}"
+
+    def get(self, url: str) -> CachedBlob | None:
+        """Return the cached blob for ``url``, or ``None`` on a miss.
+
+        A ``document_cache`` row whose blob file is missing (evicted out-of-band) is treated
+        as a miss so the caller re-downloads.
+        """
+        with self._session_scope() as db:
+            entry = db.scalar(
+                select(DocumentCacheEntry).where(DocumentCacheEntry.url == url)
+            )
+            if entry is None:
+                return None
+            path = self._root / entry.cache_path
+            if not path.exists():
+                return None
+            return CachedBlob(
+                body=path.read_bytes(),
+                doc_type=DocType(entry.doc_type),
+                content_type=entry.content_type,
+                sha256=entry.sha256,
+                size_bytes=entry.size_bytes,
+            )
+
+    def put(
+        self,
+        url: str,
+        *,
+        doc_type: DocType,
+        body: bytes,
+        content_type: str | None,
+    ) -> CachedBlob:
+        """Write ``body`` to the cache and upsert its ``document_cache`` row."""
+        sha = self._sha(url)
+        relpath = self._relpath(sha, doc_type)
+        path = self._root / relpath
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(body)
+
+        with self._session_scope() as db:
+            entry = db.scalar(
+                select(DocumentCacheEntry).where(DocumentCacheEntry.url == url)
+            )
+            if entry is None:
+                entry = DocumentCacheEntry(url=url)
+                db.add(entry)
+            entry.sha256 = sha
+            entry.cache_path = relpath
+            entry.doc_type = doc_type.value
+            entry.content_type = content_type
+            entry.size_bytes = len(body)
+            db.commit()
+
+        return CachedBlob(
+            body=body,
+            doc_type=doc_type,
+            content_type=content_type,
+            sha256=sha,
+            size_bytes=len(body),
+        )

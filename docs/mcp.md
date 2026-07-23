@@ -44,7 +44,8 @@ above):
   (`platform`, `average_score`, `started_at`, `finished_at`, `scenarios` count,
   `status_breakdown`).
 - `scenario_results` — adds a `scenario_results` list to each platform
-  (`scenario_id`, `use_case`, `status`, `average_score`).
+  (`id` — the scenario's `ScenarioResult` UUID —, `scenario_id`, `use_case`, `status`,
+  `average_score`).
 - `metric_scores` — adds a `turns` list to each scenario, each turn carrying its
   `turn_id`, `turn_score`, and a `metric_scores` list (`metric_name`, `score`,
   `judge_model`, `rubric_version`). Each score's structured trace is persisted on
@@ -70,6 +71,7 @@ above):
         "status_breakdown": {"completado": 1},
         "scenario_results": [
           {
+            "id": "3f0a…",
             "scenario_id": "esc1",
             "use_case": "default",
             "status": "completado",
