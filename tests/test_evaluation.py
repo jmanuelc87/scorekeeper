@@ -44,6 +44,7 @@ from scorekeeper.evaluation import (
     retrieve_turn_traces,
     run_evaluation,
     score_run,
+    set_turn_selection,
     start_run,
 )
 from scorekeeper.metrics.base import (
@@ -405,9 +406,16 @@ def test_progress_midway(session: Session, registry) -> None:
     assert summary["progress"] == {"done": 1, "total": 2, "ratio": 0.5}
 
 
+def _all_turn_ids(session: Session, run_id: str) -> list[str]:
+    turns = session.execute(select(Turn)).scalars().all()
+    return [str(t.id) for t in turns]
+
+
 def test_score_run_end_to_end(session: Session, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
     run_id = ingest_evaluation("claude", files, session=session)
+    # Scoring is opt-in per turn — select both turns before scoring.
+    set_turn_selection(run_id, _all_turn_ids(session, run_id), True, session=session)
 
     summary = score_run(run_id, session=session, judge=RecordingJudge(0.8))
 
@@ -418,6 +426,79 @@ def test_score_run_end_to_end(session: Session, registry) -> None:
     assert summary["progress"] == {"done": 2, "total": 2, "ratio": 1.0}
     scores = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
     assert scores == 2  # 2 turns × 1 metric
+
+
+def test_score_run_only_scores_selected_turns(session: Session, registry) -> None:
+    # Select only the first of the two ingested turns; scoring must skip the other.
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = ingest_evaluation("claude", files, session=session)
+    first_turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+    set_turn_selection(run_id, [str(first_turn.id)], True, session=session)
+
+    score_run(run_id, session=session, judge=RecordingJudge(0.8))
+
+    # Only the selected turn produced a score row; the other stays unscored.
+    scores = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
+    assert scores == 1
+    by_number = {
+        t.turn_number: t.turn_score
+        for t in session.execute(select(Turn)).scalars().all()
+    }
+    assert by_number[1] == pytest.approx(0.8)
+    assert by_number[2] is None
+
+
+def test_set_turn_selection_updates_matching_turns(session: Session, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = ingest_evaluation("claude", files, session=session)
+    turn_ids = _all_turn_ids(session, run_id)
+
+    updated = set_turn_selection(run_id, turn_ids, True, session=session)
+
+    assert updated == 2
+    assert all(t.is_selected for t in session.execute(select(Turn)).scalars().all())
+
+    # Deselect one turn; the count reflects only the turns actually touched.
+    updated = set_turn_selection(run_id, [turn_ids[0]], False, session=session)
+    assert updated == 1
+    by_id = {str(t.id): t.is_selected for t in session.execute(select(Turn)).scalars().all()}
+    assert by_id[turn_ids[0]] is False
+    assert by_id[turn_ids[1]] is True
+
+
+def test_set_turn_selection_ignores_foreign_and_bad_ids(session: Session, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = ingest_evaluation("claude", files, session=session)
+
+    updated = set_turn_selection(
+        run_id,
+        ["not-a-uuid", "00000000-0000-0000-0000-000000000000"],
+        True,
+        session=session,
+    )
+
+    assert updated == 0
+    assert not any(t.is_selected for t in session.execute(select(Turn)).scalars().all())
+
+
+def test_set_turn_selection_unknown_run_returns_none(session: Session) -> None:
+    assert set_turn_selection("not-a-uuid", [], True, session=session) is None
+    assert (
+        set_turn_selection(
+            "00000000-0000-0000-0000-000000000000", [], True, session=session
+        )
+        is None
+    )
+
+
+def test_set_turn_selection_after_start_raises(session: Session, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = ingest_evaluation("claude", files, session=session)
+    start_run(run_id, session=session)  # ingerido -> en_cola
+
+    # Selection is only allowed before a run leaves the 'ingerido' state.
+    with pytest.raises(ValueError):
+        set_turn_selection(run_id, _all_turn_ids(session, run_id), True, session=session)
 
 
 def test_score_run_unknown_id_raises(session: Session) -> None:
@@ -598,6 +679,56 @@ def test_start_endpoint_already_started_409(monkeypatch) -> None:
 
     assert response.status_code == 409
     assert "enqueued" not in captured  # a re-start never enqueues a second job
+
+
+# --- PATCH /evaluations/{run_id}/turns/selection endpoint ---------------------
+
+
+def test_selection_endpoint_returns_updated_count(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_select(run_id, turn_ids, is_selected, **kw):
+        captured.update(run_id=run_id, turn_ids=turn_ids, is_selected=is_selected)
+        return len(turn_ids)
+
+    monkeypatch.setattr(evaluation, "set_turn_selection", fake_select)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/evaluations/run-123/turns/selection",
+            json={"turn_ids": ["a", "b"], "is_selected": True},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"run_id": "run-123", "updated": 2}
+    assert captured == {"run_id": "run-123", "turn_ids": ["a", "b"], "is_selected": True}
+
+
+def test_selection_endpoint_unknown_run_404(monkeypatch) -> None:
+    monkeypatch.setattr(evaluation, "set_turn_selection", lambda *a, **kw: None)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/evaluations/does-not-exist/turns/selection",
+            json={"turn_ids": ["a"]},
+        )
+
+    assert response.status_code == 404
+
+
+def test_selection_endpoint_already_started_409(monkeypatch) -> None:
+    def fake_select(run_id, turn_ids, is_selected, **kw):
+        raise ValueError("El run ya fue iniciado.")
+
+    monkeypatch.setattr(evaluation, "set_turn_selection", fake_select)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/evaluations/run-123/turns/selection",
+            json={"turn_ids": ["a"]},
+        )
+
+    assert response.status_code == 409
 
 
 def test_endpoint_get_returns_summary(monkeypatch) -> None:

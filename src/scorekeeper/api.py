@@ -123,6 +123,20 @@ class EvaluationEnqueuedResponse(BaseModel):
     status: str
 
 
+class TurnSelectionRequest(BaseModel):
+    """Which turns of a run to (de)select for scoring, sent to the selection endpoint."""
+
+    turn_ids: list[str]
+    is_selected: bool = True
+
+
+class TurnSelectionResponse(BaseModel):
+    """How many turns the selection endpoint updated."""
+
+    run_id: str
+    updated: int
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -276,6 +290,37 @@ def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
     tasks.enqueue_run(run_id)
     logger.info("POST /evaluations/%s/start en cola", run_id)
     return EvaluationEnqueuedResponse(run_id=run_id, status=status)
+
+
+@app.patch(
+    "/evaluations/{run_id}/turns/selection",
+    response_model=TurnSelectionResponse,
+)
+def select_turns(run_id: str, payload: TurnSelectionRequest) -> TurnSelectionResponse:
+    """Mark a subset of a run's turns as selected (or not) for scoring.
+
+    Scoring is opt-in per turn: only turns flagged ``is_selected`` are evaluated by
+    the worker. Call this before ``POST /evaluations/{run_id}/start`` to pick the
+    subset. Turn ids that don't belong to the run are ignored; the response reports
+    how many turns were actually updated. ``404`` when the ``run_id`` is unknown,
+    ``409`` when the run has already left the ``ingerido`` state (already started).
+    """
+    try:
+        updated = evaluation.set_turn_selection(
+            run_id, payload.turn_ids, payload.is_selected
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
+
+    logger.info(
+        "PATCH /evaluations/%s/turns/selection: %d turno(s) is_selected=%s",
+        run_id,
+        updated,
+        payload.is_selected,
+    )
+    return TurnSelectionResponse(run_id=run_id, updated=updated)
 
 
 @app.get("/evaluations/{run_id}", response_model=EvaluationResponse)

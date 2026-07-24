@@ -347,7 +347,10 @@ def retrieve_run(
             for platform_exec in run.platform_executions:
                 for scenario in platform_exec.scenario_results:
                     for turn in scenario.turns:
-                        _retrieve_turn(turn, orchestrator)
+                        # Skip retrieval for turns that won't be scored; their
+                        # retrieved context is only used by their own metrics.
+                        if turn.is_selected:
+                            _retrieve_turn(turn, orchestrator)
                     db.commit()  # atomic-write unit: one scenario at a time
         except Exception:
             db.rollback()
@@ -392,20 +395,36 @@ def run_evaluation(
 ) -> dict[str, Any]:
     """Ingest ``files``, retrieve their context, and score them under ``platform`` in one call.
 
-    The synchronous path: :func:`ingest_evaluation` → :func:`retrieve_run` → :func:`score_run`
-    on the same session. Kept for tests and in-process callers; the HTTP API instead ingests
-    inline and enqueues the retrieval+scoring orchestrator onto the Celery worker. ``pipeline``
-    is injectable so tests avoid network/LLM calls.
+    The synchronous path: :func:`ingest_evaluation` → select every turn → :func:`retrieve_run`
+    → :func:`score_run` on the same session. Because scoring is opt-in per turn (only
+    ``Turn.is_selected`` turns are evaluated by the worker), this convenience selects all
+    turns so it evaluates the whole file — the HTTP API instead ingests inline, lets the
+    caller pick a subset via the selection endpoint, then enqueues the retrieval+scoring
+    orchestrator onto the Celery worker. ``pipeline`` is injectable so tests avoid
+    network/LLM calls.
     """
     owns_session = session is None
     db = SessionLocal() if session is None else session
     try:
         run_id = ingest_evaluation(platform, files, session=db)
+        _select_all_turns(db, run_id)
         retrieve_run(run_id, session=db, pipeline=pipeline)
         return score_run(run_id, session=db, judge=judge)
     finally:
         if owns_session:
             db.close()
+
+
+def _select_all_turns(db: Session, run_id: str) -> None:
+    """Mark every turn of a run selected for scoring (the "evaluate everything" default)."""
+    run = _load_run(db, run_id)
+    if run is None:
+        return
+    for platform_exec in run.platform_executions:
+        for scenario in platform_exec.scenario_results:
+            for turn in scenario.turns:
+                turn.is_selected = True
+    db.commit()
 
 
 def get_run_summary(run_id: str, *, session: Session | None = None) -> dict[str, Any] | None:
@@ -446,6 +465,56 @@ def start_run(run_id: str, *, session: Session | None = None) -> str | None:
         db.commit()
         logger.info("Run %s encolado para puntuación.", run_id)
         return STATUS_EN_COLA
+    finally:
+        if owns_session:
+            db.close()
+
+
+def set_turn_selection(
+    run_id: str,
+    turn_ids: list[str],
+    is_selected: bool,
+    *,
+    session: Session | None = None,
+) -> int | None:
+    """Flag the given turns of a run as selected/deselected for scoring.
+
+    Only selected turns are evaluated by the worker (retrieval + LLM judge); this
+    is how a caller picks the subset to score before starting the run. Returns the
+    number of turns updated, or ``None`` when the ``run_id`` is unknown/invalid.
+    Raises ``ValueError`` when the run has already left the ``ingerido`` state
+    (selection must happen before starting). Turn ids that don't belong to the run
+    (or are malformed) are ignored.
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        run = _load_run(db, run_id)
+        if run is None:
+            return None
+        if run.status != STATUS_INGERIDO:
+            raise ValueError(
+                f"El run {run_id} no está en estado '{STATUS_INGERIDO}' "
+                f"(estado actual: '{run.status}')."
+            )
+        wanted: set[uuid.UUID] = set()
+        for raw in turn_ids:
+            try:
+                wanted.add(uuid.UUID(raw))
+            except (ValueError, AttributeError):
+                continue  # ignore malformed ids
+        updated = 0
+        for platform_exec in run.platform_executions:
+            for scenario in platform_exec.scenario_results:
+                for turn in scenario.turns:
+                    if turn.id in wanted:
+                        turn.is_selected = is_selected
+                        updated += 1
+        db.commit()
+        logger.info(
+            "Run %s: %d turno(s) marcados is_selected=%s.", run_id, updated, is_selected
+        )
+        return updated
     finally:
         if owns_session:
             db.close()
