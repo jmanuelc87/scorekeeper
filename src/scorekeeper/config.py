@@ -65,7 +65,9 @@ class Settings(BaseSettings):
 
     # Local filesystem directory for the retrieval pipeline's fetch cache. Fetched document
     # bytes are stored here (indexed by the ``document_cache`` table) so a document is
-    # downloaded at most once across turns/runs (see scorekeeper.retrieval.fetch).
+    # downloaded at most once per platform execution (see scorekeeper.retrieval.fetch). The
+    # entries are purged when that execution's retrieval finishes, so the directory does not
+    # accumulate documents across runs (see evaluation.retrieve_run).
     retrieval_cache_dir: str = "./retrieval-cache"
 
     # Master secret for the retrieval pipeline's credential store. Certificate private

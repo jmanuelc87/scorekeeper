@@ -445,8 +445,12 @@ class DocumentCacheEntry(Base):
     One row per distinct source ``url`` (unique), pointing at the cached blob under
     ``settings.retrieval_cache_dir``. The fetch stage (``scorekeeper.retrieval.fetch``) reads
     this to avoid re-downloading a document already on disk, so a URL is fetched at most once
-    across turns/runs even though the pipeline may reference it many times. Standalone — no FK
-    into the run hierarchy; the bytes live on disk, not in the DB.
+    per platform execution even though the pipeline may reference it many times. Standalone —
+    no FK into the run hierarchy; the bytes live on disk, not in the DB.
+
+    Rows are **transient**: they are deleted with their blobs once the platform execution's
+    retrieval finishes (``evaluation.retrieve_run``), since the extracted markdown on
+    ``retrieved_documents`` is the durable record of what was retrieved.
     """
 
     __tablename__ = "document_cache"

@@ -187,6 +187,9 @@ class _DummyPipeline:
     def run(self, cell: str) -> RetrievalReport:
         return RetrievalReport(source_format=SourceFormat.EMPTY)
 
+    def purge_cache(self) -> int:
+        return 0
+
 
 class _DummyAuthProvider:
     def classify(self, locator: DocumentLocator) -> AuthDecision:
@@ -219,6 +222,9 @@ class _DummyResolver:
 class _DummyFetcher:
     def fetch(self, locator: DocumentLocator, client: object | None) -> FetchedDocument:
         return FetchedDocument(document_url=locator.document_url, doc_type=locator.doc_type, body=b"")
+
+    def purge_cache(self) -> int:
+        return 0
 
 
 class _DummyExtractor:

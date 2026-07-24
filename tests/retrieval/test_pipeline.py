@@ -76,6 +76,7 @@ class _Fetcher:
     def __init__(self, *, body=b"bytes", exc=None):
         self._body = body
         self._exc = exc
+        self.purges = 0
 
     def fetch(self, locator, client):
         if self._exc is not None:
@@ -83,6 +84,10 @@ class _Fetcher:
         return FetchedDocument(
             document_url=locator.document_url, doc_type=locator.doc_type, body=self._body
         )
+
+    def purge_cache(self):
+        self.purges += 1
+        return 2
 
 
 class _Extractor:
@@ -183,3 +188,11 @@ def test_order_and_duplicates_preserved() -> None:
     assert len(report.outcomes) == 3
     docs = report.to_context().documents
     assert [d.name for d in docs] == ["A", "B", "A"]
+
+
+def test_purge_cache_delegates_to_the_fetch_stage() -> None:
+    fetcher = _Fetcher()
+    orch = _orch(fetcher=fetcher)
+    orch.run("cell")
+    assert orch.purge_cache() == 2  # the fetcher's removal count is passed through
+    assert fetcher.purges == 1

@@ -140,3 +140,73 @@ def test_distinct_urls_download_separately(tmp_path: Path, session: Session) -> 
     fetcher.fetch(_loc("https://pub/b.pdf"), None)
     assert http.calls == 2
     assert session.query(DocumentCacheEntry).count() == 2
+
+
+# -- purge_cache ---------------------------------------------------------------
+
+
+def test_purge_cache_removes_what_was_fetched(tmp_path: Path, session: Session) -> None:
+    http = _FakeHttp()
+    fetcher = _fetcher(tmp_path, session, http)
+    fetcher.fetch(_loc("https://pub/a.pdf"), None)
+    fetcher.fetch(_loc("https://pub/b.pdf"), None)
+
+    assert fetcher.purge_cache() == 2
+
+    assert session.query(DocumentCacheEntry).count() == 0
+    assert list(tmp_path.rglob("*.pdf")) == []  # no blobs left on disk
+
+
+def test_purge_cache_covers_documents_served_from_cache(tmp_path: Path, session: Session) -> None:
+    # A second fetcher that only ever hit the cache still owns what it served: the URL was
+    # used by this execution, so it must not survive it.
+    _fetcher(tmp_path, session).fetch(_loc("https://pub/x.pdf"), None)
+    second = _fetcher(tmp_path, session)
+    assert second.fetch(_loc("https://pub/x.pdf"), None).cached is True
+
+    assert second.purge_cache() == 1
+    assert session.query(DocumentCacheEntry).count() == 0
+
+
+def test_purge_cache_leaves_other_fetchers_documents(tmp_path: Path, session: Session) -> None:
+    mine = _fetcher(tmp_path, session)
+    mine.fetch(_loc("https://pub/mine.pdf"), None)
+    theirs = _fetcher(tmp_path, session)
+    theirs.fetch(_loc("https://pub/theirs.pdf"), None)
+
+    assert mine.purge_cache() == 1
+
+    remaining = session.query(DocumentCacheEntry).one()
+    assert remaining.url == "https://pub/theirs.pdf"
+
+
+def test_purge_cache_is_idempotent_and_empty_is_a_no_op(tmp_path: Path, session: Session) -> None:
+    fetcher = _fetcher(tmp_path, session)
+    assert fetcher.purge_cache() == 0  # nothing fetched yet
+    fetcher.fetch(_loc("https://pub/x.pdf"), None)
+    assert fetcher.purge_cache() == 1
+    assert fetcher.purge_cache() == 0  # the served set was cleared, not re-purged
+
+
+def test_fetch_after_purge_downloads_again(tmp_path: Path, session: Session) -> None:
+    http = _FakeHttp()
+    fetcher = _fetcher(tmp_path, session, http)
+    fetcher.fetch(_loc("https://pub/x.pdf"), None)
+    fetcher.purge_cache()
+
+    again = fetcher.fetch(_loc("https://pub/x.pdf"), None)
+
+    assert again.cached is False  # the cache no longer holds it
+    assert again.body == b"PDF-BYTES"
+    assert http.calls == 2
+
+
+def test_failed_fetch_purges_cleanly(tmp_path: Path, session: Session) -> None:
+    class _BadHttp:
+        def get(self, url: str) -> _Resp:
+            raise httpx2.HTTPError("boom")
+
+    fetcher = CachingDocumentFetcher(cache_dir=tmp_path, session=session, http_client=_BadHttp())
+    with pytest.raises(FetchError):
+        fetcher.fetch(_loc("https://pub/fail.pdf"), None)
+    assert fetcher.purge_cache() == 0  # nothing was cached, so nothing to remove
