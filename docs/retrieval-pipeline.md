@@ -105,9 +105,15 @@ stage: `fetch(locator, client) → FetchedDocument`. It consumes the authorize s
 
 **Local filesystem cache.** Every fetch is cached under `RETRIEVAL_CACHE_DIR`, indexed by the
 [`document_cache`](data-model.md#documentcacheentry) table (one row per `document_url`, unique).
-The first fetch of a URL downloads and stores the bytes; later fetches of the same URL — in any
-turn or run — read the blob off disk (`FetchedDocument.cached = True`), so **a document is
-downloaded at most once**.
+The first fetch of a URL downloads and stores the bytes; later fetches of the same URL read the
+blob off disk (`FetchedDocument.cached = True`), so **a document is downloaded at most once per
+platform execution** — across every turn and scenario the execution covers.
+
+**The cache does not outlive the execution.** `CachingDocumentFetcher` remembers every
+`document_url` it served, and `purge_cache()` deletes exactly those blobs (and their
+`document_cache` rows) when retrieval for a platform execution finishes — see
+[Cache cleanup](#cache-cleanup). Nothing downloaded is retained afterwards, so a later run
+re-downloads what it needs.
 
 **Duplicates are preserved.** The cache dedups *downloads*, not *results*: `fetch` returns one
 `FetchedDocument` per call, so a cell that references the same URL several times yields one
@@ -191,6 +197,24 @@ parses/fetches/extracts its raw `Turn.retrieved_context_source` (captured at ing
 marks the run `fallido` while per-document failures just shrink the context. Scoring then reads
 `retrieved_documents` as before. The run lifecycle is
 `en_cola → en_recuperacion → en_proceso → completado|parcial|fallido`.
+
+### Cache cleanup
+
+Downloaded documents are working material, not results: the extracted markdown is persisted on
+`retrieved_documents`, and scoring reads only that. So `retrieve_run` calls
+`RetrievalPipeline.purge_cache()` once a **platform execution**'s scenarios are all retrieved
+(and again on the failure path, so a `fallido` run leaves nothing behind). The purge:
+
+- removes only the `document_url`s *this* pipeline served, leaving a concurrently-running
+  execution's cache entries untouched;
+- deletes each blob and its `document_cache` row together, pruning the shard directory when it
+  empties;
+- is **best-effort** — a cleanup error is logged (`No se pudo limpiar la caché de …`) and
+  swallowed, since the context is already stored and a stranded blob is not worth failing a run.
+
+The consequence is deliberate: the fetch cache dedups downloads *within* a platform execution
+only. `RETRIEVAL_CACHE_DIR` returns to empty between executions rather than growing without
+bound, and the same document referenced by a later run is fetched again.
 
 ## Deferred phases
 

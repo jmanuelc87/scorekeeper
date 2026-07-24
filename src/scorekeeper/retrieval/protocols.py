@@ -86,6 +86,14 @@ class DocumentFetcher(Protocol):
         """
         ...
 
+    def purge_cache(self) -> int:
+        """Drop the documents fetched so far and return how many were removed.
+
+        Called once retrieval for a platform execution finishes, so downloaded bytes do not
+        outlive the execution that needed them. A fetcher that caches nothing returns 0.
+        """
+        ...
+
 
 @runtime_checkable
 class ContentExtractor(Protocol):
@@ -108,4 +116,8 @@ class RetrievalPipeline(Protocol):
 
     def run(self, cell: str) -> RetrievalReport:
         """Run parse → locate → authorize → fetch → filter → extract → assemble."""
+        ...
+
+    def purge_cache(self) -> int:
+        """Release the documents retrieved so far (see ``DocumentFetcher.purge_cache``)."""
         ...
