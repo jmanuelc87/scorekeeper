@@ -43,19 +43,6 @@ services:
     command: ["scorekeeper-api"]
     env_file: .env
     environment: *backend-environment
-    healthcheck:
-      # curl/wget aren't in the python:slim image, but Python always is.
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8001/health').status == 200 else 1)",
-        ]
-      interval: 30s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -86,5 +73,55 @@ services:
   #   ports:
   #     - "8080:80"
 
+  # --- Observability: central log aggregation (Grafana Loki) --------------------
+
+  loki:
+    image: grafana/loki:3.4.2
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./observability/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki_data:/loki
+    ports:
+      - "3100:3100"
+
+  # Grafana Alloy collects every container's logs off the Docker socket, drops the
+  # duplicated stderr text copy for the Python services, parses their stdout JSON,
+  # and pushes to Loki. Reads the socket read-only; discovers containers by label.
+  alloy:
+    image: grafana/alloy:v1.7.1
+    command:
+      [
+        "run",
+        "/etc/alloy/config.alloy",
+        "--server.http.listen-addr=0.0.0.0:12345",
+        "--storage.path=/var/lib/alloy/data",
+      ]
+    volumes:
+      - ./observability/alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - alloy_data:/var/lib/alloy/data
+    ports:
+      - "12345:12345"
+    depends_on:
+      - loki
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    environment:
+      # Anonymous admin so the local UI works with no login prompt.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - loki
+
 volumes:
   postgres_data:
+  loki_data:
+  alloy_data:
+  grafana_data:

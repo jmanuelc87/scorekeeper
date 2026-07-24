@@ -13,8 +13,8 @@ class Settings(BaseSettings):
     api_port: int = 8001
     cors_origins: str = "http://localhost:5173,http://localhost:8080"
 
-    # Root log level for the structlog-based dual output (plain text on stderr, JSON
-    # on stdout). See scorekeeper.logging_config.configure_logging.
+    # Root log level for the structlog plain-text output (single stream on stdout).
+    # See scorekeeper.logging_config.configure_logging.
     log_level: str = "INFO"
 
     # Celery broker for the evaluation worker. Defaults to the app's own Postgres

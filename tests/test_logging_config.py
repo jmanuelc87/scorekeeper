@@ -1,15 +1,15 @@
-"""Tests for the structlog-based dual-output logging configuration.
+"""Tests for the structlog-based plain-text logging configuration.
 
-``configure_logging`` must install exactly two root handlers — plain text on
-stderr (console) and JSON on stdout (telemetry) — and route both native structlog
-events and third-party ``logging`` records through them. We drive real streams and
-assert on what each one emits.
+``configure_logging`` must install exactly one root handler that emits
+human-readable plain text to stdout (no JSON stream, no separate stderr stream),
+routing both native structlog events and third-party ``logging`` records through
+it. A caller may redirect the output to another stream (the MCP server does this
+for stdio). We drive real streams and assert on what each one emits.
 """
 
 from __future__ import annotations
 
 import io
-import json
 import logging
 
 import pytest
@@ -35,7 +35,7 @@ def _reset_logging():
 
 
 def _capture(monkeypatch: pytest.MonkeyPatch) -> tuple[io.StringIO, io.StringIO]:
-    """Point the two handlers at in-memory streams and return (stderr, stdout)."""
+    """Point stdout/stderr at in-memory streams and return (stderr, stdout)."""
     import sys
 
     err, out = io.StringIO(), io.StringIO()
@@ -45,48 +45,55 @@ def _capture(monkeypatch: pytest.MonkeyPatch) -> tuple[io.StringIO, io.StringIO]
     return err, out
 
 
-def test_installs_two_handlers(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_installs_single_stdout_handler(monkeypatch: pytest.MonkeyPatch) -> None:
     _capture(monkeypatch)
-    assert len(logging.getLogger().handlers) == 2
+    assert len(logging.getLogger().handlers) == 1
 
 
-def test_structlog_event_goes_to_both_console_and_json(
+def test_structlog_event_is_plain_text_on_stdout_only(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     err, out = _capture(monkeypatch)
     structlog.get_logger("scorekeeper.test").info("llm_call", op="score", latency_ms=12.3)
 
-    console = err.getvalue()
-    telemetry = out.getvalue()
-
-    # Console (stderr): human-readable plain text with the event and its fields.
-    assert "llm_call" in console
-    assert "op=score" in console
-    # Telemetry (stdout): one JSON object carrying the same fields.
-    record = json.loads(telemetry)
-    assert record["event"] == "llm_call"
-    assert record["op"] == "score"
-    assert record["latency_ms"] == 12.3
-    assert record["level"] == "info"
-    assert "timestamp" in record
+    # Nothing on the console (stderr); a single human-readable line on stdout with the
+    # event and its key=value fields (not JSON).
+    assert err.getvalue() == ""
+    line = out.getvalue()
+    assert "llm_call" in line
+    assert "op=score" in line
+    assert "latency_ms=12.3" in line
+    assert not line.lstrip().startswith("{")
 
 
 def test_stdlib_record_is_routed_through_structlog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # A plain logging record (e.g. from a third-party library) renders through the
-    # same handlers: JSON on stdout, text on stderr.
+    # A plain logging record (e.g. from a third-party library) renders as text on
+    # stdout through the same handler.
     err, out = _capture(monkeypatch)
     logging.getLogger("some.library").warning("plain message")
 
-    assert "plain message" in err.getvalue()
-    record = json.loads(out.getvalue())
-    assert record["event"] == "plain message"
-    assert record["level"] == "warning"
+    assert err.getvalue() == ""
+    assert "plain message" in out.getvalue()
+
+
+def test_stream_override_redirects_output(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The MCP server's stdio path redirects logs off stdout (the JSON-RPC channel).
+    import sys
+
+    err, out = io.StringIO(), io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    logging_config.configure_logging(force=True, stream=err)
+
+    structlog.get_logger("scorekeeper.test").info("mcp_server_starting")
+
+    assert out.getvalue() == ""
+    assert "mcp_server_starting" in err.getvalue()
 
 
 def test_idempotent_without_force(monkeypatch: pytest.MonkeyPatch) -> None:
     _capture(monkeypatch)
-    # A second call without force is a no-op: still exactly two handlers.
+    # A second call without force is a no-op: still exactly one handler.
     logging_config.configure_logging()
-    assert len(logging.getLogger().handlers) == 2
+    assert len(logging.getLogger().handlers) == 1
