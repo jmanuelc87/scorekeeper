@@ -6,6 +6,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -26,6 +27,7 @@ from sqlalchemy.orm import (
 )
 
 from scorekeeper.config import get_settings
+from scorekeeper.retrieved_context import RetrievedDocument
 
 # JSONB on PostgreSQL, plain JSON on the SQLite fallback.
 JsonColumn = JSON().with_variant(JSONB, "postgresql")
@@ -116,8 +118,11 @@ class ScenarioResult(Base):
     use_case: Mapped[str] = mapped_column(
         String(128), default="default", server_default="default"
     )
-    # Reference into the source file: sheet name, conversation key, or row range.
-    source_ref: Mapped[str | None] = mapped_column(String(256), default=None)
+    # Provenance of the conversation: a sheet name, conversation key or row range
+    # for a file import, or the full chat URL for a live browser capture. Unbounded
+    # because a captured URL (Copilot threads carry request ids and origin params)
+    # runs well past any column width worth guessing at.
+    source_ref: Mapped[str | None] = mapped_column(Text, default=None)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     screenshot_path: Mapped[str | None] = mapped_column(String(512), default=None)
     average_score: Mapped[float | None] = mapped_column(Float, default=None)
@@ -147,16 +152,26 @@ class Turn(Base):
     turn_number: Mapped[int] = mapped_column(Integer)
     prompt: Mapped[str] = mapped_column(Text)
     response: Mapped[str] = mapped_column(Text)
-    # Retrieved context a RAG answer was grounded on, for groundedness-style
-    # metrics. Free-form text blob; None = not applicable to this turn.
-    retrieved_context: Mapped[str | None] = mapped_column(Text, default=None)
     # Ground-truth answer for the turn, for reference-based metrics (e.g. contextual
     # precision). Free-form text; None = no reference available for this turn.
     expected_output: Mapped[str | None] = mapped_column(Text, default=None)
     response_time_ms: Mapped[int | None] = mapped_column(Integer, default=None)
     turn_score: Mapped[float | None] = mapped_column(Float, default=None)
+    # Raw ``retrieved_context`` cell (ranked source references) captured at ingest; the
+    # retrieval pipeline (scorekeeper.retrieval) parses/fetches/extracts it into the
+    # ``retrieved_documents`` child rows. None = the sheet had no context column.
+    retrieved_context_source: Mapped[str | None] = mapped_column(Text, default=None)
 
     scenario_result: Mapped[ScenarioResult] = relationship(back_populates="turns")
+    # Retrieved context a RAG answer was grounded on, for groundedness-style metrics —
+    # one child row per document, ordered by retriever rank. The pydantic
+    # ``RetrievedContext`` (scorekeeper.retrieved_context) is the in-memory assembly of
+    # these rows. No rows = no retrieved context for this turn.
+    retrieved_documents: Mapped[list[RetrievedContextDocument]] = relationship(
+        back_populates="turn",
+        cascade="all, delete-orphan",
+        order_by="RetrievedContextDocument.rank",
+    )
     metric_scores: Mapped[list[MetricScore]] = relationship(
         back_populates="turn",
         cascade="all, delete-orphan",
@@ -167,6 +182,51 @@ class Turn(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+
+
+class RetrievedContextDocument(Base):
+    """One retrieved document grounding a turn's answer.
+
+    The decoupled, relational form of a ``RetrievedDocument``: one row per document,
+    ordered within a turn by ``rank`` (retriever order, 0-based). The in-memory
+    ``RetrievedContext`` value object is assembled from these rows.
+    """
+
+    __tablename__ = "retrieved_documents"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    turn_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("turns.id", ondelete="CASCADE"), index=True
+    )
+    rank: Mapped[int | float] = mapped_column(Float)  # retriever order (int or float).
+    name: Mapped[str] = mapped_column(Text)  # Short label/title for the retrieved item.
+    document: Mapped[str] = mapped_column(Text)  # Source document reference.
+    content: Mapped[str] = mapped_column(Text)  # The retrieved text.
+    url: Mapped[str | None] = mapped_column(Text, default=None)  # Source URL, if any.
+
+    turn: Mapped[Turn] = relationship(back_populates="retrieved_documents")
+
+    @classmethod
+    def from_document(
+        cls, doc: RetrievedDocument, rank: int | float
+    ) -> "RetrievedContextDocument":
+        """Build a row from a pydantic ``RetrievedDocument`` at ``rank``."""
+        return cls(
+            rank=rank,
+            name=doc.name,
+            document=doc.document,
+            content=doc.content,
+            url=doc.url,
+        )
+
+    def to_document(self) -> RetrievedDocument:
+        """Project this row back into a pydantic ``RetrievedDocument``."""
+        return RetrievedDocument(
+            name=self.name,
+            document=self.document,
+            content=self.content,
+            url=self.url,
+        )
 
 
 class MetricScore(Base):
@@ -254,6 +314,154 @@ class ScenarioMetric(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     use_case: Mapped[str] = mapped_column(String(128), index=True)
     metric_name: Mapped[str] = mapped_column(String(128))
+
+
+class AuthProviderConfig(Base):
+    """Per-provider authentication settings for the retrieval pipeline's authorize stage.
+
+    A single table with a ``provider`` discriminator (the provider *kind*, e.g.
+    ``"sharepoint"``) backs the credential taxonomy in
+    ``scorekeeper.retrieval.credentials``: one enabled row per gated ``host`` supplies the
+    settings its :class:`CredentialProvider` needs to build an authenticated client. The
+    certificate ``private_key`` is never stored in the clear — it is encrypted with a
+    per-row salt (see ``scorekeeper.retrieval.credentials.secrets``); the plaintext columns
+    hold only non-secret identifiers. ``settings`` is kind-specific overflow for future
+    providers whose fields do not map onto the SharePoint columns.
+    """
+
+    __tablename__ = "auth_providers"
+    __table_args__ = (
+        UniqueConstraint("provider", "host", name="uq_auth_provider_host"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    provider: Mapped[str] = mapped_column(String(64))  # credential-provider kind.
+    host: Mapped[str] = mapped_column(String(256), index=True)  # gated host this authorizes.
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, server_default="1")
+
+    # SharePoint certificate credentials (non-secret identifiers).
+    tenant_id: Mapped[str | None] = mapped_column(String(128), default=None)
+    client_id: Mapped[str | None] = mapped_column(String(128), default=None)
+    thumbprint: Mapped[str | None] = mapped_column(String(128), default=None)
+    site_url: Mapped[str | None] = mapped_column(String(512), default=None)
+
+    # Encrypted certificate private key: Fernet token + its per-row salt (both base64).
+    private_key_encrypted: Mapped[str | None] = mapped_column(Text, default=None)
+    private_key_salt: Mapped[str | None] = mapped_column(Text, default=None)
+
+    # Kind-specific overflow for providers whose fields don't map onto the columns above.
+    settings: Mapped[dict[str, Any] | None] = mapped_column(JsonColumn, default=None)
+
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
+
+    @classmethod
+    def from_sharepoint(
+        cls,
+        *,
+        host: str,
+        tenant_id: str,
+        client_id: str,
+        thumbprint: str,
+        site_url: str,
+        private_key: str,
+        encryption_key: str,
+        enabled: bool = True,
+    ) -> "AuthProviderConfig":
+        """Build a ``sharepoint`` row, encrypting ``private_key`` under ``encryption_key``."""
+        from scorekeeper.retrieval.credentials.secrets import encrypt_secret
+
+        salt, token = encrypt_secret(private_key, encryption_key)
+        return cls(
+            provider="sharepoint",
+            host=host,
+            enabled=enabled,
+            tenant_id=tenant_id,
+            client_id=client_id,
+            thumbprint=thumbprint,
+            site_url=site_url,
+            private_key_encrypted=token,
+            private_key_salt=salt,
+        )
+
+    @classmethod
+    def from_oauth2(
+        cls,
+        *,
+        host: str,
+        client_id: str,
+        client_secret: str,
+        token_url: str,
+        encryption_key: str,
+        scope: str | None = None,
+        enabled: bool = True,
+    ) -> "AuthProviderConfig":
+        """Build an ``oauth2`` row, encrypting ``client_secret``.
+
+        The non-secret OAuth2 settings (``token_url``, optional ``scope``) live in the
+        ``settings`` JSON overflow; the client secret is encrypted into the shared secret
+        columns like any other provider's secret.
+        """
+        from scorekeeper.retrieval.credentials.secrets import encrypt_secret
+
+        salt, token = encrypt_secret(client_secret, encryption_key)
+        settings: dict[str, Any] = {"token_url": token_url}
+        if scope is not None:
+            settings["scope"] = scope
+        return cls(
+            provider="oauth2",
+            host=host,
+            enabled=enabled,
+            client_id=client_id,
+            private_key_encrypted=token,
+            private_key_salt=salt,
+            settings=settings,
+        )
+
+    def decrypted_secret(self, encryption_key: str) -> str:
+        """Decrypt and return the row's stored secret.
+
+        The ``private_key_*`` columns hold whichever secret the provider kind needs — a
+        certificate private key (SharePoint), an OAuth2 client secret, … — encrypted with a
+        per-row salt. Raises ``SecretError`` when no secret is stored or ``encryption_key`` is
+        wrong.
+        """
+        from scorekeeper.retrieval.credentials.secrets import SecretError, decrypt_secret
+
+        if not self.private_key_encrypted or not self.private_key_salt:
+            raise SecretError(f"El proveedor {self.provider} no tiene un secreto almacenado")
+        return decrypt_secret(self.private_key_salt, self.private_key_encrypted, encryption_key)
+
+    def decrypted_private_key(self, encryption_key: str) -> str:
+        """Alias of :meth:`decrypted_secret`, reading naturally for certificate providers."""
+        return self.decrypted_secret(encryption_key)
+
+
+class DocumentCacheEntry(Base):
+    """Index of documents cached on the local filesystem by the fetch stage.
+
+    One row per distinct source ``url`` (unique), pointing at the cached blob under
+    ``settings.retrieval_cache_dir``. The fetch stage (``scorekeeper.retrieval.fetch``) reads
+    this to avoid re-downloading a document already on disk, so a URL is fetched at most once
+    across turns/runs even though the pipeline may reference it many times. Standalone — no FK
+    into the run hierarchy; the bytes live on disk, not in the DB.
+    """
+
+    __tablename__ = "document_cache"
+    __table_args__ = (UniqueConstraint("url", name="uq_document_cache_url"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    url: Mapped[str] = mapped_column(Text)  # source document URL (fetch/cache key); unique.
+    sha256: Mapped[str] = mapped_column(String(64))  # hex digest of the URL (blob filename).
+    cache_path: Mapped[str] = mapped_column(Text)  # blob path relative to the cache root.
+    doc_type: Mapped[str] = mapped_column(String(16))  # DocType value of the cached document.
+    content_type: Mapped[str | None] = mapped_column(String(255), default=None)
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    fetched_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_now, onupdate=_now
+    )
 
 
 def create_schema() -> None:

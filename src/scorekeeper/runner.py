@@ -56,6 +56,7 @@ from scorekeeper.metrics.judges import make_judge
 from scorekeeper.metrics.judges.base import UsageAccumulator, collect_usage
 from scorekeeper.metrics.rollup import platform_average, scenario_average, turn_score
 from scorekeeper.metrics.selection import resolve_scenario
+from scorekeeper.retrieved_context import RetrievedContext
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +295,12 @@ class EvalRunner:
             response=turn.response,
             turn_number=turn.turn_number,
             history=list(history),
-            retrieved_context=turn.retrieved_context or "",
+            retrieved_context=RetrievedContext(
+                documents=[
+                    row.to_document()
+                    for row in sorted(turn.retrieved_documents, key=lambda r: r.rank)
+                ]
+            ),
             expected_output=turn.expected_output or "",
         )
 

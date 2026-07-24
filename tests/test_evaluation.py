@@ -27,6 +27,7 @@ from scorekeeper.database import (
     BenchmarkRun,
     MetricScore,
     PlatformExecution,
+    RetrievedContextDocument,
     ScenarioResult,
     SourceFile,
     Turn,
@@ -38,6 +39,7 @@ from scorekeeper.evaluation import (
     ingest_evaluation,
     project_turns,
     retrieve_runs,
+    retrieve_scenario_turns,
     retrieve_turn_traces,
     run_evaluation,
     score_run,
@@ -50,6 +52,7 @@ from scorekeeper.metrics.base import (
     TraceStep,
     TurnView,
 )
+from scorekeeper.metrics.catalog.hallucination import split_context_docs
 from scorekeeper.metrics.category import MetricCategory
 from scorekeeper.metrics.judge import JudgeVerdict
 from scorekeeper.metrics.registry import MetricRegistry
@@ -192,19 +195,19 @@ def test_project_turns_missing_side_becomes_empty_string() -> None:
             "turn_number": 1,
             "prompt": "solo pregunta",
             "response": "",
-            "retrieved_context": None,
+            "retrieved_context_source": None,
             "expected_output": None,
         }
     ]
 
 
-def test_project_turns_carries_context_and_expected() -> None:
+def test_project_turns_carries_context_source_and_expected() -> None:
     messages = [
         {
             "turn": 1,
             "role": "user",
             "content": "pregunta",
-            "retrieved_context": "doc recuperado",
+            "retrieved_context_source": "fuente (https://h/a.pdf#page=1)",
             "expected_output": "respuesta ideal",
         },
         {"turn": 1, "role": "model", "content": "respuesta"},
@@ -212,8 +215,34 @@ def test_project_turns_carries_context_and_expected() -> None:
 
     turns = project_turns(messages)
 
-    assert turns[0]["retrieved_context"] == "doc recuperado"
+    assert turns[0]["retrieved_context_source"] == "fuente (https://h/a.pdf#page=1)"
     assert turns[0]["expected_output"] == "respuesta ideal"
+
+
+def test_ingest_stores_raw_context_source_without_extracting(session: Session) -> None:
+    cell = "manual (https://ejemplo.com/manual.pdf#page=3)"
+    content = _xlsx_bytes(
+        ["turn", "role", "content", "retrieved_context"],
+        [
+            [1, "user", "pregunta", cell],
+            [1, "model", "respuesta", ""],
+        ],
+    )
+    files = [
+        UploadedFile(
+            filename="esc.xlsx", content=content, scenario_id="esc", use_case="default"
+        )
+    ]
+
+    ingest_evaluation("claude", files, session=session)
+
+    # Ingest stores the raw cell and does NOT extract documents — that is the retrieval
+    # stage's job (run later by the worker).
+    docs = session.execute(select(RetrievedContextDocument)).scalars().all()
+    assert docs == []
+    turn = session.execute(select(Turn)).scalars().one()
+    assert turn.retrieved_context_source == cell
+    assert turn.retrieved_documents == []
 
 
 def test_project_turns_joins_multiple_same_role_messages() -> None:
@@ -417,13 +446,22 @@ def test_endpoint_ingests_enqueues_and_returns_run_id(monkeypatch) -> None:
         return "run-123"
 
     monkeypatch.setattr(evaluation, "ingest_evaluation", fake_ingest)
-    monkeypatch.setattr(tasks, "enqueue_score_run", lambda run_id: captured.update(enqueued=run_id))
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
 
     with TestClient(app) as client:
         response = client.post(
             "/evaluations",
             files=[("files", ("esc1.xlsx", _conversation_bytes(), "application/octet-stream"))],
-            data={"payload": _payload(files={"esc1.xlsx": {"scenario_id": "custom", "use_case": "web_search"}})},
+            data={
+                "payload": _payload(
+                    files={
+                        "esc1.xlsx": {
+                            "scenario_id": "custom",
+                            "use_case": "faithfulness_ragas",
+                        }
+                    }
+                )
+            },
         )
 
     # 202 Accepted with the run id; scoring was enqueued, not run inline.
@@ -435,7 +473,7 @@ def test_endpoint_ingests_enqueues_and_returns_run_id(monkeypatch) -> None:
     assert captured["platform"] == "claude"
     upload = captured["files"][0]
     assert upload.scenario_id == "custom"
-    assert upload.use_case == "web_search"
+    assert upload.use_case == "faithfulness_ragas"
     assert upload.platform is None  # no per-file platform → falls back to payload
 
 
@@ -448,7 +486,7 @@ def test_endpoint_per_file_platform_override(monkeypatch) -> None:
         return "run-9"
 
     monkeypatch.setattr(evaluation, "ingest_evaluation", fake_ingest)
-    monkeypatch.setattr(tasks, "enqueue_score_run", lambda run_id: None)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: None)
 
     with TestClient(app) as client:
         response = client.post(
@@ -474,7 +512,7 @@ def test_endpoint_defaults_scenario_id_to_stem(monkeypatch) -> None:
         "ingest_evaluation",
         lambda platform, files, **kw: captured.update(files=files) or "run-x",
     )
-    monkeypatch.setattr(tasks, "enqueue_score_run", lambda run_id: None)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: None)
 
     with TestClient(app) as client:
         response = client.post(
@@ -788,6 +826,117 @@ def test_mcp_retrieve_turn_traces_coalesces_none(monkeypatch) -> None:
     assert server.retrieve_turn_traces("nope") == []
 
 
+# --- retrieve_scenario_turns + /scenarios/{scenario_id}/turns -----------------
+
+
+def test_retrieve_scenario_turns_returns_content_and_scores(
+    session: Session, registry
+) -> None:
+    _score_one(session)
+    scenario = session.execute(select(ScenarioResult)).scalars().one()
+
+    turns = retrieve_scenario_turns(str(scenario.id), session=session)
+
+    assert [t["turn_number"] for t in turns] == [1, 2]
+    first = turns[0]
+    # Conversation content is surfaced (unlike the /runs metric projection).
+    assert first["prompt"] == "hola"
+    assert first["response"] == "qué tal"
+    assert uuid.UUID(first["turn_id"])
+    assert first["turn_score"] == pytest.approx(0.8)
+    scores = first["metric_scores"]
+    assert scores[0]["metric_name"] == "utilidad"
+    assert scores[0]["score"] == pytest.approx(0.8)
+    assert scores[0]["judge_model"] == "judge-test"
+    # The structured trace is not surfaced here (read it via /turns/{id}/traces).
+    assert "trace" not in scores[0]
+
+
+def test_scenario_serialization_exposes_id(session: Session, registry) -> None:
+    _score_one(session)
+    scenario = session.execute(select(ScenarioResult)).scalars().one()
+
+    runs = retrieve_runs(granularity="scenario_results", session=session)
+
+    serialized = runs[0]["platforms"][0]["scenario_results"][0]
+    # The UUID handle GET /scenarios/{id}/turns takes, alongside the readable label.
+    assert serialized["id"] == str(scenario.id)
+    assert serialized["scenario_id"] == "esc1"
+
+
+def test_retrieve_scenario_turns_empty_scenario_returns_list(
+    session: Session,
+) -> None:
+    execution = PlatformExecution(platform="claude", run=BenchmarkRun())
+    scenario = ScenarioResult(
+        scenario_id="vacio", use_case="default", platform_execution=execution
+    )
+    session.add(scenario)
+    session.commit()
+
+    # A scenario with no turns yields [] (not None — it exists).
+    assert retrieve_scenario_turns(str(scenario.id), session=session) == []
+
+
+def test_retrieve_scenario_turns_unknown_or_malformed_is_none(
+    session: Session, registry
+) -> None:
+    _score_one(session)
+
+    assert retrieve_scenario_turns("not-a-uuid", session=session) is None
+    assert (
+        retrieve_scenario_turns(
+            "00000000-0000-0000-0000-000000000000", session=session
+        )
+        is None
+    )
+
+
+def test_scenario_turns_endpoint_forwards_and_returns(monkeypatch) -> None:
+    captured: dict = {}
+    payload = [
+        {
+            "turn_id": "11111111-1111-1111-1111-111111111111",
+            "turn_number": 1,
+            "prompt": "hola",
+            "response": "qué tal",
+            "expected_output": None,
+            "retrieved_context_source": None,
+            "turn_score": 0.8,
+            "metric_scores": [
+                {
+                    "metric_name": "utilidad",
+                    "score": 0.8,
+                    "judge_model": "judge-test",
+                    "rubric_version": "v1",
+                }
+            ],
+        }
+    ]
+
+    def fake(scenario_id):
+        captured["scenario_id"] = scenario_id
+        return payload
+
+    monkeypatch.setattr(evaluation, "retrieve_scenario_turns", fake)
+
+    with TestClient(app) as client:
+        response = client.get("/scenarios/abc/turns")
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    assert captured == {"scenario_id": "abc"}
+
+
+def test_scenario_turns_endpoint_unknown_404(monkeypatch) -> None:
+    monkeypatch.setattr(evaluation, "retrieve_scenario_turns", lambda *a, **k: None)
+
+    with TestClient(app) as client:
+        response = client.get("/scenarios/nope/turns")
+
+    assert response.status_code == 404
+
+
 def test_retrieve_default_granularity_is_scenario(session: Session, registry) -> None:
     _score_one(session)
 
@@ -854,3 +1003,179 @@ def test_retrieve_invalid_granularity_raises(session: Session) -> None:
 def test_retrieve_invalid_date_raises(session: Session) -> None:
     with pytest.raises(ValueError):
         retrieve_runs(start_date="ayer", session=session)
+
+
+# --- POST /captures -----------------------------------------------------------
+
+
+def test_captures_endpoint_ingests_and_enqueues(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_ingest(platform, files, *, session=None):
+        captured["platform"] = platform
+        captured["files"] = files
+        return "run-cap"
+
+    monkeypatch.setattr(evaluation, "ingest_evaluation", fake_ingest)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/captures",
+            json={
+                "platform": "gemini",
+                "use_case": "web_search",
+                "conversations": [
+                    {
+                        "scenario_id": "esc-navegador",
+                        "source_ref": "https://gemini.google.com/app/abc",
+                        "messages": [
+                            {"role": "user", "content": "¿Cuál es la capital?"},
+                            {"role": "model", "content": "Madrid."},
+                        ],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 202
+    assert response.json() == {"run_id": "run-cap", "status": "en_cola"}
+    assert captured["enqueued"] == "run-cap"
+    assert captured["platform"] == "gemini"
+    upload = captured["files"][0]
+    assert upload.scenario_id == "esc-navegador"
+    assert upload.use_case == "web_search"  # payload default, no per-conversation one
+    assert upload.filename == "https://gemini.google.com/app/abc"
+    assert upload.messages == [
+        {"role": "user", "content": "¿Cuál es la capital?"},
+        {"role": "model", "content": "Madrid."},
+    ]
+    # No file bytes exist, so the provenance hash covers the capture itself.
+    assert json.loads(upload.content.decode()) == upload.messages
+
+
+def test_captures_endpoint_per_conversation_overrides(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(
+        evaluation,
+        "ingest_evaluation",
+        lambda platform, files, **kw: captured.update(files=files) or "run-cap",
+    )
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: None)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/captures",
+            json={
+                "platform": "claude",
+                "conversations": [
+                    {
+                        "scenario_id": "esc1",
+                        "platform": "copilot",
+                        "use_case": "document_retrieval",
+                        "messages": [{"role": "user", "content": "Hola"}],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 202
+    upload = captured["files"][0]
+    assert upload.platform == "copilot"
+    assert upload.use_case == "document_retrieval"
+    # Without a source_ref the scenario id names the "file".
+    assert upload.filename == "esc1"
+
+
+def test_captures_endpoint_rejects_contentless_conversation() -> None:
+    with TestClient(app) as client:
+        response = client.post(
+            "/captures",
+            json={
+                "platform": "claude",
+                "conversations": [
+                    {"scenario_id": "vacio", "messages": [{"role": "user", "content": "  "}]}
+                ],
+            },
+        )
+
+    assert response.status_code == 400
+    assert "vacio" in response.json()["detail"]
+
+
+def test_captures_endpoint_requires_conversations() -> None:
+    with TestClient(app) as client:
+        response = client.post("/captures", json={"platform": "claude", "conversations": []})
+
+    assert response.status_code == 422
+
+
+def test_captured_messages_reach_turns_without_a_spreadsheet(session: Session) -> None:
+    """An UploadedFile carrying messages skips the .xlsx parser end to end."""
+    run_id = ingest_evaluation(
+        "claude",
+        [
+            UploadedFile(
+                filename="https://claude.ai/chat/abc",
+                content=b"{}",
+                scenario_id="esc-captura",
+                messages=[
+                    {"role": "user", "content": "Hola"},
+                    {"role": "model", "content": "¿Qué tal?"},
+                    {"role": "user", "content": "Adiós"},
+                    {"role": "model", "content": "Hasta luego"},
+                ],
+            )
+        ],
+        session=session,
+    )
+
+    scenario = session.scalars(select(ScenarioResult)).one()
+    assert scenario.scenario_id == "esc-captura"
+    assert scenario.source_ref == "https://claude.ai/chat/abc"
+    # Turns were derived from role alternation: two user+model pairs.
+    turns = sorted(scenario.turns, key=lambda t: t.turn_number)
+    assert [(t.turn_number, t.prompt, t.response) for t in turns] == [
+        (1, "Hola", "¿Qué tal?"),
+        (2, "Adiós", "Hasta luego"),
+    ]
+    assert scenario.raw_conversation["messages"][0]["turn"] == 1
+    assert str(session.get(BenchmarkRun, uuid.UUID(run_id)).status) == "en_cola"
+
+
+def test_captured_citations_reach_turn_context(session: Session) -> None:
+    """Sources scraped off a chat UI land on the turn as ``retrieved_context_source``.
+
+    Mirrors what the extension's Copilot adapter produces: a turn whose answer
+    arrives in two model messages (an interstitial, then the real answer) with the
+    citations attached to the second one.
+    """
+    context = (
+        "eleconomista.com.mx\nhttps://www.eleconomista.com.mx/tags/grupo-mexico-861"
+        "\n\nforbes.com\nhttps://www.forbes.com/lists/global2000/"
+    )
+
+    ingest_evaluation(
+        "copilot",
+        [
+            UploadedFile(
+                filename="https://m365.cloud.microsoft/chat/",
+                content=b"{}",
+                scenario_id="esc-citas",
+                messages=[
+                    {"role": "user", "content": "Noticias sobre Grupo México"},
+                    {"role": "model", "content": "Conectar para continuar"},
+                    {"role": "model", "content": "Tres noticias", "retrieved_context": context},
+                ],
+            )
+        ],
+        session=session,
+    )
+
+    turn = session.scalars(select(ScenarioResult)).one().turns[0]
+    # Both model messages joined into one response, and the context survived even
+    # though it hung off the second of them.
+    assert turn.response == "Conectar para continuar\nTres noticias"
+    assert turn.retrieved_context_source == context
+    # Two blank-line-separated blocks, so the metrics see two retrieved documents.
+    assert len(split_context_docs(turn.retrieved_context_source)) == 2

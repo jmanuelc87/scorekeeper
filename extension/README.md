@@ -1,0 +1,250 @@
+# Scorekeeper Capture (extensión de Chrome)
+
+Captures the conversation open in Copilot, Gemini (consumer or Enterprise) or
+Claude and sends it to the Scorekeeper API for scoring — the live-session counterpart to uploading a
+conversation `.xlsx`. It is a Manifest V3 extension with no build step and no
+dependencies: the folder is loaded as-is.
+
+## Install
+
+1. Start the backend (`docker compose up --build`, or `uv run scorekeeper-api`
+   plus a worker). The extension talks to `http://localhost:8001` by default.
+2. Open `chrome://extensions` and turn on **Developer mode**.
+3. Click **Load unpacked** and pick this `extension/` folder.
+4. Optional: pin the extension so its icon stays in the toolbar.
+
+Point it at a different API from the extension's **Ajustes** (options) page. Any
+host other than the default needs a permission Chrome only grants from a click,
+so the options page asks for it when you save.
+
+## Use
+
+1. Open a conversation on a supported chat (see below) and let it finish
+   rendering — only what is in the DOM gets captured, so scroll up if the app
+   virtualizes long threads.
+2. Click the extension icon. The popup reports how many messages it found and
+   pre-fills the platform, a scenario id (page title + timestamp) and the default
+   use case.
+3. Adjust the metadata and press **Enviar a Scorekeeper**.
+
+The popup keeps a local history of the runs submitted from this browser. Its
+**Última evaluación** panel shows the run for the open chat only — matched on the
+chat URL (ignoring `?query` and `#hash`) — and its **Evaluaciones** link opens a
+full-page tab listing every run with its live status and a per-row refresh button.
+The worker keeps polling every non-terminal run even with both closed, and the
+toolbar badge tracks the newest one (`…` running, `✓` done, `!` partial/failed);
+once everything has finished successfully the `✓` clears itself after a few
+minutes, while a `!` stays until the next capture. Everything else — per-metric
+scores, comparisons — is in the API (`GET /runs`) and the dashboard.
+
+## Supported chats
+
+| Adapter | Site | Platform sent |
+|---|---|---|
+| `claude` | `claude.ai` | `claude` |
+| `gemini` | `gemini.google.com` | `gemini` |
+| `gemini-business` | `business.gemini.google` (Gemini Enterprise) | `gemini` |
+| `copilot` | `copilot.microsoft.com`, `m365.cloud.microsoft` | `copilot` |
+
+The platform is only a default — edit it in the popup before sending if you are
+benchmarking under another name.
+
+## How it works
+
+```mermaid
+flowchart TD
+    popup[popup]
+    evals[evaluations page]
+    worker[background.js worker]
+    capture[content/capture.js]
+    api[Scorekeeper API]
+    store[(chrome.storage.local<br/>run history)]
+
+    popup -- sendMessage --> worker
+    evals -- sendMessage --> worker
+    worker -- executeScript --> capture
+    capture -- "{messages, url}" --> worker
+    worker -- "POST {apiUrl}/captures → run_id" --> api
+    worker -- "GET {apiUrl}/evaluations/{id}<br/>(per open run, alarm 30s)" --> api
+    worker -- writes run history --> store
+    store -- storage.onChanged --> popup
+    store -- storage.onChanged --> evals
+```
+
+The service worker owns every network call. The popup is destroyed as soon as it
+loses focus, so it could not finish an upload it started; delegating also means a
+worker request to a host in `host_permissions` skips CORS, so no extra
+`CORS_ORIGINS` entry is needed for a locally-run API. Both UI surfaces are pure
+readers: they ask the worker to submit or re-poll and re-render off
+`storage.onChanged`, so neither owns state that dies when it closes.
+
+`capture.js` is injected on demand rather than declared in the manifest — the
+extension only reads a page while you have its popup open (`activeTab`), and has
+no standing access to any site.
+
+The same frame gets injected repeatedly: once when the popup opens to preview the
+chat, again when you send (the page is re-read so what is scored is the
+conversation as it stands at send time). `executeScript` runs the file as a
+classic script in the extension's isolated world, and **that world's global scope
+survives between injections** — it is only reset when the frame navigates. So
+`capture.js` keeps its whole body inside an IIFE and declares nothing at top
+level. Unwrap it and capture works exactly once per page load: the second
+injection dies on `SyntaxError: Identifier 'ADAPTERS' has already been declared`,
+and the popup comes up blank until you reload the page.
+
+The captured turns reach the same database rows as an `.xlsx` upload: the API
+normalizes them through `scorekeeper.importer.normalize_messages` and ingests
+them with `ingest_evaluation`, so one capture is one `ScenarioResult` with its
+`Turn` rows. See [`docs/apis.md`](../docs/apis.md) for `POST /captures`.
+
+## Run history & the two surfaces
+
+Every submit appends a run to a single `runs` list in `chrome.storage.local`
+(newest first, capped at 25, oldest dropped). Each entry carries what the two UI
+surfaces need without another API call: `runId`, `scenarioId`, `platform`,
+`status`, `progress`, per-platform averages, `sourceUrl` (the chat it came from)
+and any transient `error`. The helpers that own this shape live in
+`src/config.js` (`getRuns`, `getRun`, `upsertRun`); a pre-history single `lastRun`
+key is folded into the list once on first read, so upgrading loses nothing.
+
+The worker polls **every** non-terminal run on the 30s alarm and clears the alarm
+only once all of them are terminal (`completado`, `parcial`, `fallido`), so
+several captures scored at once all keep advancing. A `refresh` message re-polls
+one run on demand — behind the popup panel's button and each table row.
+
+The badge reflects the newest run. When all runs are terminal and the newest
+succeeded, a second alarm (`CLEAR_BADGE_ALARM`, `CLEAR_BADGE_MINUTES`) wipes the
+`✓` after a delay — long enough to notice, so the icon does not carry a stale
+green tick indefinitely. It re-checks state when it fires (a capture started in
+the meantime cancels it), and a `!` from a partial/failed run is left in place.
+
+Two surfaces read that one store, each re-rendering on `storage.onChanged`:
+
+- **Popup — “Última evaluación”.** Shows the run for the *open chat only*. The run
+  is matched by comparing the tab URL to each `sourceUrl` through
+  `normalizeChatUrl` (`src/config.js`), which drops `?query` and `#hash`: the
+  conversation lives in the path (`claude.ai/chat/<id>`) and a new message never
+  changes it, while trackers and scroll anchors do. No match → the panel is
+  hidden, keeping another chat's result from showing under this one.
+- **Evaluations page** (`src/evaluations/`, opened from the popup's
+  **Evaluaciones** link via `chrome.tabs.create`). A full-page tab listing every
+  run — scenario, platform, status, progress, average, a link back to the source
+  chat, and a per-row refresh for the ones still scoring.
+
+## Maintaining the adapters
+
+The selectors in `src/content/capture.js` are the only part coupled to somebody
+else's markup, and these vendors reskin often. Each role lists **candidate
+selectors tried in order**, so capture survives a redesign as long as one
+candidate still matches, and an obsolete candidate can stay below a new one.
+
+When a platform stops capturing:
+
+1. Open the chat, right-click one message bubble → **Inspect**.
+2. Find the element wrapping the whole bubble (the outermost node holding just
+   that one message) and note a stable attribute — a `data-testid` or a custom
+   element name beats a hashed class.
+3. Add it at the **top** of that role's candidate list in the adapter.
+4. Reload the extension at `chrome://extensions` and re-open the popup.
+
+Message text is read with `innerText` so code blocks and lists keep their line
+breaks; lines that are nothing but interface chrome (`Copiar`, `Retry`, …) are
+dropped by the `UI_NOISE` patterns in the same file.
+
+### Apps built out of web components
+
+Some chats render entirely inside shadow DOM — Gemini Enterprise puts the whole
+conversation behind ~1,200 open shadow roots, two boundaries deep, where plain
+`document.querySelectorAll` matches *nothing*. Every selector is therefore
+resolved with `deepQueryAll`, one depth-first walk that descends into each
+element's `shadowRoot`. On an ordinary page it returns exactly what
+`querySelectorAll` would.
+
+A selector still cannot cross a shadow boundary *within itself*: `a b` only
+matches when `b` is a light-DOM descendant of `a`. So when the role selector
+lands on a wrapper and the text lives one shadow root further in, the adapter
+declares a `content` selector list, and the message is read from the first
+**non-empty** match inside the bubble (first non-empty, because a component that
+streams its markdown may leave empty stand-ins of the same shape beside the real
+one). This also drops surrounding furniture for free — a `content` of
+`.markdown-document` never sees the copy button, the thinking header or the
+feedback footer, because none of them are inside it.
+
+## Layout
+
+| Path | Role |
+|---|---|
+| `manifest.json` | MV3 manifest: permissions, popup, options, worker. |
+| `src/background.js` | Service worker — injection, `POST /captures`, polls every open run, badge. |
+| `src/config.js` | Shared defaults, run-history + `chrome.storage.local` helpers, chat-URL match, permission request. |
+| `src/content/capture.js` | Per-platform adapters; the only DOM-coupled file. |
+| `src/popup/` | Capture form and the open chat's evaluation panel. |
+| `src/evaluations/` | Full-page tab: the table of every run, with per-row refresh. |
+| `src/options/` | API URL, default use case, connection test; persisted per browser. |
+| `icons/` | Toolbar and Web Store icons. |
+
+## Limits
+
+- Only the messages currently in the DOM are captured; a thread the app has
+  virtualized away needs scrolling back first.
+- Attachments, images and rendered artifacts are not captured — text only.
+- `retrieved_context` is captured only where a platform exposes its citations in
+  the DOM (today: Microsoft Copilot and Gemini Enterprise — see below). Elsewhere
+  it is absent, and the metrics that need it degrade: `hallucination` returns a
+  free perfect score and `contextual_precision` a floor of 0, so those scenarios
+  are better served by an `.xlsx` upload carrying a context column.
+- `expected_output` is never scrapable — a chat UI has no reference answer. Only
+  an `.xlsx` upload can supply it.
+
+## Citations → `retrieved_context`
+
+An adapter may declare a `citations` block. What it matches becomes the message's
+`retrieved_context`: a JSON array of `{name, url}` records, one element per unique
+source (`name` omitted when the source has no title). The backend stores that JSON
+in the column and `split_context_docs` renders one retrieved document per element.
+
+```json
+[
+  {"name": "es.finance.yahoo.com", "url": "https://es.finance.yahoo.com/quote/GMEXICOB.MX/"},
+  {"name": "es-us.finanzas.yahoo.com", "url": "https://es-us.finanzas.yahoo.com/quote/SCCO/"}
+]
+```
+
+`containers` says where the chips are; the rest of the block says how that
+platform stores its URLs, and there are two shapes:
+
+| Field | Meaning | Used by |
+|---|---|---|
+| `json` | a `dataset` key on the chip holding `[{name, url}]` | `copilot` |
+| `links` + `label` | selectors for one link per source, plus the attributes to read its name from | `gemini-business` |
+
+For Microsoft Copilot the URLs sit on the inline citation chips as a JSON
+`data-grouped-citations` attribute. The visible "Sources" flyout is a dead end —
+it stays collapsed until clicked and contains only the word "Sources".
+
+Gemini Enterprise instead keeps them in the popover each chip opens, inside the
+chip's own shadow root: `a.single-popover-link` when the chip cites one source,
+one `md-menu-item` per source once it carries a "+N" badge. Both selectors are
+tried on every chip, since one answer mixes the two shapes. The popovers also
+carry an excerpt of the retrieved page, deliberately not captured — it runs to
+several thousand characters per source and would dominate the judge's prompt.
+
+Only what was actually *retrieved* is recorded, never the sentence a chip is
+anchored to: that text is the model's own output, and grounding a response
+against itself would score every model as perfectly faithful.
+
+## Chrome inside a bubble
+
+Any adapter may declare a `chrome` selector list for furniture inside a bubble
+whose text is not part of the message — accessible headings ("You said:", "Tú
+dijiste"), the agent-name badge, the copy/feedback bar, the "may make mistakes"
+disclaimer. Lines equal to those elements' text are dropped, so unlike the
+wording-based `UI_NOISE` patterns a label can never eat a line of real
+conversation that merely resembles it.
+
+Both Microsoft Copilot and Gemini need this. Gemini's labels are Angular CDK
+`cdk-visually-hidden` elements — clipped rather than removed from layout, so
+`innerText` picks them up and every user turn would otherwise start with "Tú
+dijiste". An element `innerText` skips anyway costs nothing here: it contributes
+no text, so it removes no lines, which makes a defensive entry safe to add for
+furniture that only surfaces on the fallback selectors.

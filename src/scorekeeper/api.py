@@ -1,4 +1,8 @@
+import json
+from datetime import datetime
 from pathlib import Path
+from typing import Any
+from uuid import UUID
 
 import structlog
 import uvicorn
@@ -9,6 +13,11 @@ from pydantic import BaseModel, Field
 from scorekeeper import evaluation, tasks
 from scorekeeper.config import get_settings
 from scorekeeper.logging_config import configure_logging
+from scorekeeper.retrieval.credentials import service as auth_providers
+from scorekeeper.retrieval.credentials.service import (
+    ProviderConflictError,
+    ProviderValidationError,
+)
 
 settings = get_settings()
 
@@ -23,7 +32,7 @@ app = FastAPI(title="Scorekeeper Results API", version="0.1.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -45,6 +54,38 @@ class EvaluationPayload(BaseModel):
     use_case: str = evaluation.DEFAULT_USE_CASE
     # Optional per-filename overrides; a file with no entry uses the defaults.
     files: dict[str, FileOverride] = Field(default_factory=dict)
+
+
+class CaptureMessage(BaseModel):
+    """One scraped chat bubble: who said it and what it said."""
+
+    role: str = Field(..., min_length=1)  # user | model (aliases are normalized)
+    content: str = ""
+    # Explicit turn number; omitted for every message means turns are derived
+    # (each user message following a non-user message opens a new turn).
+    turn: int | None = None
+    retrieved_context: str | None = None
+    expected_output: str | None = None
+
+
+class CaptureConversation(BaseModel):
+    """One captured conversation — the JSON twin of one uploaded ``.xlsx`` file."""
+
+    scenario_id: str = Field(..., min_length=1)
+    messages: list[CaptureMessage] = Field(..., min_length=1)
+    # Overrides the payload-level defaults for just this conversation.
+    use_case: str | None = None
+    platform: str | None = None
+    # Where the capture came from (e.g. the chat URL); stored as the source ref.
+    source_ref: str | None = None
+
+
+class CapturePayload(BaseModel):
+    """Body of ``POST /captures``: conversations scraped from a chat UI."""
+
+    platform: str = Field(..., min_length=1)
+    use_case: str = evaluation.DEFAULT_USE_CASE
+    conversations: list[CaptureConversation] = Field(..., min_length=1)
 
 
 class PlatformSummary(BaseModel):
@@ -95,9 +136,10 @@ def create_evaluation(
     sets one, otherwise under the payload-level ``platform``.
 
     Returns ``202`` with a ``run_id`` as soon as the upload is parsed and persisted
-    (status ``en_cola``); a Celery worker does the slow LLM scoring off the request
-    path. Poll ``GET /evaluations/{run_id}`` for progress and results. A malformed
-    sheet or bad input is still rejected synchronously here, before anything queues.
+    (status ``en_cola``); a Celery worker then runs the retrieval pipeline and the LLM
+    scoring off the request path. Poll ``GET /evaluations/{run_id}`` for progress and
+    results. A malformed sheet or bad input is still rejected synchronously here, before
+    anything queues.
     """
     try:
         parsed_payload = EvaluationPayload.model_validate_json(payload)
@@ -143,8 +185,64 @@ def create_evaluation(
         logger.warning("POST /evaluations rechazado: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    tasks.enqueue_score_run(run_id)
+    tasks.enqueue_run(run_id)
     logger.info("POST /evaluations en cola: run_id=%s", run_id)
+    return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_EN_COLA)
+
+
+@app.post("/captures", response_model=EvaluationEnqueuedResponse, status_code=202)
+def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
+    """Ingest conversations captured from a chat UI and enqueue them for scoring.
+
+    The JSON twin of ``POST /evaluations`` for clients that already hold the turns
+    and have no spreadsheet to upload — the browser extension in ``extension/``
+    scrapes them off Copilot, Gemini and Claude. Each entry in ``conversations`` is
+    one scenario and follows the same platform rules as an uploaded file: its own
+    ``platform`` when set, otherwise the payload-level one.
+
+    Returns ``202`` with a ``run_id``; poll ``GET /evaluations/{run_id}`` for
+    progress and results, exactly as with an upload.
+    """
+    logger.info(
+        "POST /captures: %d conversación(es), plataforma=%s",
+        len(payload.conversations),
+        payload.platform,
+    )
+
+    uploads: list[evaluation.UploadedFile] = []
+    for conversation in payload.conversations:
+        messages = [
+            message.model_dump(exclude_none=True) for message in conversation.messages
+        ]
+        if not any(message.get("content", "").strip() for message in messages):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"La conversación {conversation.scenario_id!r} no tiene "
+                    "mensajes con contenido."
+                ),
+            )
+        source_ref = conversation.source_ref or conversation.scenario_id
+        uploads.append(
+            evaluation.UploadedFile(
+                filename=source_ref,
+                # No file bytes to hash, so the capture itself is the provenance.
+                content=json.dumps(messages, ensure_ascii=False).encode("utf-8"),
+                scenario_id=conversation.scenario_id,
+                use_case=conversation.use_case or payload.use_case,
+                platform=conversation.platform,
+                messages=messages,
+            )
+        )
+
+    try:
+        run_id = evaluation.ingest_evaluation(payload.platform, uploads)
+    except ValueError as exc:
+        logger.warning("POST /captures rechazado: %s", exc)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    tasks.enqueue_run(run_id)
+    logger.info("POST /captures en cola: run_id=%s", run_id)
     return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_EN_COLA)
 
 
@@ -160,6 +258,49 @@ def get_evaluation(run_id: str) -> EvaluationResponse:
     if summary is None:
         raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
     return EvaluationResponse.model_validate(summary)
+
+
+class ScenarioTurnMetric(BaseModel):
+    """One metric's score on a turn (without its structured trace)."""
+
+    metric_name: str
+    score: float
+    judge_model: str | None = None
+    rubric_version: str | None = None
+
+
+class ScenarioTurn(BaseModel):
+    """One turn of a scenario: its conversation content plus per-metric scores."""
+
+    turn_id: str
+    turn_number: int
+    prompt: str
+    response: str
+    expected_output: str | None = None
+    retrieved_context_source: str | None = None
+    turn_score: float | None = None
+    metric_scores: list[ScenarioTurnMetric]
+
+
+@app.get("/scenarios/{scenario_id}/turns", response_model=list[ScenarioTurn])
+def get_scenario_turns(scenario_id: str) -> list[dict]:
+    """Return a scenario's turns, in ``turn_number`` order.
+
+    ``scenario_id`` is a ``ScenarioResult`` id (its UUID) — the unique handle for one
+    conversation scored under one platform in one run; it is surfaced as ``id`` on each
+    scenario in ``GET /runs``. The non-unique human-readable ``scenario_id`` label is
+    not accepted here.
+
+    Each turn carries its content (``prompt``/``response``/``expected_output``/
+    ``retrieved_context_source``), rolled-up ``turn_score`` and per-metric scores.
+    ``404`` when the ``scenario_id`` is unknown or malformed.
+    """
+    turns = evaluation.retrieve_scenario_turns(scenario_id)
+    if turns is None:
+        raise HTTPException(
+            status_code=404, detail=f"El escenario {scenario_id!r} no existe."
+        )
+    return turns
 
 
 @app.get("/turns/{turn_id}/traces")
@@ -218,6 +359,119 @@ def list_runs(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+# --- Auth provider CRUD ---------------------------------------------------------------
+#
+# Manage the retrieval pipeline's credential store (the ``auth_providers`` table). The
+# certificate ``private_key`` is **write-only**: it is accepted on create/update, stored
+# encrypted, and never returned — reads expose only ``has_private_key``. These endpoints
+# manage secrets and carry no built-in auth, so restrict them at the network/deployment layer.
+
+
+class AuthProviderCreate(BaseModel):
+    """Body for ``POST /auth-providers``. ``private_key`` is a PEM, stored encrypted."""
+
+    provider: str = Field(..., min_length=1, description="Provider kind, e.g. 'sharepoint'.")
+    host: str = Field(..., min_length=1, description="Gated host this row authorizes.")
+    enabled: bool = True
+    tenant_id: str | None = None
+    client_id: str | None = None
+    thumbprint: str | None = None
+    site_url: str | None = None
+    settings: dict[str, Any] | None = None
+    # Write-only certificate private key (PEM); encrypted at rest, never returned.
+    private_key: str | None = None
+
+
+class AuthProviderUpdate(BaseModel):
+    """Body for ``PATCH /auth-providers/{id}``. Only the fields present are changed.
+
+    Sending ``private_key`` rotates the stored key (a falsy value clears it); omitting it
+    leaves the key untouched.
+    """
+
+    provider: str | None = Field(None, min_length=1)
+    host: str | None = Field(None, min_length=1)
+    enabled: bool | None = None
+    tenant_id: str | None = None
+    client_id: str | None = None
+    thumbprint: str | None = None
+    site_url: str | None = None
+    settings: dict[str, Any] | None = None
+    private_key: str | None = None
+
+
+class AuthProviderRead(BaseModel):
+    """Safe read view of an ``auth_providers`` row — no secret material."""
+
+    id: str
+    provider: str
+    host: str
+    enabled: bool
+    tenant_id: str | None
+    client_id: str | None
+    thumbprint: str | None
+    site_url: str | None
+    # Whether an (encrypted) certificate private key is stored; the key itself is never emitted.
+    has_private_key: bool
+    settings: dict[str, Any] | None
+    created_at: datetime
+    updated_at: datetime
+
+
+@app.get("/auth-providers", response_model=list[AuthProviderRead])
+def list_auth_providers(
+    provider: str | None = Query(None, description="Filtra por tipo de proveedor."),
+    host: str | None = Query(None, description="Coincidencia exacta de host."),
+    enabled: bool | None = Query(None, description="Filtra por estado habilitado."),
+) -> list[dict[str, Any]]:
+    """List configured credential providers (filters optional, AND-combined)."""
+    return auth_providers.list_providers(provider=provider, host=host, enabled=enabled)
+
+
+@app.post("/auth-providers", response_model=AuthProviderRead, status_code=201)
+def create_auth_provider(body: AuthProviderCreate) -> dict[str, Any]:
+    """Create a credential provider row. ``409`` on a duplicate ``(provider, host)``."""
+    try:
+        return auth_providers.create_provider(body.model_dump())
+    except ProviderValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProviderConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.get("/auth-providers/{provider_id}", response_model=AuthProviderRead)
+def get_auth_provider(provider_id: UUID) -> dict[str, Any]:
+    """Return one credential provider. ``404`` when the id is unknown."""
+    row = auth_providers.get_provider(provider_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"El proveedor {provider_id} no existe.")
+    return row
+
+
+@app.patch("/auth-providers/{provider_id}", response_model=AuthProviderRead)
+def update_auth_provider(provider_id: UUID, body: AuthProviderUpdate) -> dict[str, Any]:
+    """Partially update a credential provider. ``404`` unknown; ``409`` on a duplicate key."""
+    changes = body.model_dump(exclude_unset=True)
+    if not changes:
+        raise HTTPException(status_code=422, detail="No hay campos para actualizar.")
+    try:
+        row = auth_providers.update_provider(provider_id, changes)
+    except ProviderValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except ProviderConflictError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if row is None:
+        raise HTTPException(status_code=404, detail=f"El proveedor {provider_id} no existe.")
+    return row
+
+
+@app.delete("/auth-providers/{provider_id}", status_code=204)
+def delete_auth_provider(provider_id: UUID) -> None:
+    """Delete a credential provider. ``404`` when the id is unknown."""
+    if not auth_providers.delete_provider(provider_id):
+        raise HTTPException(status_code=404, detail=f"El proveedor {provider_id} no existe.")
 
 
 def main() -> None:

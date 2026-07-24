@@ -2,6 +2,8 @@
 
 Scorekeeper is an mcp server that benchmarks AI assistant platforms (Copilot, Gemini, Claude) by loading each conversation (user and model interactions) from a `.xlsx` file, storing every turn, and scoring each turn with an LLM-as-a-judge. Per-turn metric scores roll up into scenario- and platform-level averages. All scenarios, prompts, and evaluation outputs are in spanish.
 
+For a C4 view of how the pieces fit together (context, containers, and the retrieval components), see [docs/architecture.md](docs/architecture.md).
+
 ## Run everything with Docker
 
 ```bash
@@ -92,6 +94,15 @@ npm run dev
 ```
 
 Vite runs at `http://localhost:5173` and reads `VITE_API_URL` when provided.
+
+## Browser extension
+
+`extension/` is a Manifest V3 Chrome extension that captures the conversation open
+in Copilot, Gemini or Claude and posts it to `POST /captures` — the live-session
+alternative to uploading a conversation `.xlsx`. No build step: load the folder
+unpacked from `chrome://extensions` with **Developer mode** on. See
+[extension/README.md](extension/README.md) for the adapters it supports and how to
+update their selectors when a vendor reskins its chat.
 
 ## Checks
 

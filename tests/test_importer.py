@@ -8,7 +8,12 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook
 
-from scorekeeper.importer import parse_conversation, parse_conversation_json
+from scorekeeper.importer import (
+    normalize_messages,
+    parse_conversation,
+    parse_conversation_json,
+)
+from scorekeeper.metrics.catalog.hallucination import split_context_docs
 
 
 def _write_xlsx(path: Path, header: list[str], rows: list[list[object]]) -> Path:
@@ -135,7 +140,8 @@ def test_columns_override(tmp_path: Path) -> None:
     assert [m["content"] for m in result] == ["Hola", "Adiós"]
 
 
-def test_retrieved_context_column_is_parsed(tmp_path: Path) -> None:
+def test_retrieved_context_cell_is_stored_raw(tmp_path: Path) -> None:
+    # The importer stores the raw cell verbatim; the retrieval pipeline interprets it later.
     path = _write_xlsx(
         tmp_path / "with_context.xlsx",
         ["turn", "role", "content", "contexto recuperado"],
@@ -148,14 +154,36 @@ def test_retrieved_context_column_is_parsed(tmp_path: Path) -> None:
     result = parse_conversation(path)
 
     assert result == [
-        {"turn": 1, "role": "user", "content": "¿Política de devoluciones?", "retrieved_context": ""},
+        {
+            "turn": 1,
+            "role": "user",
+            "content": "¿Política de devoluciones?",
+            "retrieved_context_source": "",
+        },
         {
             "turn": 1,
             "role": "model",
             "content": "30 días con recibo.",
-            "retrieved_context": "Devoluciones en 30 días. Requiere recibo.",
+            "retrieved_context_source": "Devoluciones en 30 días. Requiere recibo.",
         },
     ]
+
+
+def test_retrieved_context_json_cell_stored_verbatim(tmp_path: Path) -> None:
+    # A JSON source-reference cell is stored verbatim — parsing/fetching is the pipeline's job.
+    cell = json.dumps(
+        [{"index": "1", "url": "https://ejemplo.com/manual.pdf#page=3", "name": "manual"}],
+        ensure_ascii=False,
+    )
+    path = _write_xlsx(
+        tmp_path / "json_context.xlsx",
+        ["role", "content", "contexto recuperado"],
+        [["model", "R", cell]],
+    )
+
+    result = parse_conversation(path)
+
+    assert result[0]["retrieved_context_source"] == cell
 
 
 def test_retrieved_context_absent_omits_key(tmp_path: Path) -> None:
@@ -202,7 +230,7 @@ def test_retrieved_context_and_expected_output_together(tmp_path: Path) -> None:
 
     result = parse_conversation(path)
 
-    assert result[0]["retrieved_context"] == "ctx"
+    assert result[0]["retrieved_context_source"] == "ctx"
     assert result[0]["expected_output"] == "ref"
 
 
@@ -245,3 +273,87 @@ def test_output_round_trips_through_json(tmp_path: Path) -> None:
 
     assert json.loads(payload) == [{"turn": 1, "role": "user", "content": "Café con acentós"}]
     assert "Café" in payload  # ensure_ascii=False preserves accents.
+
+
+# --- normalize_messages -------------------------------------------------------
+
+
+def test_normalize_messages_derives_turns_and_aliases_roles() -> None:
+    messages = normalize_messages(
+        [
+            {"role": "usuario", "content": "  Hola  "},
+            {"role": "assistant", "content": "¿En qué ayudo?"},
+            {"role": "user", "content": "Dame una reseña."},
+            {"role": "modelo", "content": "Con gusto."},
+        ]
+    )
+
+    assert messages == [
+        {"turn": 1, "role": "user", "content": "Hola"},
+        {"turn": 1, "role": "model", "content": "¿En qué ayudo?"},
+        {"turn": 2, "role": "user", "content": "Dame una reseña."},
+        {"turn": 2, "role": "model", "content": "Con gusto."},
+    ]
+
+
+def test_normalize_messages_honors_explicit_turns() -> None:
+    messages = normalize_messages(
+        [
+            {"turn": 7, "role": "user", "content": "Primero"},
+            {"turn": 7, "role": "model", "content": "Segundo"},
+        ]
+    )
+
+    assert [m["turn"] for m in messages] == [7, 7]
+
+
+def test_normalize_messages_drops_empty_rows_and_optional_keys() -> None:
+    messages = normalize_messages(
+        [
+            {"role": "", "content": ""},
+            {"role": "user", "content": "Hola", "expected_output": " esperado "},
+        ]
+    )
+
+    # The blank row is gone; expected_output is carried, retrieved_context is not
+    # in the input so it stays absent.
+    assert messages == [
+        {"turn": 1, "role": "user", "content": "Hola", "expected_output": "esperado"}
+    ]
+
+
+def test_normalize_messages_keeps_scraped_citation_blocks_intact() -> None:
+    """The browser extension's `retrieved_context` survives normalization verbatim.
+
+    The extension joins one block per cited source with a blank line, because that
+    is what ``split_context_docs`` splits on downstream. Normalization only strips
+    the ends, so the interior blank lines that carry that meaning must remain.
+    """
+    context = (
+        "es.finance.yahoo.com\n"
+        "https://es.finance.yahoo.com/quote/GMEXICOB.MX/\n"
+        "\n"
+        "es-us.finanzas.yahoo.com\n"
+        "https://es-us.finanzas.yahoo.com/quote/SCCO/"
+    )
+
+    messages = normalize_messages(
+        [
+            {"role": "user", "content": "Precio de GMEXICOB y SCCO"},
+            {"role": "model", "content": "Tabla comparativa", "retrieved_context": context},
+        ]
+    )
+
+    assert messages == [
+        {"turn": 1, "role": "user", "content": "Precio de GMEXICOB y SCCO"},
+        {
+            "turn": 1,
+            "role": "model",
+            "content": "Tabla comparativa",
+            "retrieved_context": context,
+        },
+    ]
+    assert split_context_docs(messages[1]["retrieved_context"]) == [
+        "es.finance.yahoo.com\nhttps://es.finance.yahoo.com/quote/GMEXICOB.MX/",
+        "es-us.finanzas.yahoo.com\nhttps://es-us.finanzas.yahoo.com/quote/SCCO/",
+    ]
