@@ -1,10 +1,10 @@
 import json
-import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+import structlog
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -12,20 +12,19 @@ from pydantic import BaseModel, Field
 
 from scorekeeper import evaluation, tasks
 from scorekeeper.config import get_settings
+from scorekeeper.logging_config import configure_logging
 from scorekeeper.retrieval.credentials import service as auth_providers
 from scorekeeper.retrieval.credentials.service import (
     ProviderConflictError,
     ProviderValidationError,
 )
 
-# Surface app (INFO) logs in the container output; uvicorn only configures its own
-# loggers, so without this our progress logs would be swallowed.
-logging.basicConfig(level=logging.INFO)
-# httpx logs every judge request at INFO, which floods the output; quiet it.
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logger = logging.getLogger("scorekeeper.api")
-
 settings = get_settings()
+
+# Plain-text logging to stdout. uvicorn only configures its own loggers, so
+# without this our app events would be swallowed.
+configure_logging(settings.log_level)
+logger = structlog.get_logger("scorekeeper.api")
 
 # The database schema is owned by Alembic — run `alembic upgrade head`
 # before starting the app (the compose `migrate` service does this).
@@ -322,6 +321,29 @@ def get_turn_traces(
     if traces is None:
         raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
     return traces
+
+
+class TurnTokenUsage(BaseModel):
+    """A turn's raw LLM token usage; ``total_tokens`` is the derived ``input + output``."""
+
+    turn_id: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+
+@app.get("/turns/{turn_id}/token-usage", response_model=TurnTokenUsage)
+def get_turn_token_usage(turn_id: str) -> dict:
+    """Return the LLM token usage for scoring one turn (no aggregation).
+
+    The turn's 1:1 ``TurnTokenUsage``: ``input_tokens``, ``output_tokens`` and the
+    derived ``total_tokens``. A turn that was never scored reports zeros. ``404`` when
+    the ``turn_id`` is unknown or malformed.
+    """
+    usage = evaluation.retrieve_turn_token_usage(turn_id)
+    if usage is None:
+        raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
+    return usage
 
 
 @app.get("/runs")

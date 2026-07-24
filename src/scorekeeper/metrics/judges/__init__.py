@@ -16,6 +16,7 @@ from scorekeeper.metrics.judges.anthropic_judge import AnthropicJudge
 from scorekeeper.metrics.judges.base import JudgeError, StepModels
 from scorekeeper.metrics.judges.lmstudio_judge import LMStudioJudge
 from scorekeeper.metrics.judges.openai_judge import OpenAIJudge
+from scorekeeper.metrics.judges.tracing import TracingJudge
 
 if TYPE_CHECKING:
     from scorekeeper.config import Settings
@@ -26,6 +27,7 @@ __all__ = [
     "JudgeError",
     "LMStudioJudge",
     "OpenAIJudge",
+    "TracingJudge",
     "make_judge",
 ]
 
@@ -49,11 +51,24 @@ def _step_models(settings: Settings, default_model: str) -> StepModels:
     )
 
 
+def _traced(judge: Judge, settings: Settings) -> Judge:
+    """Wrap ``judge`` in a ``TracingJudge`` when ``judge_trace_enabled`` is set.
+
+    Off by default, so the returned judge is the bare provider judge unless the
+    operator opts in — tracing is observational and never changes scoring.
+    """
+    if settings.judge_trace_enabled:
+        return TracingJudge(judge)
+    return judge
+
+
 def make_judge(settings: Settings | None = None) -> Judge:
     """Build the judge configured by ``settings`` (defaults to ``get_settings()``).
 
     Reads ``judge_provider`` and the matching model/API-key settings. Raises a
     Spanish ``ValueError`` when the provider is unknown or its API key is missing.
+    When ``judge_trace_enabled`` is set, the built judge is wrapped so every LLM
+    API call is traced (see :class:`~scorekeeper.metrics.judges.tracing.TracingJudge`).
     """
     settings = settings or get_settings()
     provider = settings.judge_provider.strip().lower()
@@ -73,36 +88,45 @@ def make_judge(settings: Settings | None = None) -> Judge:
                 api_key=settings.openai_api_key,
                 embedding_model=settings.openai_embedding_model,
             )
-        return AnthropicJudge(
-            model=settings.anthropic_judge_model,
-            api_key=settings.anthropic_api_key,
-            max_tokens=settings.judge_max_tokens,
-            system_prompt=settings.judge_system_prompt,
-            embedder=embedder,
-            step_models=_step_models(settings, settings.anthropic_judge_model),
+        return _traced(
+            AnthropicJudge(
+                model=settings.anthropic_judge_model,
+                api_key=settings.anthropic_api_key,
+                max_tokens=settings.judge_max_tokens,
+                system_prompt=settings.judge_system_prompt,
+                embedder=embedder,
+                step_models=_step_models(settings, settings.anthropic_judge_model),
+            ),
+            settings,
         )
 
     if provider == "openai":
         if not settings.openai_api_key:
             raise ValueError("Falta OPENAI_API_KEY para el juez de OpenAI.")
-        return OpenAIJudge(
-            model=settings.openai_judge_model,
-            api_key=settings.openai_api_key,
-            system_prompt=settings.judge_system_prompt,
-            embedding_model=settings.openai_embedding_model,
-            step_models=_step_models(settings, settings.openai_judge_model),
+        return _traced(
+            OpenAIJudge(
+                model=settings.openai_judge_model,
+                api_key=settings.openai_api_key,
+                system_prompt=settings.judge_system_prompt,
+                embedding_model=settings.openai_embedding_model,
+                step_models=_step_models(settings, settings.openai_judge_model),
+            ),
+            settings,
         )
 
     if provider in ("lmstudio", "local", "lm-studio"):
         # Local OpenAI-compatible server (LM Studio). No API key gate: it needs none.
         # Remaps every requested/pinned model to the loaded local model, so all
         # metrics run end-to-end (see LMStudioJudge).
-        return LMStudioJudge(
-            model=settings.lmstudio_judge_model,
-            base_url=settings.lmstudio_base_url,
-            api_key=settings.lmstudio_api_key,
-            system_prompt=settings.judge_system_prompt,
-            embedding_model=settings.lmstudio_embedding_model,
+        return _traced(
+            LMStudioJudge(
+                model=settings.lmstudio_judge_model,
+                base_url=settings.lmstudio_base_url,
+                api_key=settings.lmstudio_api_key,
+                system_prompt=settings.judge_system_prompt,
+                embedding_model=settings.lmstudio_embedding_model,
+            ),
+            settings,
         )
 
     raise ValueError(

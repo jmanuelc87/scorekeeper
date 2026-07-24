@@ -47,11 +47,13 @@ from scorekeeper.database import (
     PlatformExecution,
     ScenarioResult,
     Turn,
+    TurnTokenUsage,
     _now,
 )
 from scorekeeper.metrics.base import Metric, MetricResult, TurnView
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.judges import make_judge
+from scorekeeper.metrics.judges.base import UsageAccumulator, collect_usage
 from scorekeeper.metrics.rollup import platform_average, scenario_average, turn_score
 from scorekeeper.metrics.selection import resolve_scenario
 from scorekeeper.retrieved_context import RetrievedContext
@@ -192,7 +194,10 @@ class EvalRunner:
         logger.info(
             "Turno %s: evaluando %d métrica(s) en paralelo", turn.turn_number, len(metrics)
         )
-        for result in self._evaluate_metrics(view, metrics, turn.turn_number):
+        # One accumulator for the whole turn — every metric thread adds each judge
+        # call's tokens to it (see _evaluate_metrics), so the snapshot is the turn total.
+        usage = UsageAccumulator()
+        for result in self._evaluate_metrics(view, metrics, turn.turn_number, usage):
             turn.metric_scores.append(
                 MetricScore(
                     metric_name=result.metric_name,
@@ -210,6 +215,7 @@ class EvalRunner:
                 result.raw_score,
             )
         turn.turn_score = turn_score(turn.metric_scores)
+        self._record_turn_usage(turn, usage)
         self.session.commit()
         logger.info(
             "Turno %s puntuado: turn_score=%s (%d métrica(s) exitosa(s))",
@@ -219,23 +225,36 @@ class EvalRunner:
         )
 
     def _evaluate_metrics(
-        self, view: TurnView, metrics: list[Metric], turn_number: int
+        self,
+        view: TurnView,
+        metrics: list[Metric],
+        turn_number: int,
+        usage: UsageAccumulator,
     ) -> list[MetricResult]:
         """Evaluate every metric concurrently — one thread each — and return the
         surviving results in metric-declaration order.
 
         Only ``metric.evaluate`` runs off-thread: it takes the ORM-free ``view`` and
-        the shared, thread-safe ``judge`` and touches no session state. Results are
-        placed by metric index so the caller writes ``MetricScore`` rows in a stable
-        order regardless of which judge call finishes first. A metric that raises is
-        logged and dropped (skip-metric-continue).
+        the shared, thread-safe ``judge`` and touches no session state. Each worker
+        activates the shared per-turn ``usage`` accumulator for the duration of its
+        evaluate() (``collect_usage`` must run *inside* the worker — ThreadPoolExecutor
+        threads do not inherit the caller's context — and it resets on exit so nothing
+        leaks to the next task on a reused thread). Results are placed by metric index
+        so the caller writes ``MetricScore`` rows in a stable order regardless of which
+        judge call finishes first. A metric that raises is logged and dropped
+        (skip-metric-continue).
         """
         if not metrics:
             return []
+
+        def _evaluate(metric: Metric) -> MetricResult:
+            with collect_usage(usage):
+                return metric.evaluate(view, self.judge)
+
         results: list[MetricResult | None] = [None] * len(metrics)
         with ThreadPoolExecutor(max_workers=len(metrics)) as pool:
             futures = {
-                pool.submit(metric.evaluate, view, self.judge): index
+                pool.submit(_evaluate, metric): index
                 for index, metric in enumerate(metrics)
             }
             for future in as_completed(futures):
@@ -250,6 +269,23 @@ class EvalRunner:
                         exc,
                     )
         return [result for result in results if result is not None]
+
+    @staticmethod
+    def _record_turn_usage(turn: Turn, usage: UsageAccumulator) -> None:
+        """Persist the turn's summed token usage as its 1:1 ``TurnTokenUsage`` row.
+
+        Updates the existing row in place when re-scoring (keeps a single row per
+        turn, avoiding the unique-constraint churn of delete-then-insert).
+        """
+        snapshot = usage.snapshot()
+        if turn.token_usage is None:
+            turn.token_usage = TurnTokenUsage(
+                input_tokens=snapshot.input_tokens,
+                output_tokens=snapshot.output_tokens,
+            )
+        else:
+            turn.token_usage.input_tokens = snapshot.input_tokens
+            turn.token_usage.output_tokens = snapshot.output_tokens
 
     # ---- Helpers ------------------------------------------------------------
     def _to_turn_view(self, turn: Turn, history: list[tuple[str, str]]) -> TurnView:

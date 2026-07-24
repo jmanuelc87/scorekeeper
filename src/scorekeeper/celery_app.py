@@ -14,12 +14,11 @@ safe to import from the API process and from tests.
 
 from __future__ import annotations
 
-import logging
-
 from celery import Celery
 from celery.signals import after_setup_logger, after_setup_task_logger
 
 from scorekeeper.config import get_settings
+from scorekeeper.logging_config import configure_logging
 
 celery_app = Celery(
     "scorekeeper",
@@ -38,26 +37,16 @@ celery_app.conf.update(
 )
 
 
-def _quiet_http_request_logging() -> None:
-    """Silence the per-request HTTP INFO logs from the judge's HTTP client.
-
-    Each judge call makes the ``httpx`` client log ``HTTP Request: POST
-    https://api.anthropic.com/v1/messages`` at INFO, which floods the worker output
-    (one line per metric per turn). Our own evaluation logs are the signal we want, so
-    keep httpx/httpcore at WARNING.
-    """
-    logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("httpcore").setLevel(logging.WARNING)
-
-
-# Celery owns logging in the worker and configures it on boot, so set the levels from
-# these signals (which fire *after* Celery's setup) rather than at import time — an
-# import-time level would be overwritten when Celery hijacks the root logger.
+# Celery owns logging in the worker and configures (and hijacks) it on boot, so
+# install our structlog dual output from these signals — which fire *after* Celery's
+# setup — with force=True to override it. Configuring at import time would be
+# overwritten when Celery reconfigures the root logger. This also quiets the httpx
+# per-request INFO lines that would otherwise flood the worker output.
 @after_setup_logger.connect
 def _on_after_setup_logger(**_kwargs: object) -> None:
-    _quiet_http_request_logging()
+    configure_logging(get_settings().log_level, force=True)
 
 
 @after_setup_task_logger.connect
 def _on_after_setup_task_logger(**_kwargs: object) -> None:
-    _quiet_http_request_logging()
+    configure_logging(get_settings().log_level, force=True)

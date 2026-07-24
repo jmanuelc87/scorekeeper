@@ -1,0 +1,48 @@
+// Grafana Alloy: collect Docker container logs and ship them to Loki.
+//
+// Pipeline: discover containers off the Docker socket -> relabel compose metadata
+// into stable labels (service/project/container) -> read their logs -> push to
+// Loki. The app emits human-readable plain text (structlog), so lines are shipped
+// as-is; query-time parsing (LogQL) can pull out fields when needed.
+
+// Discover all running containers via the mounted Docker socket.
+discovery.docker "containers" {
+	host = "unix:///var/run/docker.sock"
+}
+
+// Map Docker/compose metadata onto the labels we want to query by.
+discovery.relabel "compose" {
+	targets = discovery.docker.containers.targets
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+		target_label  = "service"
+	}
+
+	rule {
+		source_labels = ["__meta_docker_container_label_com_docker_compose_project"]
+		target_label  = "project"
+	}
+
+	// Container names come through as "/name"; strip the leading slash.
+	rule {
+		source_labels = ["__meta_docker_container_name"]
+		regex         = "/(.*)"
+		target_label  = "container"
+	}
+}
+
+// Read logs for every discovered container and push straight to Loki with the
+// compose labels attached.
+loki.source.docker "default" {
+	host       = "unix:///var/run/docker.sock"
+	targets    = discovery.relabel.compose.output
+	labels     = {platform = "scorekeeper"}
+	forward_to = [loki.write.default.receiver]
+}
+
+loki.write "default" {
+	endpoint {
+		url = "http://loki:3100/loki/api/v1/push"
+	}
+}

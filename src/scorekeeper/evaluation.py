@@ -47,6 +47,7 @@ from scorekeeper.database import (
     SessionLocal,
     SourceFile,
     Turn,
+    TurnTokenUsage,
 )
 from scorekeeper.config import get_settings
 from scorekeeper.importer import normalize_messages, parse_conversation
@@ -442,6 +443,32 @@ def retrieve_turn_traces(
             db.close()
 
 
+def retrieve_turn_token_usage(
+    turn_id: str,
+    *,
+    session: Session | None = None,
+) -> dict[str, Any] | None:
+    """LLM token usage for scoring one turn, or ``None`` if the turn is unknown.
+
+    Returns the turn's 1:1 :class:`TurnTokenUsage` as
+    ``{"turn_id", "input_tokens", "output_tokens", "total_tokens"}`` (``total_tokens``
+    is the derived ``input + output``, never stored). This is a raw per-turn read — no
+    aggregation across turns, scenarios or platforms. A turn that was never scored (no
+    usage row) reports zeros. A malformed or unknown ``turn_id`` yields ``None`` (the
+    HTTP layer maps that to ``404``).
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        turn = _load_turn(db, turn_id)
+        if turn is None:
+            return None
+        return _serialize_turn_token_usage(turn)
+    finally:
+        if owns_session:
+            db.close()
+
+
 def retrieve_scenario_turns(
     scenario_id: str,
     *,
@@ -771,6 +798,21 @@ def _serialize_metric_trace(
         entry["rubric_version"] = score.rubric_version
     entry["trace"] = {"steps": score.trace.steps} if score.trace is not None else None
     return entry
+
+
+def _serialize_turn_token_usage(turn: Turn) -> dict[str, Any]:
+    """A turn's raw token usage; zeros when the turn has no usage row yet.
+
+    ``total_tokens`` is derived (``input + output``), matching ``TurnTokenUsage`` which
+    never stores the total.
+    """
+    usage = turn.token_usage or TurnTokenUsage(input_tokens=0, output_tokens=0)
+    return {
+        "turn_id": str(turn.id),
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "total_tokens": usage.input_tokens + usage.output_tokens,
+    }
 
 
 def _serialize_scenario_turn(turn: Turn) -> dict[str, Any]:
