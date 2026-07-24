@@ -11,8 +11,9 @@ Model Context Protocol — see [MCP tools](mcp.md).
 | Method & path                | Purpose |
 |------------------------------|---------|
 | `GET /health`                | Liveness probe. |
-| `POST /evaluations`          | Ingest conversation `.xlsx` files and **enqueue** them for scoring (per-file platform, defaulting to the payload platform). |
-| `POST /captures`             | Ingest conversations captured from a chat UI as JSON and **enqueue** them for scoring (the browser extension's entry point). |
+| `POST /evaluations`          | Ingest conversation `.xlsx` files for scoring (per-file platform, defaulting to the payload platform). Persists at `ingerido`; does **not** start scoring. |
+| `POST /captures`             | Ingest conversations captured from a chat UI as JSON for scoring (the browser extension's entry point). Persists at `ingerido`; does **not** start scoring. |
+| `POST /evaluations/{run_id}/start` | Start scoring an ingested run: flip it from `ingerido` to `en_cola` and **enqueue** the pipeline. |
 | `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity (HTTP twin of the MCP `retrieve` tool). |
 | `GET /scenarios/{scenario_id}/turns` | Retrieve one scenario's turns — conversation content plus per-metric scores. |
@@ -23,21 +24,25 @@ Model Context Protocol — see [MCP tools](mcp.md).
 | `DELETE /auth-providers/{id}`| Delete a credential provider row. |
 | `GET /turns/{turn_id}/traces` | Retrieve the structured metric traces for a single turn. |
 
-## Architecture: API enqueues, worker retrieves + scores
+## Architecture: ingestion is decoupled from scoring; the worker retrieves + scores
 
 Retrieval (fetching/extracting each turn's source documents) and scoring (the LLM judge, once
-per metric per turn) are both slow, so they run **off the request path**. `POST /evaluations`
-parses the upload and persists the run tree synchronously, then enqueues one Celery job and
-returns `202` immediately. A separate **worker** process
-(`celery -A scorekeeper.celery_app:celery_app worker`) consumes the queue and runs the pipeline
-orchestrator `run_pipeline_task`: **retrieval first, then scoring**
-(`evaluation.retrieve_run` → `evaluation.score_run`). The broker is the app's own Postgres
-(kombu's SQLAlchemy transport — no extra service); there is no Celery result backend, so
-clients track progress by polling `GET /evaluations/{run_id}`, which reads `BenchmarkRun.status`.
+per metric per turn) are both slow, so they run **off the request path**. Ingestion is also
+**decoupled from the start of scoring**: `POST /evaluations` (and `POST /captures`) parses the
+upload and persists the run tree synchronously at status `ingerido`, then returns `202` — it
+does **not** enqueue anything. Scoring starts only when a client calls
+`POST /evaluations/{run_id}/start`, which flips the run to `en_cola` and enqueues one Celery
+job. A separate **worker** process (`celery -A scorekeeper.celery_app:celery_app worker`)
+consumes the queue and runs the pipeline orchestrator `run_pipeline_task`: **retrieval first,
+then scoring** (`evaluation.retrieve_run` → `evaluation.score_run`). The broker is the app's own
+Postgres (kombu's SQLAlchemy transport — no extra service); there is no Celery result backend,
+so clients track progress by polling `GET /evaluations/{run_id}`, which reads
+`BenchmarkRun.status`.
 
-Run status lifecycle: `en_cola` (queued) → `en_recuperacion` (a worker is retrieving the
-turns' source documents) → `en_proceso` (a worker is scoring) → `completado` | `parcial` |
-`fallido` (terminal rollup; `fallido` also marks a run whose retrieval or scoring raised).
+Run status lifecycle: `ingerido` (persisted, not started) → `en_cola` (queued, after
+`/start`) → `en_recuperacion` (a worker is retrieving the turns' source documents) →
+`en_proceso` (a worker is scoring) → `completado` | `parcial` | `fallido` (terminal rollup;
+`fallido` also marks a run whose retrieval or scoring raised).
 
 ## `GET /health`
 
@@ -45,11 +50,13 @@ Liveness probe. Returns `200` with `{"status": "ok"}`. Takes no parameters.
 
 ## `POST /evaluations`
 
-Ingest uploaded conversation `.xlsx` files and enqueue them for scoring. Each file
+Ingest uploaded conversation `.xlsx` files and persist them for scoring. Each file
 is scored under its own platform (a per-file override, defaulting to the payload
 platform). Parsing and persistence happen synchronously (so a malformed sheet is
-rejected here); the LLM scoring runs later in the worker. This is the glue between
-the parser (`scorekeeper.importer`) and the scoring runner (`scorekeeper.runner`).
+rejected here). Ingestion is **decoupled** from scoring: this endpoint does not start
+anything — the run lands at status `ingerido` and stays there until
+`POST /evaluations/{run_id}/start` enqueues it. This is the glue between the parser
+(`scorekeeper.importer`) and the scoring runner (`scorekeeper.runner`).
 
 - **Content type:** `multipart/form-data`
 - **Parts:**
@@ -110,10 +117,12 @@ On the request (`ingest_evaluation`):
    `retrieved_context` cell is stored verbatim on `Turn.retrieved_context_source` — it is
    **not** interpreted here; the retrieval pipeline handles it in the worker.
 3. Build and commit the `BenchmarkRun → PlatformExecution → ScenarioResult → Turn`
-   tree — one `PlatformExecution` per distinct platform — with status `en_cola`, and
-   enqueue the pipeline job carrying just the `run_id`.
+   tree — one `PlatformExecution` per distinct platform — with status `ingerido`.
+   Nothing is enqueued; the run waits for `POST /evaluations/{run_id}/start`.
 
-In the worker (`run_pipeline_task`, off the request path):
+After `POST /evaluations/{run_id}/start` flips the run to `en_cola` and enqueues the
+pipeline job (carrying just the `run_id`), the worker (`run_pipeline_task`, off the
+request path):
 
 4. **Retrieval** (`retrieve_run`): mark the run `en_recuperacion` and run the retrieval
    pipeline over each turn's `retrieved_context_source`, populating `retrieved_documents`
@@ -126,31 +135,35 @@ In the worker (`run_pipeline_task`, off the request path):
 
 > **Prerequisites.** The database schema must already exist (`alembic upgrade head`)
 > and the configured judge must have a valid API key (see `scorekeeper.config`). The
-> worker must be running to make progress past `en_cola`.
+> worker must be running to make progress past `en_cola`, and a client must call
+> `POST /evaluations/{run_id}/start` to move a run past `ingerido`.
 
 ### Response `202`
 
-`POST` returns as soon as the run is queued:
+`POST` returns as soon as the run is persisted, at status `ingerido` (not started):
 
 ```json
-{"run_id": "b1f2…", "status": "en_cola"}
+{"run_id": "b1f2…", "status": "ingerido"}
 ```
 
-Poll `GET /evaluations/{run_id}` for progress and results (below).
+Call `POST /evaluations/{run_id}/start` to begin scoring, then poll
+`GET /evaluations/{run_id}` for progress and results (both below).
 
 ### Errors
 
 | Status | When |
 |--------|------|
 | `422`  | `payload` is not valid JSON or fails schema validation (e.g. empty `platform`). |
-| `400`  | An uploaded file is not `.xlsx`, is empty, has no `role`/`content` columns, or no file/platform was provided. Ingest rolls back — nothing is persisted and no job is enqueued. |
+| `400`  | An uploaded file is not `.xlsx`, is empty, has no `role`/`content` columns, or no file/platform was provided. Ingest rolls back — nothing is persisted. |
 
 ## `POST /captures`
 
-Ingest conversations **captured from a chat UI** and enqueue them for scoring. The
+Ingest conversations **captured from a chat UI** and persist them for scoring. The
 JSON twin of `POST /evaluations` for clients that already hold the turns and have no
 spreadsheet to upload — the [browser extension](../extension/README.md) scrapes them
-straight off Copilot, Gemini and Claude.
+straight off Copilot, Gemini and Claude. Like `POST /evaluations`, ingestion is
+decoupled from scoring: the run lands at `ingerido` and starts only via
+`POST /evaluations/{run_id}/start`.
 
 Both endpoints converge immediately: the messages are normalized by
 `scorekeeper.importer.normalize_messages` (the same role aliasing and turn numbering
@@ -190,10 +203,11 @@ serialized capture itself.
 
 ### Response `202`
 
-Identical to `POST /evaluations` — poll `GET /evaluations/{run_id}` from here.
+Identical to `POST /evaluations` — the run is persisted at `ingerido`. Call
+`POST /evaluations/{run_id}/start` to begin scoring, then poll `GET /evaluations/{run_id}`.
 
 ```json
-{"run_id": "b1f2…", "status": "en_cola"}
+{"run_id": "b1f2…", "status": "ingerido"}
 ```
 
 ### Errors
@@ -201,12 +215,38 @@ Identical to `POST /evaluations` — poll `GET /evaluations/{run_id}` from here.
 | Status | When |
 |--------|------|
 | `422`  | The body fails schema validation (empty `platform`, empty `conversations`, a conversation with no `messages`). |
-| `400`  | A conversation's messages are all blank, or ingest rejected the run. Nothing is persisted and no job is enqueued. |
+| `400`  | A conversation's messages are all blank, or ingest rejected the run. Nothing is persisted. |
+
+## `POST /evaluations/{run_id}/start`
+
+Start scoring a previously-ingested run — the explicit trigger decoupled from
+ingestion. Flips the run from `ingerido` to `en_cola` and enqueues the Celery pipeline
+(retrieval + LLM scoring). This is the only way a run moves past `ingerido`.
+
+- **Content type:** none (no body); the `run_id` is the one returned by
+  `POST /evaluations` or `POST /captures`.
+
+### Response `202`
+
+```json
+{"run_id": "b1f2…", "status": "en_cola"}
+```
+
+Poll `GET /evaluations/{run_id}` for progress and results.
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | No run with that `run_id` exists (unknown or malformed id). |
+| `409`  | The run is not in the `ingerido` state (already started/queued/scored). A run is never enqueued twice. |
 
 ## `GET /evaluations/{run_id}`
 
 Poll a run's current status and summary. Read the `status` to know where the run
-is in its lifecycle (`en_cola → en_recuperacion → en_proceso → completado|parcial|fallido`).
+is in its lifecycle (`ingerido → en_cola → en_recuperacion → en_proceso →
+completado|parcial|fallido`). A freshly ingested run stays at `ingerido` until
+`POST /evaluations/{run_id}/start` is called.
 
 ### Response `200`
 
@@ -223,11 +263,12 @@ is in its lifecycle (`en_cola → en_recuperacion → en_proceso → completado|
 ```
 
 - `status` — run lifecycle / rollup. `completado` (all scenarios scored), `parcial`
-  (some failed), `fallido` (none scored or the retrieval/scoring job errored); `en_cola` /
-  `en_recuperacion` / `en_proceso` while still queued, retrieving, or scoring.
+  (some failed), `fallido` (none scored or the retrieval/scoring job errored); `ingerido`
+  before `/start`, then `en_cola` / `en_recuperacion` / `en_proceso` while queued,
+  retrieving, or scoring.
 - `progress` — **turn-level** progress: `done` of `total` turns scored, with
   `ratio` = `done / total` (0.0–1.0) for a progress bar. A turn counts as done once
-  its `turn_score` is set. The ratio climbs live while `en_cola` / `en_proceso`; on
+  its `turn_score` is set. The ratio climbs live while `en_proceso`; on
   any terminal status it is pinned to `1.0` (a turn whose every metric failed keeps
   `turn_score = null`, so a finished run must not read below 100%).
 - `platforms` — one entry per distinct platform in the run. `average_score` is the
@@ -426,12 +467,19 @@ Returns one entry per metric scored on the turn (a turn with no scores yields `[
 
 ## Examples
 
-Enqueue (defaults, single file) → returns a `run_id`:
+Ingest (defaults, single file) → returns a `run_id` at status `ingerido`:
 
 ```bash
 curl -X POST http://localhost:8001/evaluations \
   -F 'files=@esc1.xlsx' \
   -F 'payload={"platform":"claude","use_case":"default"}'
+# {"run_id":"b1f2…","status":"ingerido"}
+```
+
+Start scoring (decoupled from ingestion) → run moves to `en_cola`:
+
+```bash
+curl -X POST http://localhost:8001/evaluations/b1f2…/start
 # {"run_id":"b1f2…","status":"en_cola"}
 ```
 
@@ -441,7 +489,7 @@ Poll until terminal:
 curl http://localhost:8001/evaluations/b1f2…
 ```
 
-Enqueue a conversation captured from a chat UI (what the browser extension sends):
+Ingest a conversation captured from a chat UI (what the browser extension sends):
 
 ```bash
 curl -X POST http://localhost:8001/captures \
@@ -458,7 +506,7 @@ curl -X POST http://localhost:8001/captures \
           ]
         }]
       }'
-# {"run_id":"b1f2…","status":"en_cola"}
+# {"run_id":"b1f2…","status":"ingerido"} — then POST /evaluations/{run_id}/start to score
 ```
 
 Retrieve full details for all `claude` runs scored in July, down to metric scores:

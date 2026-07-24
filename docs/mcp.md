@@ -32,8 +32,8 @@ in July".
 The date range filters the **scoring window** — `PlatformExecution.started_at >=
 start_date` and `PlatformExecution.finished_at <= end_date`. Those columns stay
 `null` until a worker scores the run, so supplying either bound excludes runs still
-`en_cola` / `en_proceso`. With no date filter, queued runs are included. Results are
-ordered by `BenchmarkRun.created_at`.
+`ingerido` / `en_cola` / `en_proceso`. With no date filter, ingested and queued runs
+are included. Results are ordered by `BenchmarkRun.created_at`.
 
 ### Granularity levels
 

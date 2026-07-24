@@ -43,6 +43,7 @@ from scorekeeper.evaluation import (
     retrieve_turn_traces,
     run_evaluation,
     score_run,
+    start_run,
 )
 from scorekeeper.metrics.base import (
     Metric,
@@ -365,14 +366,14 @@ def test_run_evaluation_malformed_sheet_raises(session: Session, registry) -> No
 # --- ingest_evaluation / score_run (the async split) --------------------------
 
 
-def test_ingest_sets_queued_status(session: Session, registry) -> None:
+def test_ingest_sets_ingested_status(session: Session, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
 
     run_id = ingest_evaluation("claude", files, session=session)
 
-    # The tree exists, is queued, and is not yet scored.
+    # The tree exists, is ingested but not started, and is not yet scored.
     run = session.get(BenchmarkRun, uuid.UUID(run_id))
-    assert run.status == "en_cola"
+    assert run.status == "ingerido"
     turns = session.execute(select(Turn)).scalars().all()
     assert len(turns) == 2
     assert all(t.turn_score is None for t in turns)
@@ -428,6 +429,32 @@ def test_get_run_summary_unknown_returns_none(session: Session) -> None:
     assert get_run_summary("00000000-0000-0000-0000-000000000000", session=session) is None
 
 
+def test_start_run_moves_ingested_to_queued(session: Session, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = ingest_evaluation("claude", files, session=session)
+
+    status = start_run(run_id, session=session)
+
+    assert status == "en_cola"
+    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    assert run.status == "en_cola"
+
+
+def test_start_run_unknown_returns_none(session: Session) -> None:
+    assert start_run("not-a-uuid", session=session) is None
+    assert start_run("00000000-0000-0000-0000-000000000000", session=session) is None
+
+
+def test_start_run_already_started_raises(session: Session, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = ingest_evaluation("claude", files, session=session)
+    start_run(run_id, session=session)  # ingerido -> en_cola
+
+    # A second start is rejected so a run is never enqueued twice.
+    with pytest.raises(ValueError):
+        start_run(run_id, session=session)
+
+
 # --- POST /evaluations endpoint -----------------------------------------------
 
 
@@ -437,7 +464,7 @@ def _payload(**over) -> str:
     return json.dumps(body)
 
 
-def test_endpoint_ingests_enqueues_and_returns_run_id(monkeypatch) -> None:
+def test_endpoint_ingests_without_enqueue_and_returns_run_id(monkeypatch) -> None:
     captured: dict = {}
 
     def fake_ingest(platform, files, *, session=None):
@@ -464,11 +491,11 @@ def test_endpoint_ingests_enqueues_and_returns_run_id(monkeypatch) -> None:
             },
         )
 
-    # 202 Accepted with the run id; scoring was enqueued, not run inline.
+    # 202 Accepted with the run id; ingestion is decoupled, so nothing is enqueued yet.
     assert response.status_code == 202
     body = response.json()
-    assert body == {"run_id": "run-123", "status": "en_cola"}
-    assert captured["enqueued"] == "run-123"
+    assert body == {"run_id": "run-123", "status": "ingerido"}
+    assert "enqueued" not in captured
     # Per-file overrides applied; defaults elsewhere.
     assert captured["platform"] == "claude"
     upload = captured["files"][0]
@@ -525,6 +552,51 @@ def test_endpoint_defaults_scenario_id_to_stem(monkeypatch) -> None:
     upload = captured["files"][0]
     assert upload.scenario_id == "esc1"  # stem of esc1.xlsx
     assert upload.use_case == "default"
+
+
+# --- POST /evaluations/{run_id}/start endpoint --------------------------------
+
+
+def test_start_endpoint_enqueues_and_returns_queued(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(evaluation, "start_run", lambda run_id, **kw: "en_cola")
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/evaluations/run-123/start")
+
+    # 202 Accepted; the run flips to en_cola and the pipeline is enqueued now.
+    assert response.status_code == 202
+    assert response.json() == {"run_id": "run-123", "status": "en_cola"}
+    assert captured["enqueued"] == "run-123"
+
+
+def test_start_endpoint_unknown_run_404(monkeypatch) -> None:
+    captured: dict = {}
+    monkeypatch.setattr(evaluation, "start_run", lambda run_id, **kw: None)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/evaluations/does-not-exist/start")
+
+    assert response.status_code == 404
+    assert "enqueued" not in captured  # nothing enqueued for an unknown run
+
+
+def test_start_endpoint_already_started_409(monkeypatch) -> None:
+    captured: dict = {}
+
+    def fake_start(run_id, **kw):
+        raise ValueError("El run ya fue iniciado.")
+
+    monkeypatch.setattr(evaluation, "start_run", fake_start)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/evaluations/run-123/start")
+
+    assert response.status_code == 409
+    assert "enqueued" not in captured  # a re-start never enqueues a second job
 
 
 def test_endpoint_get_returns_summary(monkeypatch) -> None:
@@ -1008,7 +1080,7 @@ def test_retrieve_invalid_date_raises(session: Session) -> None:
 # --- POST /captures -----------------------------------------------------------
 
 
-def test_captures_endpoint_ingests_and_enqueues(monkeypatch) -> None:
+def test_captures_endpoint_ingests_without_enqueue(monkeypatch) -> None:
     captured: dict = {}
 
     def fake_ingest(platform, files, *, session=None):
@@ -1039,8 +1111,8 @@ def test_captures_endpoint_ingests_and_enqueues(monkeypatch) -> None:
         )
 
     assert response.status_code == 202
-    assert response.json() == {"run_id": "run-cap", "status": "en_cola"}
-    assert captured["enqueued"] == "run-cap"
+    assert response.json() == {"run_id": "run-cap", "status": "ingerido"}
+    assert "enqueued" not in captured  # ingestion is decoupled from starting
     assert captured["platform"] == "gemini"
     upload = captured["files"][0]
     assert upload.scenario_id == "esc-navegador"
@@ -1140,7 +1212,7 @@ def test_captured_messages_reach_turns_without_a_spreadsheet(session: Session) -
         (2, "Adiós", "Hasta luego"),
     ]
     assert scenario.raw_conversation["messages"][0]["turn"] == 1
-    assert str(session.get(BenchmarkRun, uuid.UUID(run_id)).status) == "en_cola"
+    assert str(session.get(BenchmarkRun, uuid.UUID(run_id)).status) == "ingerido"
 
 
 def test_captured_citations_reach_turn_context(session: Session) -> None:

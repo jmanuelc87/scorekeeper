@@ -9,18 +9,23 @@ for a **single platform** and its set of files (each file is one scenario, score
 under that one platform), seeds the metric-selection table, runs the evaluation,
 and reports a JSON-serializable summary.
 
-Two phases, split so scoring can run off the request path (see ``scorekeeper.tasks``):
+Ingestion and scoring are split so the start of scoring is decoupled from the upload
+and can run off the request path (see ``scorekeeper.tasks``):
 
 * :func:`ingest_evaluation` — parse the uploads and persist the run tree as
-  ``en_cola`` (*queued*), returning the ``run_id``. Fast; the API runs it inline.
+  ``ingerido`` (*persisted, not started*), returning the ``run_id``. Fast; the API
+  runs it inline. It does **not** start scoring.
+* :func:`start_run` — flip an ingested run from ``ingerido`` to ``en_cola`` (*queued*)
+  so a caller can enqueue it. The explicit trigger the API exposes as
+  ``POST /evaluations/{run_id}/start``.
 * :func:`score_run` — load a queued run by id and score it with the LLM judge.
   Slow; the Celery worker runs it. The runner commits **per scenario** (its
   atomic-write unit), so an interrupted job keeps every scenario it already
   finished. On failure the run is marked ``fallido`` so pollers see a terminal state.
 
-:func:`run_evaluation` runs both phases on one session — the synchronous path kept
-for tests and any in-process caller. :func:`get_run_summary` reads a run's current
-status/summary for polling.
+:func:`run_evaluation` runs ingestion and scoring on one session — the synchronous
+path kept for tests and any in-process caller. :func:`get_run_summary` reads a run's
+current status/summary for polling.
 """
 
 from __future__ import annotations
@@ -68,7 +73,8 @@ DEFAULT_USE_CASE = "default"
 
 # Orchestration-level run statuses that precede scoring (the scoring-complete
 # literals — completado/parcial/fallido — live in ``runner``).
-STATUS_EN_COLA = "en_cola"  # ingested, waiting for a worker
+STATUS_INGERIDO = "ingerido"  # persisted, not yet started
+STATUS_EN_COLA = "en_cola"  # enqueued to Celery, waiting for a worker
 STATUS_EN_PROCESO = "en_proceso"  # a worker is scoring it now
 
 # Retrieval granularity: how deep :func:`retrieve_runs` serializes the run tree.
@@ -159,11 +165,11 @@ def ingest_evaluation(
     platform — each file lands under ``upload.platform`` when set, otherwise under the
     run-level ``platform`` fallback. Each file becomes one ``ScenarioResult`` (with its
     ``Turn`` rows) attached to its platform's execution. The run is committed with
-    status ``en_cola`` and left unscored; a worker later scores it via
-    :func:`score_run`.
+    status ``ingerido`` (persisted, not yet started) and left unscored; a caller later
+    starts it via :func:`start_run` (which enqueues :func:`score_run`).
 
     This is the fast, on-request half: parsing is synchronous so a malformed sheet is
-    rejected here (as ``ValueError``) before any job is enqueued. ``session`` defaults
+    rejected here (as ``ValueError``) before anything is persisted. ``session`` defaults
     to ``SessionLocal()``; tests inject an in-memory session.
 
     Raises ``ValueError`` when ``platform`` or ``files`` is empty, or when a file
@@ -200,7 +206,7 @@ def ingest_evaluation(
             db.add(source_file)
             parsed.append((upload, messages, source_file))
 
-        run = BenchmarkRun(status=STATUS_EN_COLA)
+        run = BenchmarkRun(status=STATUS_INGERIDO)
         # A run references a single source file; only meaningful with one upload.
         if len(parsed) == 1:
             run.source_file = parsed[0][2]
@@ -239,7 +245,7 @@ def ingest_evaluation(
             len(s.turns) for pe in run.platform_executions for s in pe.scenario_results
         )
         logger.info(
-            "Run %s en cola: %d plataforma(s) × %d archivo(s) = %d turno(s).",
+            "Run %s ingerido: %d plataforma(s) × %d archivo(s) = %d turno(s).",
             run.id,
             len(executions),
             len(parsed),
@@ -408,6 +414,37 @@ def get_run_summary(run_id: str, *, session: Session | None = None) -> dict[str,
     try:
         run = _load_run(db, run_id)
         return _summarize(run) if run is not None else None
+    finally:
+        if owns_session:
+            db.close()
+
+
+def start_run(run_id: str, *, session: Session | None = None) -> str | None:
+    """Move an ingested run to ``en_cola`` so it can be enqueued for scoring.
+
+    Decouples the start of evaluation from ingestion: :func:`ingest_evaluation` leaves
+    the run at ``ingerido`` and a separate call flips it to ``en_cola``, after which the
+    caller enqueues the Celery pipeline. Commits the new status; the caller enqueues.
+
+    Returns the new status (``en_cola``) on success, or ``None`` when the ``run_id`` is
+    unknown/invalid. Raises ``ValueError`` when the run is not in the ``ingerido`` state
+    (already started), so a run is never enqueued twice.
+    """
+    owns_session = session is None
+    db = SessionLocal() if session is None else session
+    try:
+        run = _load_run(db, run_id)
+        if run is None:
+            return None
+        if run.status != STATUS_INGERIDO:
+            raise ValueError(
+                f"El run {run_id} no está en estado '{STATUS_INGERIDO}' "
+                f"(estado actual: '{run.status}')."
+            )
+        run.status = STATUS_EN_COLA
+        db.commit()
+        logger.info("Run %s encolado para puntuación.", run_id)
+        return STATUS_EN_COLA
     finally:
         if owns_session:
             db.close()

@@ -34,6 +34,7 @@ const CLEAR_BADGE_ALARM = "scorekeeper-clear-badge";
 const CLEAR_BADGE_MINUTES = 10;
 
 const BADGE = {
+  ingerido: { text: "•", color: "#6b7280" },
   en_cola: { text: "…", color: "#8b5cf6" },
   en_proceso: { text: "…", color: "#8b5cf6" },
   completado: { text: "✓", color: "#16a34a" },
