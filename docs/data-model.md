@@ -361,9 +361,16 @@ non-secret identifiers. Shipped kinds: `sharepoint` (client certificate) and `oa
 
 The retrieval pipeline's fetch-stage download index (`table document_cache`). One row per
 distinct source `url` (unique) points at the document's bytes cached on the local filesystem
-under `RETRIEVAL_CACHE_DIR`, so a document is downloaded **at most once** across turns/runs
-(see [Retrieval pipeline § Fetch](retrieval-pipeline.md#fetch)). Standalone — no FK into the
-run hierarchy; the bytes live on disk, not in the DB.
+under `RETRIEVAL_CACHE_DIR`, so a document is downloaded **at most once per platform
+execution** (see [Retrieval pipeline § Fetch](retrieval-pipeline.md#fetch)). Standalone — no FK
+into the run hierarchy; the bytes live on disk, not in the DB.
+
+**Transient.** Rows and blobs are deleted together when retrieval for a platform execution
+finishes ([§ Cache cleanup](retrieval-pipeline.md#cache-cleanup)) — the extracted markdown on
+[`RetrievedContextDocument`](#retrieveddocument) is the durable record. A non-empty table
+outside a running retrieval phase means a worker died mid-phase; the entries are harmless
+(a missing blob is treated as a cache miss) and are reclaimed by the next execution that
+fetches the same URL.
 
 | Column | Type | Notes |
 | --- | --- | --- |

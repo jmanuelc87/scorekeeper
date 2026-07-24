@@ -16,10 +16,17 @@ first fetch of a ``document_url`` downloads and stores it; later fetches of the 
 the blob off disk. The cache dedups *downloads*, not *results* — the fetcher returns one
 ``FetchedDocument`` per call, so duplicate references to the same URL in a cell each get their
 own result (with ``cached=True`` after the first), and only the first touches the network.
+
+The cache is **scoped to a platform execution**, not kept forever: the fetcher remembers every
+URL it served and :meth:`CachingDocumentFetcher.purge_cache` drops exactly those blobs (and
+their ``document_cache`` rows) when retrieval for that execution finishes — see
+``evaluation.retrieve_run``. Downloaded documents therefore do not outlive the execution that
+needed them.
 """
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -31,6 +38,8 @@ if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
     from scorekeeper.retrieval.credentials.base import AuthClient
+
+logger = logging.getLogger(__name__)
 
 # Default per-request timeout for public HTTP fetches.
 _FETCH_TIMEOUT_SECONDS = 30.0
@@ -62,6 +71,8 @@ class CachingDocumentFetcher:
         root = Path(cache_dir) if cache_dir is not None else Path(get_settings().retrieval_cache_dir)
         self._store = DocumentStore(root, session=session)
         self._http_client = http_client
+        # Every document_url served since the last purge — the cleanup scope (see purge_cache).
+        self._served: set[str] = set()
 
     @property
     def http_client(self) -> Any:
@@ -80,6 +91,7 @@ class CachingDocumentFetcher:
         self, locator: DocumentLocator, client: AuthClient | None
     ) -> FetchedDocument:
         """Return ``locator``'s bytes, from the cache when present else downloading once."""
+        self._served.add(locator.document_url)
         cached = self._store.get(locator.document_url)
         if cached is not None:
             return FetchedDocument(
@@ -103,6 +115,21 @@ class CachingDocumentFetcher:
             content_type=content_type,
             cached=False,
         )
+
+    def purge_cache(self) -> int:
+        """Delete the documents this fetcher served and forget them; return how many went.
+
+        Called when retrieval for a platform execution finishes (``evaluation.retrieve_run``):
+        the extracted markdown is already persisted on the turns, so the downloaded bytes have
+        no further use. Only this fetcher's own URLs are purged, leaving any other execution's
+        cache entries alone. Idempotent — a second call with nothing served removes nothing.
+        """
+        served, self._served = self._served, set()
+        if not served:
+            return 0
+        removed = self._store.purge(served)
+        logger.info("Caché de recuperación: %d documento(s) eliminado(s)", removed)
+        return removed
 
     # -- helpers ------------------------------------------------------------------------
 

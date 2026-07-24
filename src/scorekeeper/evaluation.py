@@ -325,6 +325,10 @@ def retrieve_run(
     rather than raised. Commits **per scenario** so an interrupted job keeps finished scenarios;
     a hard phase failure marks the run ``fallido`` and re-raises.
 
+    When a platform execution's turns are all retrieved, its downloaded documents are purged
+    from the fetch cache (:func:`_purge_cache`) — the extracted markdown is persisted by then,
+    so the bytes are dead weight. The failure path purges too, leaving no orphaned downloads.
+
     ``session`` defaults to ``SessionLocal()``; ``pipeline`` to a ``RetrievalOrchestrator`` bound
     to that session (tests inject a fake). This is the retrieval half the worker runs before
     scoring. Returns the run summary.
@@ -352,12 +356,14 @@ def retrieve_run(
                         if turn.is_selected:
                             _retrieve_turn(turn, orchestrator)
                     db.commit()  # atomic-write unit: one scenario at a time
+                _purge_cache(orchestrator, platform_exec)
         except Exception:
             db.rollback()
             run = _load_run(db, run_id)
             if run is not None:
                 run.status = STATUS_FALLIDO
                 db.commit()
+            _purge_cache(orchestrator)  # a failed phase leaves no downloads behind either
             raise
 
         logger.info("Recuperación completada para run %s", run.id)
@@ -365,6 +371,26 @@ def retrieve_run(
     finally:
         if owns_session:
             db.close()
+
+
+def _purge_cache(
+    pipeline: RetrievalPipeline, platform_exec: PlatformExecution | None = None
+) -> None:
+    """Release the documents downloaded for one platform execution (best-effort).
+
+    Retrieval is the only phase that needs the fetched bytes — scoring reads the extracted
+    markdown off ``retrieved_documents`` — so once a platform execution's turns are done the
+    cache entries it created are dropped from disk and from ``document_cache``. A cleanup
+    failure is logged and swallowed: the context is already persisted, so a stranded blob is
+    not worth failing the run over.
+    """
+    label = platform_exec.platform if platform_exec is not None else "?"
+    try:
+        removed = pipeline.purge_cache()
+    except Exception:  # noqa: BLE001 — cleanup must never break a completed retrieval
+        logger.warning("No se pudo limpiar la caché de %s", label, exc_info=True)
+        return
+    logger.info("Plataforma %s: %d documento(s) liberado(s) de la caché", label, removed)
 
 
 def _retrieve_turn(turn: Turn, pipeline: RetrievalPipeline) -> None:

@@ -9,6 +9,9 @@ failed reference is recorded, never raised, so the rest of the cell still retrie
 
 The auth and fetch stages need a DB session (and the ``auth_encryption_key``), so the
 orchestrator is constructed per run with a ``session``; every stage is injectable for tests.
+
+``purge_cache`` closes the loop on the fetch stage's disk cache: the caller invokes it once a
+platform execution's turns are retrieved, dropping the downloaded bytes it no longer needs.
 """
 
 from __future__ import annotations
@@ -93,6 +96,10 @@ class RetrievalOrchestrator:
             source_format=source_format,
             outcomes=[self._run_ref(ref) for ref in refs],
         )
+
+    def purge_cache(self) -> int:
+        """Drop the documents fetched so far, delegating to the fetch stage's cache."""
+        return self._fetcher.purge_cache()
 
     # -- per-reference stage threading --------------------------------------------------
 

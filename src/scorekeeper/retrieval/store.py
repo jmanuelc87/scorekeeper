@@ -1,8 +1,10 @@
 """Local filesystem blob store for fetched documents, indexed by ``document_cache``.
 
-The fetch stage downloads a document at most once: bytes are written under a cache root and
-recorded in the ``document_cache`` table (one row per source ``url``). A later fetch of the
-same URL — even from a different turn or run — reads the blob off disk instead of the network.
+The fetch stage downloads a document at most once *within* a platform execution: bytes are
+written under a cache root and recorded in the ``document_cache`` table (one row per source
+``url``), so later references to the same URL read the blob off disk instead of the network.
+The cache is **not** retained across platform executions — :meth:`DocumentStore.purge` drops
+the blobs (and their index rows) once retrieval for an execution is done.
 
 Blobs are sharded into subdirectories by the leading hex of the URL's SHA-256 to keep any one
 directory small; the DB row stores the path relative to the cache root, so the root can move.
@@ -13,7 +15,7 @@ The store follows the codebase's session-injection convention (``session`` defau
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -124,3 +126,34 @@ class DocumentStore:
             sha256=sha,
             size_bytes=len(body),
         )
+
+    def purge(self, urls: Iterable[str]) -> int:
+        """Delete the cached blobs for ``urls`` and their index rows; return how many went.
+
+        Scoped on purpose: only the URLs handed in are removed, so a concurrent execution's
+        entries survive. Unknown URLs and rows whose blob is already gone are skipped without
+        error (the goal is that nothing remains, not that everything was there). Empty shard
+        directories are pruned so the cache root does not fill with husks.
+        """
+        removed = 0
+        with self._session_scope() as db:
+            for url in set(urls):
+                entry = db.scalar(
+                    select(DocumentCacheEntry).where(DocumentCacheEntry.url == url)
+                )
+                if entry is None:
+                    continue
+                self._unlink(self._root / entry.cache_path)
+                db.delete(entry)
+                removed += 1
+            db.commit()
+        return removed
+
+    @staticmethod
+    def _unlink(path: Path) -> None:
+        """Remove a blob and its shard directory when that leaves the directory empty."""
+        path.unlink(missing_ok=True)
+        try:
+            path.parent.rmdir()
+        except OSError:  # not empty (other blobs share the shard), or already gone
+            pass

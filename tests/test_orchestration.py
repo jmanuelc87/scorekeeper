@@ -33,6 +33,13 @@ class _FakePipeline:
     def __init__(self, *, raise_exc: Exception | None = None) -> None:
         self._raise = raise_exc
         self.calls: list[str] = []
+        # Cells retrieved at the time of each purge_cache() call — lets a test assert both
+        # how many times the cache was released and that it happened after the turns ran.
+        self.purges: list[int] = []
+
+    def purge_cache(self) -> int:
+        self.purges.append(len(self.calls))
+        return len(self.calls)
 
     def run(self, cell: str) -> RetrievalReport:
         self.calls.append(cell)
@@ -146,6 +153,58 @@ def test_retrieve_run_is_idempotent(session: Session) -> None:
     retrieve_run(run_id, session=session, pipeline=_FakePipeline())  # re-run
     turn = session.execute(select(Turn)).scalars().one()
     assert len(turn.retrieved_documents) == 1  # cleared + repopulated, not doubled
+
+
+# -- cache cleanup -------------------------------------------------------------------------
+
+
+def test_retrieve_run_purges_cache_once_per_platform_execution(session: Session) -> None:
+    # Two scenarios under one platform execution: the cache is released when the execution
+    # finishes, not after every scenario, and only once every turn has been retrieved.
+    files = [
+        UploadedFile(
+            filename=f"esc{i}.xlsx",
+            content=_xlsx(
+                ["turn", "role", "content", "retrieved_context"],
+                [[1, "user", "pregunta", f"ref-{i}"], [1, "model", "respuesta", ""]],
+            ),
+            scenario_id=f"esc{i}",
+        )
+        for i in (1, 2)
+    ]
+    run_id = ingest_evaluation("claude", files, session=session)
+    pipeline = _FakePipeline()
+
+    retrieve_run(run_id, session=session, pipeline=pipeline)
+
+    assert pipeline.calls == ["ref-1", "ref-2"]
+    assert pipeline.purges == [2]  # one purge, after both scenarios ran
+
+
+def test_retrieve_run_purges_cache_on_failure(session: Session) -> None:
+    run_id = _ingest_one_turn_with_context(session, "algo")
+    pipeline = _FakePipeline(raise_exc=RuntimeError("kaboom"))
+
+    with pytest.raises(RuntimeError):
+        retrieve_run(run_id, session=session, pipeline=pipeline)
+
+    assert pipeline.purges == [1]  # a failed phase leaves no downloads behind
+
+
+def test_retrieve_run_survives_a_cache_cleanup_failure(session: Session) -> None:
+    class _UnpurgeablePipeline(_FakePipeline):
+        def purge_cache(self) -> int:
+            raise OSError("disco de solo lectura")
+
+    run_id = _ingest_one_turn_with_context(session, "algo")
+
+    retrieve_run(run_id, session=session, pipeline=_UnpurgeablePipeline())
+
+    # The retrieved context is already persisted; cleanup trouble must not undo it.
+    turn = session.execute(select(Turn)).scalars().one()
+    assert len(turn.retrieved_documents) == 1
+    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    assert run.status == STATUS_EN_RECUPERACION
 
 
 # -- Celery wiring -------------------------------------------------------------------------
