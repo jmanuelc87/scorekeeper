@@ -40,6 +40,7 @@ from scorekeeper.evaluation import (
     project_turns,
     retrieve_runs,
     retrieve_scenario_turns,
+    retrieve_turn_token_usage,
     retrieve_turn_traces,
     run_evaluation,
     score_run,
@@ -824,6 +825,99 @@ def test_mcp_retrieve_turn_traces_coalesces_none(monkeypatch) -> None:
     monkeypatch.setattr(evaluation, "retrieve_turn_traces", lambda *a, **k: None)
     # The MCP tool never 404s: an unknown turn becomes an empty list.
     assert server.retrieve_turn_traces("nope") == []
+
+
+# --- retrieve_turn_token_usage + /turns/{turn_id}/token-usage -----------------
+
+
+def test_retrieve_turn_token_usage_returns_row(session: Session, registry) -> None:
+    _score_one(session)
+    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+    turn.token_usage.input_tokens = 120
+    turn.token_usage.output_tokens = 45
+    session.flush()
+
+    usage = retrieve_turn_token_usage(str(turn.id), session=session)
+
+    assert usage == {
+        "turn_id": str(turn.id),
+        "input_tokens": 120,
+        "output_tokens": 45,
+        "total_tokens": 165,  # derived input + output, never stored.
+    }
+
+
+def test_retrieve_turn_token_usage_without_row_reports_zeros(
+    session: Session, registry
+) -> None:
+    _score_one(session)
+    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+    # A turn with no usage row (e.g. never scored) reports zeros rather than 404ing.
+    turn.token_usage = None
+    session.flush()
+
+    usage = retrieve_turn_token_usage(str(turn.id), session=session)
+
+    assert usage == {
+        "turn_id": str(turn.id),
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+    }
+
+
+def test_retrieve_turn_token_usage_unknown_or_malformed_is_none(
+    session: Session, registry
+) -> None:
+    _score_one(session)
+
+    assert retrieve_turn_token_usage("not-a-uuid", session=session) is None
+    assert (
+        retrieve_turn_token_usage(
+            "00000000-0000-0000-0000-000000000000", session=session
+        )
+        is None
+    )
+
+
+def test_turn_token_usage_endpoint_forwards_and_returns(monkeypatch) -> None:
+    captured: dict = {}
+    payload = {
+        "turn_id": "abc",
+        "input_tokens": 10,
+        "output_tokens": 3,
+        "total_tokens": 13,
+    }
+
+    def fake(turn_id, **kwargs):
+        captured["turn_id"] = turn_id
+        return payload
+
+    monkeypatch.setattr(evaluation, "retrieve_turn_token_usage", fake)
+
+    with TestClient(app) as client:
+        response = client.get("/turns/abc/token-usage")
+
+    assert response.status_code == 200
+    assert response.json() == payload
+    assert captured == {"turn_id": "abc"}
+
+
+def test_turn_token_usage_endpoint_unknown_turn_404(monkeypatch) -> None:
+    monkeypatch.setattr(evaluation, "retrieve_turn_token_usage", lambda *a, **k: None)
+
+    with TestClient(app) as client:
+        response = client.get("/turns/nope/token-usage")
+
+    assert response.status_code == 404
+
+
+def test_mcp_retrieve_turn_token_usage_coalesces_none(monkeypatch) -> None:
+    from scorekeeper import server
+
+    monkeypatch.setattr(evaluation, "retrieve_turn_token_usage", lambda *a, **k: None)
+    # The MCP tool never 404s: an unknown turn becomes an empty object.
+    assert server.retrieve_turn_token_usage("nope") == {}
 
 
 # --- retrieve_scenario_turns + /scenarios/{scenario_id}/turns -----------------

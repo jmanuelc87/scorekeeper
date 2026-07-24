@@ -21,8 +21,8 @@ from scorekeeper.retrieval.credentials.service import (
 
 settings = get_settings()
 
-# Structured dual output (plain text → stderr, JSON → stdout). uvicorn only
-# configures its own loggers, so without this our app events would be swallowed.
+# Plain-text logging to stdout. uvicorn only configures its own loggers, so
+# without this our app events would be swallowed.
 configure_logging(settings.log_level)
 logger = structlog.get_logger("scorekeeper.api")
 
@@ -321,6 +321,29 @@ def get_turn_traces(
     if traces is None:
         raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
     return traces
+
+
+class TurnTokenUsage(BaseModel):
+    """A turn's raw LLM token usage; ``total_tokens`` is the derived ``input + output``."""
+
+    turn_id: str
+    input_tokens: int
+    output_tokens: int
+    total_tokens: int
+
+
+@app.get("/turns/{turn_id}/token-usage", response_model=TurnTokenUsage)
+def get_turn_token_usage(turn_id: str) -> dict:
+    """Return the LLM token usage for scoring one turn (no aggregation).
+
+    The turn's 1:1 ``TurnTokenUsage``: ``input_tokens``, ``output_tokens`` and the
+    derived ``total_tokens``. A turn that was never scored reports zeros. ``404`` when
+    the ``turn_id`` is unknown or malformed.
+    """
+    usage = evaluation.retrieve_turn_token_usage(turn_id)
+    if usage is None:
+        raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
+    return usage
 
 
 @app.get("/runs")
