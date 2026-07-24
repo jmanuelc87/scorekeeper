@@ -23,6 +23,7 @@ Model Context Protocol — see [MCP tools](mcp.md).
 | `PATCH /auth-providers/{id}` | Partially update a credential provider (rotate/clear its key). |
 | `DELETE /auth-providers/{id}`| Delete a credential provider row. |
 | `GET /turns/{turn_id}/traces` | Retrieve the structured metric traces for a single turn. |
+| `GET /turns/{turn_id}/token-usage` | Retrieve one turn's raw LLM token usage (no aggregation). |
 
 ## Architecture: ingestion is decoupled from scoring; the worker retrieves + scores
 
@@ -465,6 +466,36 @@ Returns one entry per metric scored on the turn (a turn with no scores yields `[
 |--------|------|
 | `404`  | The `turn_id` is unknown or not a valid UUID. |
 
+## `GET /turns/{turn_id}/token-usage`
+
+Retrieve the LLM token usage for scoring a **single turn** — the turn's 1:1
+[`TurnTokenUsage`](data-model.md) entity, read raw with **no aggregation** across turns,
+scenarios, or platforms. Summed across every judge call every metric made while scoring the
+turn, with provider counts normalized to input/output. The `turn_id` is the turn's UUID,
+discoverable from `GET /runs?granularity=metric_scores` (each turn carries a `turn_id`). Takes
+no query parameters.
+
+`total_tokens` is **derived** (`input_tokens + output_tokens`) and never stored. A turn that
+was never scored — or whose scoring recorded no usage — reports zeros rather than `404`ing;
+only an unknown or malformed `turn_id` is a `404`.
+
+### Response `200`
+
+```json
+{
+  "turn_id": "7c9e…",
+  "input_tokens": 1280,
+  "output_tokens": 320,
+  "total_tokens": 1600
+}
+```
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | The `turn_id` is unknown or not a valid UUID. |
+
 ## Examples
 
 Ingest (defaults, single file) → returns a `run_id` at status `ingerido`:
@@ -528,6 +559,12 @@ curl 'http://localhost:8001/turns/7c9e…/traces'
 curl 'http://localhost:8001/turns/7c9e…/traces?provenance=false'
 ```
 
+Read one turn's token usage:
+
+```bash
+curl 'http://localhost:8001/turns/7c9e…/token-usage'
+```
+
 Multiple files with per-file overrides — `esc1` keeps the payload `claude` default;
 `esc2` is scored under `gemini` (producing two platform executions in the one run):
 
@@ -580,7 +617,7 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Ingest / retrieve / score split + polling — `src/scorekeeper/evaluation.py`
   (`ingest_evaluation`, `retrieve_run`, `score_run`, `get_run_summary`, `run_evaluation`)
 - Read paths — `src/scorekeeper/evaluation.py` (`retrieve_runs`, `retrieve_scenario_turns`,
-  `retrieve_turn_traces`)
+  `retrieve_turn_traces`, `retrieve_turn_token_usage`)
 - Retrieval orchestrator — `src/scorekeeper/retrieval/pipeline.py` (`RetrievalOrchestrator`)
 - Auth-provider CRUD service — `src/scorekeeper/retrieval/credentials/service.py`
 - Celery app & tasks — `src/scorekeeper/celery_app.py`, `src/scorekeeper/tasks.py`

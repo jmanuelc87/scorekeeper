@@ -19,6 +19,7 @@ from scorekeeper.metrics.judges.base import (
     clamp,
     judge_call,
     owned_model,
+    record_usage,
     render_prompt,
     require_parsed,
     scale_spec,
@@ -98,6 +99,20 @@ class OpenAIJudge:
             return owned_model(model, owns=self._owns, provider=self.provider)
         return self.model_for(step)
 
+    @staticmethod
+    def _record_chat_usage(completion: Any) -> None:
+        """Record a chat completion's token usage on the active accumulator.
+
+        ``getattr``-safe: a response (or a test fake) without ``usage`` records
+        nothing. OpenAI reports ``prompt_tokens``/``completion_tokens``, mapped to
+        input/output.
+        """
+        usage = getattr(completion, "usage", None)
+        record_usage(
+            input_tokens=getattr(usage, "prompt_tokens", None),
+            output_tokens=getattr(usage, "completion_tokens", None),
+        )
+
     def score(
         self,
         *,
@@ -121,7 +136,10 @@ class OpenAIJudge:
                 response_format=_ScoreResponse,
             )
             message = completion.choices[0].message
-        parsed = require_parsed(
+        # Recorded before the parse check: the tokens were spent even if the model
+        # refused or returned output that does not satisfy the schema.
+        self._record_chat_usage(completion)
+        parsed: _ScoreResponse = require_parsed(
             message.parsed,
             provider=self.provider,
             model=model,
@@ -154,6 +172,7 @@ class OpenAIJudge:
                 response_format=schema,
             )
             message = completion.choices[0].message
+        self._record_chat_usage(completion)
         return require_parsed(
             message.parsed,
             provider=self.provider,
@@ -183,4 +202,7 @@ class OpenAIJudge:
             response = self._client.embeddings.create(
                 model=embedding_model, input=texts
             )
+        # Embeddings usage carries only prompt_tokens (no completion side).
+        usage = getattr(response, "usage", None)
+        record_usage(input_tokens=getattr(usage, "prompt_tokens", None), output_tokens=None)
         return [item.embedding for item in response.data]

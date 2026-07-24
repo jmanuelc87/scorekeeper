@@ -20,6 +20,7 @@ from scorekeeper.metrics.judges.base import (
     clamp,
     judge_call,
     owned_model,
+    record_usage,
     render_prompt,
     require_parsed,
     scale_spec,
@@ -96,6 +97,19 @@ class AnthropicJudge:
         return self.model_for(step)
 
     @staticmethod
+    def _record_usage(message: Any) -> None:
+        """Record the Anthropic response's token usage on the active accumulator.
+
+        ``getattr``-safe: a response (or a test fake) without ``usage`` records
+        nothing. Anthropic reports ``input_tokens``/``output_tokens``.
+        """
+        usage = getattr(message, "usage", None)
+        record_usage(
+            input_tokens=getattr(usage, "input_tokens", None),
+            output_tokens=getattr(usage, "output_tokens", None),
+        )
+
+    @staticmethod
     def _thinking_kwargs(model: str) -> dict[str, Any]:
         """Per-model ``thinking`` for ``messages.parse``.
 
@@ -130,7 +144,10 @@ class AnthropicJudge:
                 messages=[{"role": "user", "content": content}],
                 output_format=_ScoreResponse,
             )
-        parsed = require_parsed(
+        # Recorded before the parse check: the tokens were spent even if the model
+        # refused or returned output that does not satisfy the schema.
+        self._record_usage(message)
+        parsed: _ScoreResponse = require_parsed(
             message.parsed_output,
             provider=PROVIDER,
             model=model,
@@ -163,6 +180,7 @@ class AnthropicJudge:
                 ],
                 output_format=schema,
             )
+        self._record_usage(message)
         return require_parsed(
             message.parsed_output,
             provider=PROVIDER,

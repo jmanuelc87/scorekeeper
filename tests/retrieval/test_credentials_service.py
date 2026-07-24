@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from types import SimpleNamespace
 from uuid import UUID, uuid4
 
 import pytest
@@ -72,7 +73,14 @@ def test_create_unknown_kind_raises(session: Session) -> None:
         )
 
 
-def test_create_private_key_without_encryption_key_raises(session: Session) -> None:
+def test_create_private_key_without_encryption_key_raises(
+    session: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # encryption_key=None makes _apply_private_key fall back to settings; force that
+    # fallback empty so the test does not depend on the ambient .env's AUTH_ENCRYPTION_KEY.
+    monkeypatch.setattr(
+        service, "get_settings", lambda: SimpleNamespace(auth_encryption_key=None)
+    )
     with pytest.raises(ProviderValidationError):
         service.create_provider(_payload(), session=session, encryption_key=None)
 

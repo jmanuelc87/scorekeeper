@@ -1,12 +1,16 @@
 import argparse
 import os
+import sys
 
+import structlog
 from mcp.server.fastmcp import FastMCP
 
 from scorekeeper import evaluation
 from scorekeeper.config import get_settings
+from scorekeeper.logging_config import configure_logging
 
 settings = get_settings()
+logger = structlog.get_logger("scorekeeper.server")
 mcp = FastMCP(
     "Scorekeeper",
     instructions="Record scores and retrieve the latest results.",
@@ -66,6 +70,19 @@ def retrieve_turn_traces(turn_id: str, provenance: bool = True) -> list[dict]:
     return evaluation.retrieve_turn_traces(turn_id, include_provenance=provenance) or []
 
 
+@mcp.tool()
+def retrieve_turn_token_usage(turn_id: str) -> dict:
+    """Recupera el uso de tokens del LLM al puntuar un turno (sin agregación).
+
+    Devuelve el ``TurnTokenUsage`` 1:1 del turno: ``input_tokens``, ``output_tokens``
+    y el ``total_tokens`` derivado (``input + output``). Un turno que nunca se puntuó
+    informa ceros. El ``turn_id`` (UUID del turno) se obtiene de ``retrieve`` con
+    ``granularity="metric_scores"``. Un ``turn_id`` desconocido o inválido devuelve un
+    objeto vacío.
+    """
+    return evaluation.retrieve_turn_token_usage(turn_id) or {}
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Scorekeeper MCP server")
     parser.add_argument(
@@ -76,6 +93,12 @@ def main() -> None:
     args = parser.parse_args()
     # Schema is managed by Alembic; run `alembic upgrade head` before starting.
     transport = "streamable-http" if args.transport == "http" else args.transport
+    # Plain-text logging like the API/worker. stdio transport speaks JSON-RPC over
+    # stdout, so the logs go to stderr in that mode to avoid corrupting the protocol;
+    # other transports log to stdout.
+    log_stream = sys.stderr if transport == "stdio" else None
+    configure_logging(settings.log_level, stream=log_stream)
+    logger.info("mcp_server_starting", transport=transport)
     mcp.run(transport=transport)
 
 
