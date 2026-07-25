@@ -55,7 +55,7 @@ class DocumentLocatorResolver(Protocol):
 class AuthProvider(Protocol):
     """Decide a document's auth requirement and supply credentials when available."""
 
-    def classify(self, locator: DocumentLocator) -> AuthDecision:
+    async def classify(self, locator: DocumentLocator) -> AuthDecision:
         """Classify the auth requirement/status for ``locator``'s host."""
         ...
 
@@ -63,7 +63,7 @@ class AuthProvider(Protocol):
         """Auth headers/cookies for the fetch; empty unless the status is SATISFIED."""
         ...
 
-    def client(self, locator: DocumentLocator) -> AuthClient | None:
+    async def client(self, locator: DocumentLocator) -> AuthClient | None:
         """Generic authenticated client the fetch stage retrieves through.
 
         ``None`` when the host needs no client (public, or a header-only provider); a
@@ -76,7 +76,7 @@ class AuthProvider(Protocol):
 class DocumentFetcher(Protocol):
     """Fetch the raw bytes for a located, authorized document."""
 
-    def fetch(
+    async def fetch(
         self, locator: DocumentLocator, client: AuthClient | None
     ) -> FetchedDocument:
         """Fetch ``locator.document_url`` and return its bytes.
@@ -86,7 +86,7 @@ class DocumentFetcher(Protocol):
         """
         ...
 
-    def purge_cache(self) -> int:
+    async def purge_cache(self) -> int:
         """Drop the documents fetched so far and return how many were removed.
 
         Called once retrieval for a platform execution finishes, so downloaded bytes do not
@@ -114,10 +114,10 @@ class ContentExtractor(Protocol):
 class RetrievalPipeline(Protocol):
     """Orchestrate the stages over one cell into a ``RetrievalReport``."""
 
-    def run(self, cell: str) -> RetrievalReport:
+    async def run(self, cell: str) -> RetrievalReport:
         """Run parse → locate → authorize → fetch → filter → extract → assemble."""
         ...
 
-    def purge_cache(self) -> int:
+    async def purge_cache(self) -> int:
         """Release the documents retrieved so far (see ``DocumentFetcher.purge_cache``)."""
         ...

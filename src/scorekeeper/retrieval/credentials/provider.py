@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 
 from scorekeeper.config import get_settings
-from scorekeeper.database import AuthProviderConfig, SessionLocal
+from scorekeeper.database import AuthProviderConfig, session_scope
 from scorekeeper.retrieval.credentials import catalog as _catalog  # noqa: F401  (populate registry)
 from scorekeeper.retrieval.credentials.base import AuthClient, CredentialError
 from scorekeeper.retrieval.credentials.registry import CredentialProviderRegistry
@@ -30,13 +30,13 @@ from scorekeeper.retrieval.types import (
     DocumentLocator,
 )
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 class StoredAuthProvider:
     """Authorize stage backed by the ``auth_providers`` table and the provider registry.
 
-    ``session`` defaults to a fresh ``SessionLocal()`` and ``encryption_key`` to
+    ``session`` defaults to a fresh ``SessionLocal()`` per lookup and ``encryption_key`` to
     ``settings.auth_encryption_key`` (the injection convention used across the codebase, so
     tests can pass an in-memory session and an explicit key). Enabled rows are loaded once
     and cached; built clients are cached per host.
@@ -45,10 +45,10 @@ class StoredAuthProvider:
     def __init__(
         self,
         *,
-        session: Session | None = None,
+        session: AsyncSession | None = None,
         encryption_key: str | None = None,
     ) -> None:
-        self._session = session if session is not None else SessionLocal()
+        self._session = session
         self._encryption_key = (
             encryption_key if encryption_key is not None
             else get_settings().auth_encryption_key
@@ -58,9 +58,9 @@ class StoredAuthProvider:
 
     # -- AuthProvider protocol ----------------------------------------------------------
 
-    def classify(self, locator: DocumentLocator) -> AuthDecision:
+    async def classify(self, locator: DocumentLocator) -> AuthDecision:
         """Classify the auth requirement/status for ``locator``'s host against the DB."""
-        config = self._match(locator.host)
+        config = await self._match(locator.host)
         if config is None:
             return AuthDecision(
                 requirement=AuthRequirement.PUBLIC,
@@ -82,14 +82,14 @@ class StoredAuthProvider:
         """No header-based auth here — credentials are carried by the generic client."""
         return {}
 
-    def client(self, locator: DocumentLocator) -> AuthClient | None:
+    async def client(self, locator: DocumentLocator) -> AuthClient | None:
         """Build (and cache) the generic :class:`AuthClient` for ``locator``'s host.
 
         Returns ``None`` for public hosts. Raises :class:`CredentialError` (or
         ``SecretError``) when a gated host is configured but its client cannot be built —
         this is the fetch-time failure, distinct from the classify-time status.
         """
-        config = self._match(locator.host)
+        config = await self._match(locator.host)
         if config is None:
             return None
         cached = self._clients.get(config.host)
@@ -104,17 +104,18 @@ class StoredAuthProvider:
 
     # -- helpers ------------------------------------------------------------------------
 
-    def _enabled_configs(self) -> list[AuthProviderConfig]:
+    async def _enabled_configs(self) -> list[AuthProviderConfig]:
         """Load and cache the enabled ``auth_providers`` rows."""
         if self._configs is None:
-            self._configs = list(
-                self._session.scalars(
-                    select(AuthProviderConfig).where(AuthProviderConfig.enabled.is_(True))
+            async with session_scope(self._session) as db:
+                self._configs = list(
+                    await db.scalars(
+                        select(AuthProviderConfig).where(AuthProviderConfig.enabled.is_(True))
+                    )
                 )
-            )
         return self._configs
 
-    def _match(self, host: str) -> AuthProviderConfig | None:
+    async def _match(self, host: str) -> AuthProviderConfig | None:
         """Return the enabled config gating ``host`` (exact or parent-domain), longest wins.
 
         A row's ``host`` matches a locator host equal to it or a subdomain of it; when
@@ -123,7 +124,7 @@ class StoredAuthProvider:
         host = host.lower()
         matches = [
             config
-            for config in self._enabled_configs()
+            for config in await self._enabled_configs()
             if (h := config.host.lower()) and (host == h or host.endswith(f".{h}"))
         ]
         if not matches:

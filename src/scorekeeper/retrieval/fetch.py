@@ -26,6 +26,7 @@ needed them.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -35,7 +36,7 @@ from scorekeeper.retrieval.store import DocumentStore
 from scorekeeper.retrieval.types import DocumentLocator, FetchedDocument
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import Session
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     from scorekeeper.retrieval.credentials.base import AuthClient
 
@@ -65,7 +66,7 @@ class CachingDocumentFetcher:
         self,
         *,
         cache_dir: str | Path | None = None,
-        session: Session | None = None,
+        session: AsyncSession | None = None,
         http_client: Any | None = None,
     ) -> None:
         root = Path(cache_dir) if cache_dir is not None else Path(get_settings().retrieval_cache_dir)
@@ -87,12 +88,12 @@ class CachingDocumentFetcher:
 
     # -- DocumentFetcher protocol -------------------------------------------------------
 
-    def fetch(
+    async def fetch(
         self, locator: DocumentLocator, client: AuthClient | None
     ) -> FetchedDocument:
         """Return ``locator``'s bytes, from the cache when present else downloading once."""
         self._served.add(locator.document_url)
-        cached = self._store.get(locator.document_url)
+        cached = await self._store.get(locator.document_url)
         if cached is not None:
             return FetchedDocument(
                 document_url=locator.document_url,
@@ -101,8 +102,10 @@ class CachingDocumentFetcher:
                 content_type=cached.content_type,
                 cached=True,
             )
-        body, content_type = self._download(locator, client)
-        self._store.put(
+        # _download drives blocking IO (an authenticated SDK client, or a sync httpx2
+        # GET), so it runs on a worker thread rather than stalling the event loop.
+        body, content_type = await asyncio.to_thread(self._download, locator, client)
+        await self._store.put(
             locator.document_url,
             doc_type=locator.doc_type,
             body=body,
@@ -116,7 +119,7 @@ class CachingDocumentFetcher:
             cached=False,
         )
 
-    def purge_cache(self) -> int:
+    async def purge_cache(self) -> int:
         """Delete the documents this fetcher served and forget them; return how many went.
 
         Called when retrieval for a platform execution finishes (``evaluation.retrieve_run``):
@@ -127,7 +130,7 @@ class CachingDocumentFetcher:
         served, self._served = self._served, set()
         if not served:
             return 0
-        removed = self._store.purge(served)
+        removed = await self._store.purge(served)
         logger.info("Caché de recuperación: %d documento(s) eliminado(s)", removed)
         return removed
 

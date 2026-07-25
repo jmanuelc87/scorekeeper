@@ -11,7 +11,7 @@ the decorator on each class stays the authoring source of truth.
 from __future__ import annotations
 
 from sqlalchemy import delete, select
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.database import ScenarioMetric
 from scorekeeper.metrics import catalog as _catalog  # noqa: F401  (populate registry)
@@ -35,7 +35,7 @@ def declared_selection() -> set[tuple[str, str]]:
     return pairs
 
 
-def sync_selection(session: Session) -> None:
+async def sync_selection(session: AsyncSession) -> None:
     """Reconcile ``scenario_metrics`` with the metrics' declared scenarios.
 
     Idempotent: inserts missing rows and removes rows no longer declared, so the
@@ -44,14 +44,14 @@ def sync_selection(session: Session) -> None:
     desired = declared_selection()
     existing = {
         (row.use_case, row.metric_name)
-        for row in session.execute(select(ScenarioMetric)).scalars()
+        for row in (await session.execute(select(ScenarioMetric))).scalars()
     }
 
     for use_case, metric_name in desired - existing:
         session.add(ScenarioMetric(use_case=use_case, metric_name=metric_name))
 
     for use_case, metric_name in existing - desired:
-        session.execute(
+        await session.execute(
             delete(ScenarioMetric).where(
                 ScenarioMetric.use_case == use_case,
                 ScenarioMetric.metric_name == metric_name,
@@ -59,21 +59,21 @@ def sync_selection(session: Session) -> None:
         )
 
 
-def metrics_for(session: Session, use_case: str) -> list[str]:
+async def metrics_for(session: AsyncSession, use_case: str) -> list[str]:
     """Metric names selected for ``use_case``, falling back to the default set."""
-    names = _query_names(session, use_case)
+    names = await _query_names(session, use_case)
     if not names:
-        names = _query_names(session, DEFAULT_USE_CASE)
+        names = await _query_names(session, DEFAULT_USE_CASE)
     return names
 
 
-def resolve(session: Session, use_case: str) -> list[Metric]:
+async def resolve(session: AsyncSession, use_case: str) -> list[Metric]:
     """Instantiate the metrics selected for ``use_case``.
 
     Raises ``KeyError`` (Spanish message) if a stored ``metric_name`` is not in
     the code registry.
     """
-    return [MetricRegistry.create(name) for name in metrics_for(session, use_case)]
+    return [MetricRegistry.create(name) for name in await metrics_for(session, use_case)]
 
 
 def parse_use_cases(raw: str) -> list[str]:
@@ -81,7 +81,7 @@ def parse_use_cases(raw: str) -> list[str]:
     return [token.strip() for token in raw.split(",") if token.strip()]
 
 
-def metrics_for_scenario(session: Session, use_case: str) -> list[str]:
+async def metrics_for_scenario(session: AsyncSession, use_case: str) -> list[str]:
     """Union of metric names across a scenario's comma-separated ``use_case`` tokens.
 
     Each token is resolved independently (no per-token default); the results are
@@ -92,28 +92,28 @@ def metrics_for_scenario(session: Session, use_case: str) -> list[str]:
     names: list[str] = []
     seen: set[str] = set()
     for token in parse_use_cases(use_case):
-        for name in _query_names(session, token):
+        for name in await _query_names(session, token):
             if name not in seen:
                 seen.add(name)
                 names.append(name)
     if not names:
-        names = _query_names(session, DEFAULT_USE_CASE)
+        names = await _query_names(session, DEFAULT_USE_CASE)
     return names
 
 
-def resolve_scenario(session: Session, use_case: str) -> list[Metric]:
+async def resolve_scenario(session: AsyncSession, use_case: str) -> list[Metric]:
     """Instantiate the metrics for a comma-separated scenario ``use_case``.
 
     Raises ``KeyError`` (Spanish message) if a stored ``metric_name`` is not in
     the code registry.
     """
-    return [MetricRegistry.create(name) for name in metrics_for_scenario(session, use_case)]
+    return [MetricRegistry.create(name) for name in await metrics_for_scenario(session, use_case)]
 
 
-def _query_names(session: Session, use_case: str) -> list[str]:
+async def _query_names(session: AsyncSession, use_case: str) -> list[str]:
     stmt = (
         select(ScenarioMetric.metric_name)
         .where(ScenarioMetric.use_case == use_case)
         .order_by(ScenarioMetric.metric_name)
     )
-    return list(session.execute(stmt).scalars())
+    return list((await session.execute(stmt)).scalars())

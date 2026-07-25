@@ -9,10 +9,7 @@ from __future__ import annotations
 
 import pytest
 from pydantic import BaseModel
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
 
-from scorekeeper.database import Base
 from scorekeeper.metrics.base import TurnView
 from scorekeeper.metrics.catalog.faithfulness import (
     FaithfulnessDeepeval,
@@ -119,11 +116,3 @@ def make_judge():
 @pytest.fixture
 def turn() -> TurnView:
     return TurnView(prompt="¿Cómo reinicio el router?", response="Mantén pulsado 10s.")
-
-
-@pytest.fixture
-def db_session() -> Session:
-    engine = create_engine("sqlite://")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        yield session
