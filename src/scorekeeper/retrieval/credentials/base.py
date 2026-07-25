@@ -22,7 +22,7 @@ from scorekeeper.retrieval.credentials.secrets import SecretError
 from scorekeeper.retrieval.types import DocumentLocator
 
 if TYPE_CHECKING:
-    from scorekeeper.database import AuthProviderConfig
+    from scorekeeper.db.models import AuthProviderConfig
 
 
 class CredentialError(Exception):

@@ -22,7 +22,8 @@ from pathlib import Path
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.database import DocumentCacheEntry, session_scope
+from scorekeeper.db.connection import session_scope
+from scorekeeper.db.models import DocumentCacheEntry
 from scorekeeper.retrieval.types import DocType
 
 # Blob filename extension per document type (cosmetic; the SHA is the real key).

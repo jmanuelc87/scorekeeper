@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper import evaluation, tasks
-from scorekeeper.database import BenchmarkRun, Turn
+from scorekeeper.db.models import BenchmarkRun, Turn
 from scorekeeper.evaluation import UploadedFile, ingest_evaluation, retrieve_run
 from scorekeeper.retrieval.types import (
     STATUS_EN_RECUPERACION,

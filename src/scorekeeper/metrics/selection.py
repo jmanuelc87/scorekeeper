@@ -13,7 +13,7 @@ from __future__ import annotations
 from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.database import ScenarioMetric
+from scorekeeper.db.models import ScenarioMetric
 from scorekeeper.metrics import catalog as _catalog  # noqa: F401  (populate registry)
 from scorekeeper.metrics.base import Metric
 from scorekeeper.metrics.registry import MetricRegistry

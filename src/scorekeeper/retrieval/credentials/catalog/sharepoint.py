@@ -19,7 +19,7 @@ from scorekeeper.retrieval.credentials.registry import register_credential_provi
 from scorekeeper.retrieval.types import DocumentLocator
 
 if TYPE_CHECKING:
-    from scorekeeper.database import AuthProviderConfig
+    from scorekeeper.db.models import AuthProviderConfig
 
 # Settings every SharePoint row must supply to build a certificate ClientContext.
 _REQUIRED_FIELDS = ("tenant_id", "client_id", "thumbprint", "site_url")

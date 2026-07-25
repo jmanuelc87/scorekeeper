@@ -1,6 +1,6 @@
 """CRUD service for ``auth_providers`` rows (the retrieval credential store).
 
-Thin persistence layer over :class:`~scorekeeper.database.AuthProviderConfig`, following the
+Thin persistence layer over :class:`~scorekeeper.db.models.AuthProviderConfig`, following the
 codebase's session-injection convention (``session`` defaults to ``SessionLocal()``; tests
 inject an in-memory session). The HTTP layer (``scorekeeper.api``) validates input and maps
 these functions' results and exceptions onto status codes.
@@ -24,7 +24,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.config.settings import get_settings
-from scorekeeper.database import AuthProviderConfig, session_scope
+from scorekeeper.db.connection import session_scope
+from scorekeeper.db.models import AuthProviderConfig
 from scorekeeper.retrieval.credentials.registry import CredentialProviderRegistry
 from scorekeeper.retrieval.credentials.secrets import encrypt_secret
 

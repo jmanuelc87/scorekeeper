@@ -272,7 +272,7 @@ the *authoring source of truth is the decorator on each class*:
   Spanish `KeyError` if a stored name is not in the code registry).
 
 ```python
-from scorekeeper.database import SessionLocal
+from scorekeeper.db.connection import SessionLocal
 from scorekeeper.metrics.selection import sync_selection, resolve
 
 with SessionLocal() as session:

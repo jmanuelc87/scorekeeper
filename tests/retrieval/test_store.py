@@ -9,7 +9,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.database import DocumentCacheEntry
+from scorekeeper.db.models import DocumentCacheEntry
 from scorekeeper.retrieval.store import DocumentStore
 from scorekeeper.retrieval.types import DocType
 

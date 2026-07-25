@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
-from scorekeeper.database import Base
+from scorekeeper.db.models import Base
 from scorekeeper.runner import EvalRunner
 
 
@@ -57,7 +57,7 @@ def _isolate_session_local(monkeypatch, session_factory) -> None:
     time, so this single patch covers every consumer — and guarantees no test can reach
     the real DATABASE_URL by taking a code path that opens its own session.
     """
-    monkeypatch.setattr("scorekeeper.database.SessionLocal", session_factory)
+    monkeypatch.setattr("scorekeeper.db.connection.SessionLocal", session_factory)
 
 
 @pytest.fixture

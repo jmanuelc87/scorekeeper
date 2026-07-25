@@ -20,7 +20,7 @@ from celery.signals import worker_process_init
 
 from scorekeeper import evaluation
 from scorekeeper.celery_app import celery_app
-from scorekeeper.database import engine
+from scorekeeper.db.connection import engine
 
 logger = logging.getLogger(__name__)
 

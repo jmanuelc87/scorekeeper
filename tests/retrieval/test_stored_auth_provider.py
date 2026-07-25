@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.database import AuthProviderConfig
+from scorekeeper.db.models import AuthProviderConfig
 from scorekeeper.retrieval import (
     AuthClient,
     AuthProvider,

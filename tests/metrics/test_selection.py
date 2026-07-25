@@ -17,7 +17,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.database import ScenarioMetric
+from scorekeeper.db.models import ScenarioMetric
 from scorekeeper.metrics.base import Metric
 from scorekeeper.metrics.selection import (
     metrics_for,

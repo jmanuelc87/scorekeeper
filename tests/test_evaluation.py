@@ -23,7 +23,7 @@ from sqlalchemy.orm import selectinload
 
 from scorekeeper import evaluation, tasks
 from scorekeeper.api import app
-from scorekeeper.database import (
+from scorekeeper.db.models import (
     BenchmarkRun,
     MetricScore,
     PlatformExecution,
@@ -32,7 +32,7 @@ from scorekeeper.database import (
     SourceFile,
     Turn,
 )
-from scorekeeper.database import MetricTrace as MetricTraceRow
+from scorekeeper.db.models import MetricTrace as MetricTraceRow
 from scorekeeper.evaluation import (
     UploadedFile,
     get_run_summary,

@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 
 from scorekeeper import evaluation, tasks
 from scorekeeper.config.settings import get_settings
-from scorekeeper.database import engine
+from scorekeeper.db.connection import engine
 from scorekeeper.utils.logging_config import configure_logging
 from scorekeeper.retrieval.credentials import service as auth_providers
 from scorekeeper.retrieval.credentials.service import (

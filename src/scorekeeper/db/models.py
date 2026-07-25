@@ -1,8 +1,17 @@
+"""The ORM models — every table in the schema.
+
+One module on purpose: the models are a single interlinked object graph whose
+forward references (``Mapped[list[BenchmarkRun]]`` on ``SourceFile``, the string
+``order_by="PlatformExecution.started_at"``) resolve through the declarative
+registry, and importing ``Base`` from here is what guarantees Alembic's
+autogenerate sees all of them.
+
+The schema itself is owned by Alembic — see ``migrations/``.
+"""
+
 from __future__ import annotations
 
 import uuid
-from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any
 
@@ -19,12 +28,7 @@ from sqlalchemy import (
     Uuid,
 )
 from sqlalchemy.dialects.postgresql import JSONB
-from sqlalchemy.ext.asyncio import (
-    AsyncAttrs,
-    AsyncSession,
-    async_sessionmaker,
-    create_async_engine,
-)
+from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -32,38 +36,10 @@ from sqlalchemy.orm import (
     relationship,
 )
 
-from scorekeeper.config.settings import get_settings
 from scorekeeper.retrieved_context import RetrievedDocument
 
 # JSONB on PostgreSQL, plain JSON on the SQLite fallback.
 JsonColumn = JSON().with_variant(JSONB, "postgresql")
-
-engine = create_async_engine(get_settings().database_url, pool_pre_ping=True)
-# expire_on_commit=False is load-bearing under asyncio: with it True, every attribute
-# read after a commit is a lazy refresh — i.e. implicit IO from a context that cannot
-# do it, which surfaces as MissingGreenlet rather than as a slow query.
-SessionLocal = async_sessionmaker(bind=engine, expire_on_commit=False)
-
-
-@asynccontextmanager
-async def session_scope(
-    session: AsyncSession | None = None,
-) -> AsyncGenerator[AsyncSession]:
-    """Yield the injected ``session``, or open a fresh one and close it afterwards.
-
-    The one place the "caller may inject a session, otherwise we own one" convention
-    lives; every service function opens with ``async with session_scope(session) as db``.
-    ``SessionLocal`` is read from the module global at call time, so tests repoint it
-    once and every un-injected caller follows.
-    """
-    if session is not None:
-        yield session
-        return
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        await db.close()
 
 
 def _now() -> datetime:
@@ -510,7 +486,3 @@ class DocumentCacheEntry(Base):
         DateTime(timezone=True), default=_now, onupdate=_now
     )
 
-
-async def create_schema() -> None:
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)

@@ -7,7 +7,7 @@ import types
 
 import pytest
 
-from scorekeeper.database import AuthProviderConfig
+from scorekeeper.db.models import AuthProviderConfig
 from scorekeeper.retrieval.credentials.base import CredentialError
 from scorekeeper.retrieval.credentials.catalog.sharepoint import SharePointCredentialProvider
 from scorekeeper.retrieval.credentials.secrets import SecretError

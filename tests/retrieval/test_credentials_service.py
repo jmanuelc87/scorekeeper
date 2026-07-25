@@ -8,7 +8,7 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.database import AuthProviderConfig
+from scorekeeper.db.models import AuthProviderConfig
 from scorekeeper.retrieval.credentials import service
 from scorekeeper.retrieval.credentials.service import (
     ProviderConflictError,

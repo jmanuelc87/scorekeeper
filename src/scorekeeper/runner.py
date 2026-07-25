@@ -40,7 +40,7 @@ import random
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.config.settings import get_settings
-from scorekeeper.database import (
+from scorekeeper.db.models import (
     BenchmarkRun,
     MetricScore,
     MetricTrace,

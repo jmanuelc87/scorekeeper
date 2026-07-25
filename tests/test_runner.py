@@ -15,7 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.evaluation import _run_tree
-from scorekeeper.database import (
+from scorekeeper.db.models import (
     BenchmarkRun,
     MetricScore,
     PlatformExecution,

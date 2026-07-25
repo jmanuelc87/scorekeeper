@@ -26,7 +26,7 @@ from scorekeeper.retrieval.credentials.registry import register_credential_provi
 from scorekeeper.retrieval.types import DocumentLocator
 
 if TYPE_CHECKING:
-    from scorekeeper.database import AuthProviderConfig
+    from scorekeeper.db.models import AuthProviderConfig
 
 # Refresh a little before the token's stated expiry, to avoid using one that lapses in flight.
 _EXPIRY_SKEW_SECONDS = 30.0

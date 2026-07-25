@@ -144,7 +144,8 @@ lazily; injectable in tests), so no extra install is needed.
 3. Insert an enabled `auth_providers` row. `AuthProviderConfig.from_sharepoint` encrypts the
    PEM on the way in:
    ```python
-   from scorekeeper.database import AuthProviderConfig, SessionLocal
+   from scorekeeper.db.connection import SessionLocal
+   from scorekeeper.db.models import AuthProviderConfig
    from scorekeeper.config.settings import get_settings
 
    with SessionLocal() as db:

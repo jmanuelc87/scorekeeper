@@ -45,7 +45,9 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from scorekeeper.database import (
+from scorekeeper.config.settings import get_settings
+from scorekeeper.db.connection import session_scope
+from scorekeeper.db.models import (
     BenchmarkRun,
     MetricScore,
     PlatformExecution,
@@ -54,9 +56,7 @@ from scorekeeper.database import (
     SourceFile,
     Turn,
     TurnTokenUsage,
-    session_scope,
 )
-from scorekeeper.config.settings import get_settings
 from scorekeeper.importer import normalize_messages, parse_conversation
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.selection import sync_selection

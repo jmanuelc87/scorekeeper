@@ -1,10 +1,10 @@
-"""Tests for ORM-level helpers in ``scorekeeper.database``."""
+"""Tests for ORM-level helpers in ``scorekeeper.db.models``."""
 
 from __future__ import annotations
 
 import pytest
 
-from scorekeeper.database import AuthProviderConfig, RetrievedContextDocument
+from scorekeeper.db.models import AuthProviderConfig, RetrievedContextDocument
 from scorekeeper.retrieval.credentials.secrets import SecretError
 from scorekeeper.retrieved_context import RetrievedDocument
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from scorekeeper.database import AuthProviderConfig
+from scorekeeper.db.models import AuthProviderConfig
 from scorekeeper.retrieval.credentials.base import AuthClient, CredentialError
 from scorekeeper.retrieval.credentials.catalog.oauth2 import (
     OAuth2Client,
