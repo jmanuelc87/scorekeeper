@@ -12,7 +12,9 @@ from fastapi import FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from scorekeeper import evaluation, tasks
+from scorekeeper import tasks
+from scorekeeper.core.services import ingestion, read_models, runs as run_service
+from scorekeeper.core.services import status as run_status
 from scorekeeper.config.settings import get_settings
 from scorekeeper.db.connection import engine
 from scorekeeper.utils.logging_config import configure_logging
@@ -61,7 +63,7 @@ class EvaluationPayload(BaseModel):
 
     # Default platform for the upload; a file may override it via its FileOverride.
     platform: str = Field(..., min_length=1)
-    use_case: str = evaluation.DEFAULT_USE_CASE
+    use_case: str = ingestion.DEFAULT_USE_CASE
     # Optional per-filename overrides; a file with no entry uses the defaults.
     files: dict[str, FileOverride] = Field(default_factory=dict)
 
@@ -94,7 +96,7 @@ class CapturePayload(BaseModel):
     """Body of ``POST /captures``: conversations scraped from a chat UI."""
 
     platform: str = Field(..., min_length=1)
-    use_case: str = evaluation.DEFAULT_USE_CASE
+    use_case: str = ingestion.DEFAULT_USE_CASE
     conversations: list[CaptureConversation] = Field(..., min_length=1)
 
 
@@ -185,7 +187,7 @@ async def create_evaluation(
         parsed_payload.platform,
     )
 
-    uploads: list[evaluation.UploadedFile] = []
+    uploads: list[ingestion.UploadedFile] = []
     for upload in files:
         filename = upload.filename or "archivo.xlsx"
         if not filename.lower().endswith(".xlsx"):
@@ -199,7 +201,7 @@ async def create_evaluation(
             )
         override = parsed_payload.files.get(filename, FileOverride())
         uploads.append(
-            evaluation.UploadedFile(
+            ingestion.UploadedFile(
                 filename=filename,
                 content=content,
                 scenario_id=override.scenario_id or Path(filename).stem,
@@ -209,14 +211,14 @@ async def create_evaluation(
         )
 
     try:
-        run_id = await evaluation.ingest_evaluation(parsed_payload.platform, uploads)
+        run_id = await ingestion.ingest_evaluation(parsed_payload.platform, uploads)
     except ValueError as exc:
         # Empty inputs or an unparseable sheet — a client error.
         logger.warning("POST /evaluations rechazado: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     logger.info("POST /evaluations ingerido: run_id=%s", run_id)
-    return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_INGERIDO)
+    return EvaluationEnqueuedResponse(run_id=run_id, status=run_status.STATUS_INGERIDO)
 
 
 @app.post("/captures", response_model=EvaluationEnqueuedResponse, status_code=202)
@@ -240,7 +242,7 @@ async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
         payload.platform,
     )
 
-    uploads: list[evaluation.UploadedFile] = []
+    uploads: list[ingestion.UploadedFile] = []
     for conversation in payload.conversations:
         messages = [
             message.model_dump(exclude_none=True) for message in conversation.messages
@@ -255,7 +257,7 @@ async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
             )
         source_ref = conversation.source_ref or conversation.scenario_id
         uploads.append(
-            evaluation.UploadedFile(
+            ingestion.UploadedFile(
                 filename=source_ref,
                 # No file bytes to hash, so the capture itself is the provenance.
                 content=json.dumps(messages, ensure_ascii=False).encode("utf-8"),
@@ -267,13 +269,13 @@ async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
         )
 
     try:
-        run_id = await evaluation.ingest_evaluation(payload.platform, uploads)
+        run_id = await ingestion.ingest_evaluation(payload.platform, uploads)
     except ValueError as exc:
         logger.warning("POST /captures rechazado: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     logger.info("POST /captures ingerido: run_id=%s", run_id)
-    return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_INGERIDO)
+    return EvaluationEnqueuedResponse(run_id=run_id, status=run_status.STATUS_INGERIDO)
 
 
 @app.post(
@@ -291,7 +293,7 @@ async def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
     never enqueued twice.
     """
     try:
-        status = await evaluation.start_run(run_id)
+        status = await run_service.start_run(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if status is None:
@@ -318,7 +320,7 @@ async def select_turns(run_id: str, payload: TurnSelectionRequest) -> TurnSelect
     ``409`` when the run has already left the ``ingerido`` state (already started).
     """
     try:
-        updated = await evaluation.set_turn_selection(
+        updated = await run_service.set_turn_selection(
             run_id, payload.turn_ids, payload.is_selected
         )
     except ValueError as exc:
@@ -344,7 +346,7 @@ async def get_evaluation(run_id: str) -> EvaluationResponse:
     ``POST /evaluations/{run_id}/start`` enqueues it. The platform's ``average_score``
     stays ``null`` until scoring finishes. ``404`` when the ``run_id`` is unknown.
     """
-    summary = await evaluation.get_run_summary(run_id)
+    summary = await run_service.get_run_summary(run_id)
     if summary is None:
         raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
     return EvaluationResponse.model_validate(summary)
@@ -385,7 +387,7 @@ async def get_scenario_turns(scenario_id: str) -> list[dict]:
     ``retrieved_context_source``), rolled-up ``turn_score`` and per-metric scores.
     ``404`` when the ``scenario_id`` is unknown or malformed.
     """
-    turns = await evaluation.retrieve_scenario_turns(scenario_id)
+    turns = await read_models.retrieve_scenario_turns(scenario_id)
     if turns is None:
         raise HTTPException(
             status_code=404, detail=f"El escenario {scenario_id!r} no existe."
@@ -407,7 +409,7 @@ async def get_turn_traces(
     ``judge_model`` and ``rubric_version``; ``provenance=false`` returns the minimal
     shape. ``404`` when the ``turn_id`` is unknown or malformed.
     """
-    traces = await evaluation.retrieve_turn_traces(turn_id, include_provenance=provenance)
+    traces = await read_models.retrieve_turn_traces(turn_id, include_provenance=provenance)
     if traces is None:
         raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
     return traces
@@ -430,7 +432,7 @@ async def get_turn_token_usage(turn_id: str) -> dict:
     derived ``total_tokens``. A turn that was never scored reports zeros. ``404`` when
     the ``turn_id`` is unknown or malformed.
     """
-    usage = await evaluation.retrieve_turn_token_usage(turn_id)
+    usage = await read_models.retrieve_turn_token_usage(turn_id)
     if usage is None:
         raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
     return usage
@@ -463,7 +465,7 @@ async def list_runs(
     persisted for direct inspection but not surfaced through this API.
     """
     try:
-        return await evaluation.retrieve_runs(
+        return await read_models.retrieve_runs(
             run_id=run_id,
             platform=platform,
             start_date=start_date,

@@ -10,9 +10,12 @@ from openpyxl import Workbook
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper import evaluation, tasks
+from scorekeeper import tasks
 from scorekeeper.db.models import BenchmarkRun, Turn
-from scorekeeper.evaluation import UploadedFile, ingest_evaluation, retrieve_run
+from scorekeeper.core.services import retrieval, scoring
+from scorekeeper.core.services import runs as run_service
+from scorekeeper.core.services.ingestion import UploadedFile, ingest_evaluation
+from scorekeeper.core.services.retrieval import retrieve_run
 from scorekeeper.core.retrieval.types import (
     STATUS_EN_RECUPERACION,
     DocType,
@@ -74,7 +77,7 @@ async def _ingest_one_turn_with_context(session: AsyncSession, cell: str) -> str
     run_id = await ingest_evaluation("claude", files, session=session)
     # Retrieval only runs for selected turns; select the turn so these tests exercise it.
     turn_ids = [str(t.id) for t in (await session.execute(select(Turn))).scalars().all()]
-    await evaluation.set_turn_selection(run_id, turn_ids, True, session=session)
+    await run_service.set_turn_selection(run_id, turn_ids, True, session=session)
     return run_id
 
 
@@ -166,7 +169,7 @@ async def test_retrieve_run_purges_cache_once_per_platform_execution(session: As
     run_id = await ingest_evaluation("claude", files, session=session)
     # Retrieval only runs for selected turns; select them so both scenarios retrieve.
     turn_ids = [str(t.id) for t in (await session.execute(select(Turn))).scalars().all()]
-    await evaluation.set_turn_selection(run_id, turn_ids, True, session=session)
+    await run_service.set_turn_selection(run_id, turn_ids, True, session=session)
     pipeline = _FakePipeline()
 
     await retrieve_run(run_id, session=session, pipeline=pipeline)
@@ -215,8 +218,8 @@ def test_run_pipeline_task_runs_retrieval_before_scoring(monkeypatch) -> None:
     async def _score(rid: str) -> None:
         order.append("score")
 
-    monkeypatch.setattr(evaluation, "retrieve_run", _retrieve)
-    monkeypatch.setattr(evaluation, "score_run", _score)
+    monkeypatch.setattr(retrieval, "retrieve_run", _retrieve)
+    monkeypatch.setattr(scoring, "score_run", _score)
 
     tasks.run_pipeline_task("run-123")
 
