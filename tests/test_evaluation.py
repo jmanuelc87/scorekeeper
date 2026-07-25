@@ -17,13 +17,13 @@ from typing import ClassVar
 import pytest
 from fastapi.testclient import TestClient
 from openpyxl import Workbook
-from sqlalchemy import create_engine, func, select
-from sqlalchemy.orm import Session
+from sqlalchemy import func, select
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from scorekeeper import evaluation, tasks
 from scorekeeper.api import app
 from scorekeeper.database import (
-    Base,
     BenchmarkRun,
     MetricScore,
     PlatformExecution,
@@ -119,18 +119,9 @@ class Utilidad(_FakeMetric):
 # --- Fixtures & helpers -------------------------------------------------------
 
 
-@pytest.fixture
-def session() -> Session:
-    engine = create_engine("sqlite://")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        yield session
-
-
-@pytest.fixture(autouse=True)
-def _no_turn_delay(monkeypatch) -> None:
-    """Skip the real between-turns pacing sleep so tests stay fast and deterministic."""
-    monkeypatch.setattr("scorekeeper.runner.time.sleep", lambda *_: None)
+async def _async_none(*args: object, **kwargs: object) -> None:
+    """Awaitable stand-in for a service function that returns ``None`` (unknown id)."""
+    return None
 
 
 @pytest.fixture
@@ -173,7 +164,7 @@ def _conversation_bytes() -> bytes:
 # --- project_turns ------------------------------------------------------------
 
 
-def test_project_turns_pairs_user_and_model() -> None:
+async def test_project_turns_pairs_user_and_model() -> None:
     messages = [
         {"turn": 1, "role": "user", "content": "hola"},
         {"turn": 1, "role": "model", "content": "qué tal"},
@@ -190,7 +181,7 @@ def test_project_turns_pairs_user_and_model() -> None:
     assert turns[1]["response"] == "hasta luego"
 
 
-def test_project_turns_missing_side_becomes_empty_string() -> None:
+async def test_project_turns_missing_side_becomes_empty_string() -> None:
     turns = project_turns([{"turn": 1, "role": "user", "content": "solo pregunta"}])
 
     assert turns == [
@@ -204,7 +195,7 @@ def test_project_turns_missing_side_becomes_empty_string() -> None:
     ]
 
 
-def test_project_turns_carries_context_source_and_expected() -> None:
+async def test_project_turns_carries_context_source_and_expected() -> None:
     messages = [
         {
             "turn": 1,
@@ -222,7 +213,7 @@ def test_project_turns_carries_context_source_and_expected() -> None:
     assert turns[0]["expected_output"] == "respuesta ideal"
 
 
-def test_ingest_stores_raw_context_source_without_extracting(session: Session) -> None:
+async def test_ingest_stores_raw_context_source_without_extracting(session: AsyncSession) -> None:
     cell = "manual (https://ejemplo.com/manual.pdf#page=3)"
     content = _xlsx_bytes(
         ["turn", "role", "content", "retrieved_context"],
@@ -237,18 +228,22 @@ def test_ingest_stores_raw_context_source_without_extracting(session: Session) -
         )
     ]
 
-    ingest_evaluation("claude", files, session=session)
+    await ingest_evaluation("claude", files, session=session)
 
     # Ingest stores the raw cell and does NOT extract documents — that is the retrieval
     # stage's job (run later by the worker).
-    docs = session.execute(select(RetrievedContextDocument)).scalars().all()
+    docs = (await session.execute(select(RetrievedContextDocument))).scalars().all()
     assert docs == []
-    turn = session.execute(select(Turn)).scalars().one()
+    turn = (
+        await session.execute(
+            select(Turn).options(selectinload(Turn.retrieved_documents))
+        )
+    ).scalars().one()
     assert turn.retrieved_context_source == cell
     assert turn.retrieved_documents == []
 
 
-def test_project_turns_joins_multiple_same_role_messages() -> None:
+async def test_project_turns_joins_multiple_same_role_messages() -> None:
     messages = [
         {"turn": 1, "role": "user", "content": "línea 1"},
         {"turn": 1, "role": "user", "content": "línea 2"},
@@ -263,7 +258,7 @@ def test_project_turns_joins_multiple_same_role_messages() -> None:
 # --- run_evaluation -----------------------------------------------------------
 
 
-def test_run_evaluation_single_platform(session: Session, registry) -> None:
+async def test_run_evaluation_single_platform(session: AsyncSession, registry) -> None:
     files = [
         UploadedFile(
             filename="esc1.xlsx",
@@ -273,7 +268,7 @@ def test_run_evaluation_single_platform(session: Session, registry) -> None:
         )
     ]
 
-    summary = run_evaluation(
+    summary = await run_evaluation(
         "claude", files, session=session, judge=RecordingJudge(0.8)
     )
 
@@ -285,37 +280,37 @@ def test_run_evaluation_single_platform(session: Session, registry) -> None:
 
     # Persisted hierarchy: one PlatformExecution, one ScenarioResult per file,
     # two turns each, one MetricScore per turn.
-    execs = session.execute(select(PlatformExecution)).scalars().all()
+    execs = (await session.execute(select(PlatformExecution))).scalars().all()
     assert {e.platform for e in execs} == {"claude"}
-    scenarios = session.execute(select(ScenarioResult)).scalars().all()
+    scenarios = (await session.execute(select(ScenarioResult))).scalars().all()
     assert len(scenarios) == 1
     assert all(s.status == "completado" for s in scenarios)
-    turn_count = session.execute(select(func.count()).select_from(Turn)).scalar_one()
+    turn_count = (await session.execute(select(func.count()).select_from(Turn))).scalar_one()
     assert turn_count == 2
-    score_count = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
+    score_count = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
     assert score_count == 2  # 2 turns × 1 metric
 
     # Provenance recorded.
-    sources = session.execute(select(SourceFile)).scalars().all()
+    sources = (await session.execute(select(SourceFile))).scalars().all()
     assert [s.filename for s in sources] == ["esc1.xlsx"]
-    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+    turn = (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().first()
     assert turn.prompt == "hola" and turn.response == "qué tal"
 
 
-def test_run_evaluation_multiple_files(session: Session, registry) -> None:
+async def test_run_evaluation_multiple_files(session: AsyncSession, registry) -> None:
     files = [
         UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default"),
         UploadedFile("esc2.xlsx", _conversation_bytes(), "esc2", "default"),
     ]
 
-    run_evaluation("claude", files, session=session, judge=RecordingJudge())
+    await run_evaluation("claude", files, session=session, judge=RecordingJudge())
 
-    scenarios = session.execute(select(ScenarioResult)).scalars().all()
+    scenarios = (await session.execute(select(ScenarioResult))).scalars().all()
     assert len(scenarios) == 2  # 1 platform × 2 files
     assert {s.scenario_id for s in scenarios} == {"esc1", "esc2"}
 
 
-def test_ingest_groups_files_by_per_file_platform(session: Session, registry) -> None:
+async def test_ingest_groups_files_by_per_file_platform(session: AsyncSession, registry) -> None:
     # esc1 has no override (falls back to the run-level "claude"); esc2 overrides to
     # "gemini"; esc3 also overrides to "gemini" and must share esc2's execution.
     files = [
@@ -324,9 +319,9 @@ def test_ingest_groups_files_by_per_file_platform(session: Session, registry) ->
         UploadedFile("esc3.xlsx", _conversation_bytes(), "esc3", "default", platform="gemini"),
     ]
 
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
 
-    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     by_platform = {pe.platform: pe for pe in run.platform_executions}
     # One execution per distinct resolved platform.
     assert set(by_platform) == {"claude", "gemini"}
@@ -334,143 +329,154 @@ def test_ingest_groups_files_by_per_file_platform(session: Session, registry) ->
     assert {s.scenario_id for s in by_platform["gemini"].scenario_results} == {"esc2", "esc3"}
 
 
-def test_ingest_single_platform_when_no_overrides(session: Session, registry) -> None:
+async def test_ingest_single_platform_when_no_overrides(session: AsyncSession, registry) -> None:
     files = [
         UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default"),
         UploadedFile("esc2.xlsx", _conversation_bytes(), "esc2", "default"),
     ]
 
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
 
-    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     # No per-file platform → a single execution holding both scenarios.
     assert len(run.platform_executions) == 1
     assert run.platform_executions[0].platform == "claude"
     assert len(run.platform_executions[0].scenario_results) == 2
 
 
-def test_run_evaluation_rejects_empty_inputs(session: Session, registry) -> None:
+async def test_run_evaluation_rejects_empty_inputs(session: AsyncSession, registry) -> None:
     file = UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")
     with pytest.raises(ValueError):
-        run_evaluation("", [file], session=session, judge=RecordingJudge())
+        await run_evaluation("", [file], session=session, judge=RecordingJudge())
     with pytest.raises(ValueError):
-        run_evaluation("claude", [], session=session, judge=RecordingJudge())
+        await run_evaluation("claude", [], session=session, judge=RecordingJudge())
 
 
-def test_run_evaluation_malformed_sheet_raises(session: Session, registry) -> None:
+async def test_run_evaluation_malformed_sheet_raises(session: AsyncSession, registry) -> None:
     bad = UploadedFile(
         "esc1.xlsx", _xlsx_bytes(["foo", "bar"], [["a", "b"]]), "esc1", "default"
     )
     with pytest.raises(ValueError):
-        run_evaluation("claude", [bad], session=session, judge=RecordingJudge())
+        await run_evaluation("claude", [bad], session=session, judge=RecordingJudge())
 
 
 # --- ingest_evaluation / score_run (the async split) --------------------------
 
 
-def test_ingest_sets_ingested_status(session: Session, registry) -> None:
+async def test_ingest_sets_ingested_status(session: AsyncSession, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
 
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
 
     # The tree exists, is ingested but not started, and is not yet scored.
-    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     assert run.status == "ingerido"
-    turns = session.execute(select(Turn)).scalars().all()
+    turns = (await session.execute(select(Turn))).scalars().all()
     assert len(turns) == 2
     assert all(t.turn_score is None for t in turns)
-    scores = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
+    scores = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
     assert scores == 0
 
 
-def test_ingest_progress_zero(session: Session, registry) -> None:
+async def test_ingest_progress_zero(session: AsyncSession, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
 
-    summary = get_run_summary(run_id, session=session)
+    summary = await get_run_summary(run_id, session=session)
     assert summary["progress"] == {"done": 0, "total": 2, "ratio": 0.0}
 
 
-def test_progress_midway(session: Session, registry) -> None:
+async def test_progress_midway(session: AsyncSession, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
 
     # Simulate a worker part-way through: running, one of two turns scored.
-    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     run.status = "en_proceso"
-    turns = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().all()
+    turns = (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().all()
     turns[0].turn_score = 0.5
-    session.commit()
+    await session.commit()
 
-    summary = get_run_summary(run_id, session=session)
+    summary = await get_run_summary(run_id, session=session)
     assert summary["progress"] == {"done": 1, "total": 2, "ratio": 0.5}
 
 
-def _all_turn_ids(session: Session, run_id: str) -> list[str]:
-    turns = session.execute(select(Turn)).scalars().all()
+async def _all_turn_ids(session: AsyncSession, run_id: str) -> list[str]:
+    turns = (await session.execute(select(Turn))).scalars().all()
     return [str(t.id) for t in turns]
 
 
-def test_score_run_end_to_end(session: Session, registry) -> None:
+async def test_score_run_end_to_end(session: AsyncSession, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
     # Scoring is opt-in per turn — select both turns before scoring.
-    set_turn_selection(run_id, _all_turn_ids(session, run_id), True, session=session)
+    await set_turn_selection(
+        run_id, await _all_turn_ids(session, run_id), True, session=session
+    )
 
-    summary = score_run(run_id, session=session, judge=RecordingJudge(0.8))
+    summary = await score_run(run_id, session=session, judge=RecordingJudge(0.8))
 
     assert summary["run_id"] == run_id
     assert summary["status"] == "completado"
     assert summary["platforms"][0]["average_score"] == pytest.approx(0.8)
     # Fully scored -> progress pinned to 1.0.
     assert summary["progress"] == {"done": 2, "total": 2, "ratio": 1.0}
-    scores = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
+    scores = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
     assert scores == 2  # 2 turns × 1 metric
 
 
-def test_score_run_only_scores_selected_turns(session: Session, registry) -> None:
+async def test_score_run_only_scores_selected_turns(session: AsyncSession, registry) -> None:
     # Select only the first of the two ingested turns; scoring must skip the other.
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
-    run_id = ingest_evaluation("claude", files, session=session)
-    first_turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
-    set_turn_selection(run_id, [str(first_turn.id)], True, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
+    first_turn = (
+        (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().first()
+    )
+    await set_turn_selection(run_id, [str(first_turn.id)], True, session=session)
 
-    score_run(run_id, session=session, judge=RecordingJudge(0.8))
+    await score_run(run_id, session=session, judge=RecordingJudge(0.8))
 
     # Only the selected turn produced a score row; the other stays unscored.
-    scores = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
+    scores = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
     assert scores == 1
     by_number = {
         t.turn_number: t.turn_score
-        for t in session.execute(select(Turn)).scalars().all()
+        for t in (await session.execute(select(Turn))).scalars().all()
     }
     assert by_number[1] == pytest.approx(0.8)
     assert by_number[2] is None
 
 
-def test_set_turn_selection_updates_matching_turns(session: Session, registry) -> None:
+async def test_set_turn_selection_updates_matching_turns(
+    session: AsyncSession, registry
+) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
-    run_id = ingest_evaluation("claude", files, session=session)
-    turn_ids = _all_turn_ids(session, run_id)
+    run_id = await ingest_evaluation("claude", files, session=session)
+    turn_ids = await _all_turn_ids(session, run_id)
 
-    updated = set_turn_selection(run_id, turn_ids, True, session=session)
+    updated = await set_turn_selection(run_id, turn_ids, True, session=session)
 
     assert updated == 2
-    assert all(t.is_selected for t in session.execute(select(Turn)).scalars().all())
+    assert all(t.is_selected for t in (await session.execute(select(Turn))).scalars().all())
 
     # Deselect one turn; the count reflects only the turns actually touched.
-    updated = set_turn_selection(run_id, [turn_ids[0]], False, session=session)
+    updated = await set_turn_selection(run_id, [turn_ids[0]], False, session=session)
     assert updated == 1
-    by_id = {str(t.id): t.is_selected for t in session.execute(select(Turn)).scalars().all()}
+    by_id = {
+        str(t.id): t.is_selected
+        for t in (await session.execute(select(Turn))).scalars().all()
+    }
     assert by_id[turn_ids[0]] is False
     assert by_id[turn_ids[1]] is True
 
 
-def test_set_turn_selection_ignores_foreign_and_bad_ids(session: Session, registry) -> None:
+async def test_set_turn_selection_ignores_foreign_and_bad_ids(
+    session: AsyncSession, registry
+) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
 
-    updated = set_turn_selection(
+    updated = await set_turn_selection(
         run_id,
         ["not-a-uuid", "00000000-0000-0000-0000-000000000000"],
         True,
@@ -478,63 +484,67 @@ def test_set_turn_selection_ignores_foreign_and_bad_ids(session: Session, regist
     )
 
     assert updated == 0
-    assert not any(t.is_selected for t in session.execute(select(Turn)).scalars().all())
+    assert not any(
+        t.is_selected for t in (await session.execute(select(Turn))).scalars().all()
+    )
 
 
-def test_set_turn_selection_unknown_run_returns_none(session: Session) -> None:
-    assert set_turn_selection("not-a-uuid", [], True, session=session) is None
+async def test_set_turn_selection_unknown_run_returns_none(session: AsyncSession) -> None:
+    assert await set_turn_selection("not-a-uuid", [], True, session=session) is None
     assert (
-        set_turn_selection(
+        await set_turn_selection(
             "00000000-0000-0000-0000-000000000000", [], True, session=session
         )
         is None
     )
 
 
-def test_set_turn_selection_after_start_raises(session: Session, registry) -> None:
+async def test_set_turn_selection_after_start_raises(session: AsyncSession, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
-    run_id = ingest_evaluation("claude", files, session=session)
-    start_run(run_id, session=session)  # ingerido -> en_cola
+    run_id = await ingest_evaluation("claude", files, session=session)
+    await start_run(run_id, session=session)  # ingerido -> en_cola
 
     # Selection is only allowed before a run leaves the 'ingerido' state.
     with pytest.raises(ValueError):
-        set_turn_selection(run_id, _all_turn_ids(session, run_id), True, session=session)
+        await set_turn_selection(
+            run_id, await _all_turn_ids(session, run_id), True, session=session
+        )
 
 
-def test_score_run_unknown_id_raises(session: Session) -> None:
+async def test_score_run_unknown_id_raises(session: AsyncSession) -> None:
     with pytest.raises(ValueError):
-        score_run("00000000-0000-0000-0000-000000000000", session=session)
+        await score_run("00000000-0000-0000-0000-000000000000", session=session)
 
 
-def test_get_run_summary_unknown_returns_none(session: Session) -> None:
-    assert get_run_summary("not-a-uuid", session=session) is None
-    assert get_run_summary("00000000-0000-0000-0000-000000000000", session=session) is None
+async def test_get_run_summary_unknown_returns_none(session: AsyncSession) -> None:
+    assert await get_run_summary("not-a-uuid", session=session) is None
+    assert await get_run_summary("00000000-0000-0000-0000-000000000000", session=session) is None
 
 
-def test_start_run_moves_ingested_to_queued(session: Session, registry) -> None:
+async def test_start_run_moves_ingested_to_queued(session: AsyncSession, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
 
-    status = start_run(run_id, session=session)
+    status = await start_run(run_id, session=session)
 
     assert status == "en_cola"
-    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     assert run.status == "en_cola"
 
 
-def test_start_run_unknown_returns_none(session: Session) -> None:
-    assert start_run("not-a-uuid", session=session) is None
-    assert start_run("00000000-0000-0000-0000-000000000000", session=session) is None
+async def test_start_run_unknown_returns_none(session: AsyncSession) -> None:
+    assert await start_run("not-a-uuid", session=session) is None
+    assert await start_run("00000000-0000-0000-0000-000000000000", session=session) is None
 
 
-def test_start_run_already_started_raises(session: Session, registry) -> None:
+async def test_start_run_already_started_raises(session: AsyncSession, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
-    run_id = ingest_evaluation("claude", files, session=session)
-    start_run(run_id, session=session)  # ingerido -> en_cola
+    run_id = await ingest_evaluation("claude", files, session=session)
+    await start_run(run_id, session=session)  # ingerido -> en_cola
 
     # A second start is rejected so a run is never enqueued twice.
     with pytest.raises(ValueError):
-        start_run(run_id, session=session)
+        await start_run(run_id, session=session)
 
 
 # --- POST /evaluations endpoint -----------------------------------------------
@@ -546,10 +556,10 @@ def _payload(**over) -> str:
     return json.dumps(body)
 
 
-def test_endpoint_ingests_without_enqueue_and_returns_run_id(monkeypatch) -> None:
+async def test_endpoint_ingests_without_enqueue_and_returns_run_id(monkeypatch) -> None:
     captured: dict = {}
 
-    def fake_ingest(platform, files, *, session=None):
+    async def fake_ingest(platform, files, *, session=None):
         captured["platform"] = platform
         captured["files"] = files
         return "run-123"
@@ -586,10 +596,10 @@ def test_endpoint_ingests_without_enqueue_and_returns_run_id(monkeypatch) -> Non
     assert upload.platform is None  # no per-file platform → falls back to payload
 
 
-def test_endpoint_per_file_platform_override(monkeypatch) -> None:
+async def test_endpoint_per_file_platform_override(monkeypatch) -> None:
     captured: dict = {}
 
-    def fake_ingest(platform, files, *, session=None):
+    async def fake_ingest(platform, files, *, session=None):
         captured["platform"] = platform
         captured["files"] = {u.filename: u for u in files}
         return "run-9"
@@ -614,13 +624,13 @@ def test_endpoint_per_file_platform_override(monkeypatch) -> None:
     assert captured["files"]["esc2.xlsx"].platform == "gemini"
 
 
-def test_endpoint_defaults_scenario_id_to_stem(monkeypatch) -> None:
+async def test_endpoint_defaults_scenario_id_to_stem(monkeypatch) -> None:
     captured: dict = {}
-    monkeypatch.setattr(
-        evaluation,
-        "ingest_evaluation",
-        lambda platform, files, **kw: captured.update(files=files) or "run-x",
-    )
+    async def fake_ingest(platform, files, **kw):
+        captured.update(files=files)
+        return "run-x"
+
+    monkeypatch.setattr(evaluation, "ingest_evaluation", fake_ingest)
     monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: None)
 
     with TestClient(app) as client:
@@ -639,9 +649,13 @@ def test_endpoint_defaults_scenario_id_to_stem(monkeypatch) -> None:
 # --- POST /evaluations/{run_id}/start endpoint --------------------------------
 
 
-def test_start_endpoint_enqueues_and_returns_queued(monkeypatch) -> None:
+async def test_start_endpoint_enqueues_and_returns_queued(monkeypatch) -> None:
     captured: dict = {}
-    monkeypatch.setattr(evaluation, "start_run", lambda run_id, **kw: "en_cola")
+
+    async def fake_start(run_id, **kw):
+        return "en_cola"
+
+    monkeypatch.setattr(evaluation, "start_run", fake_start)
     monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
 
     with TestClient(app) as client:
@@ -653,9 +667,13 @@ def test_start_endpoint_enqueues_and_returns_queued(monkeypatch) -> None:
     assert captured["enqueued"] == "run-123"
 
 
-def test_start_endpoint_unknown_run_404(monkeypatch) -> None:
+async def test_start_endpoint_unknown_run_404(monkeypatch) -> None:
     captured: dict = {}
-    monkeypatch.setattr(evaluation, "start_run", lambda run_id, **kw: None)
+
+    async def fake_start(run_id, **kw):
+        return None
+
+    monkeypatch.setattr(evaluation, "start_run", fake_start)
     monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
 
     with TestClient(app) as client:
@@ -665,10 +683,10 @@ def test_start_endpoint_unknown_run_404(monkeypatch) -> None:
     assert "enqueued" not in captured  # nothing enqueued for an unknown run
 
 
-def test_start_endpoint_already_started_409(monkeypatch) -> None:
+async def test_start_endpoint_already_started_409(monkeypatch) -> None:
     captured: dict = {}
 
-    def fake_start(run_id, **kw):
+    async def fake_start(run_id, **kw):
         raise ValueError("El run ya fue iniciado.")
 
     monkeypatch.setattr(evaluation, "start_run", fake_start)
@@ -684,10 +702,10 @@ def test_start_endpoint_already_started_409(monkeypatch) -> None:
 # --- PATCH /evaluations/{run_id}/turns/selection endpoint ---------------------
 
 
-def test_selection_endpoint_returns_updated_count(monkeypatch) -> None:
+async def test_selection_endpoint_returns_updated_count(monkeypatch) -> None:
     captured: dict = {}
 
-    def fake_select(run_id, turn_ids, is_selected, **kw):
+    async def fake_select(run_id, turn_ids, is_selected, **kw):
         captured.update(run_id=run_id, turn_ids=turn_ids, is_selected=is_selected)
         return len(turn_ids)
 
@@ -704,8 +722,11 @@ def test_selection_endpoint_returns_updated_count(monkeypatch) -> None:
     assert captured == {"run_id": "run-123", "turn_ids": ["a", "b"], "is_selected": True}
 
 
-def test_selection_endpoint_unknown_run_404(monkeypatch) -> None:
-    monkeypatch.setattr(evaluation, "set_turn_selection", lambda *a, **kw: None)
+async def test_selection_endpoint_unknown_run_404(monkeypatch) -> None:
+    async def fake_select(*a, **kw):
+        return None
+
+    monkeypatch.setattr(evaluation, "set_turn_selection", fake_select)
 
     with TestClient(app) as client:
         response = client.patch(
@@ -716,8 +737,8 @@ def test_selection_endpoint_unknown_run_404(monkeypatch) -> None:
     assert response.status_code == 404
 
 
-def test_selection_endpoint_already_started_409(monkeypatch) -> None:
-    def fake_select(run_id, turn_ids, is_selected, **kw):
+async def test_selection_endpoint_already_started_409(monkeypatch) -> None:
+    async def fake_select(run_id, turn_ids, is_selected, **kw):
         raise ValueError("El run ya fue iniciado.")
 
     monkeypatch.setattr(evaluation, "set_turn_selection", fake_select)
@@ -731,11 +752,9 @@ def test_selection_endpoint_already_started_409(monkeypatch) -> None:
     assert response.status_code == 409
 
 
-def test_endpoint_get_returns_summary(monkeypatch) -> None:
-    monkeypatch.setattr(
-        evaluation,
-        "get_run_summary",
-        lambda run_id, **kw: {
+async def test_endpoint_get_returns_summary(monkeypatch) -> None:
+    async def fake_summary(run_id, **kw):
+        return {
             "run_id": run_id,
             "status": "en_proceso",
             "progress": {"done": 1, "total": 2, "ratio": 0.5},
@@ -747,8 +766,9 @@ def test_endpoint_get_returns_summary(monkeypatch) -> None:
                     "status_breakdown": {},
                 }
             ],
-        },
-    )
+        }
+
+    monkeypatch.setattr(evaluation, "get_run_summary", fake_summary)
 
     with TestClient(app) as client:
         response = client.get("/evaluations/run-123")
@@ -761,8 +781,8 @@ def test_endpoint_get_returns_summary(monkeypatch) -> None:
     assert body["platforms"][0]["average_score"] is None
 
 
-def test_endpoint_get_unknown_run_404(monkeypatch) -> None:
-    monkeypatch.setattr(evaluation, "get_run_summary", lambda run_id, **kw: None)
+async def test_endpoint_get_unknown_run_404(monkeypatch) -> None:
+    monkeypatch.setattr(evaluation, "get_run_summary", _async_none)
 
     with TestClient(app) as client:
         response = client.get("/evaluations/does-not-exist")
@@ -770,11 +790,11 @@ def test_endpoint_get_unknown_run_404(monkeypatch) -> None:
     assert response.status_code == 404
 
 
-def test_runs_endpoint_forwards_filters_and_returns_list(monkeypatch) -> None:
+async def test_runs_endpoint_forwards_filters_and_returns_list(monkeypatch) -> None:
     captured: dict = {}
     runs = [{"run_id": "run-1", "status": "completado", "platforms": []}]
 
-    def fake_retrieve(**kwargs):
+    async def fake_retrieve(**kwargs):
         captured.update(kwargs)
         return runs
 
@@ -804,10 +824,10 @@ def test_runs_endpoint_forwards_filters_and_returns_list(monkeypatch) -> None:
     }
 
 
-def test_runs_endpoint_defaults_granularity_and_empty_result(monkeypatch) -> None:
+async def test_runs_endpoint_defaults_granularity_and_empty_result(monkeypatch) -> None:
     captured: dict = {}
 
-    def fake_retrieve(**kwargs):
+    async def fake_retrieve(**kwargs):
         captured.update(kwargs)
         return []
 
@@ -828,8 +848,8 @@ def test_runs_endpoint_defaults_granularity_and_empty_result(monkeypatch) -> Non
     }
 
 
-def test_runs_endpoint_invalid_input_400(monkeypatch) -> None:
-    def fake_retrieve(**kwargs):
+async def test_runs_endpoint_invalid_input_400(monkeypatch) -> None:
+    async def fake_retrieve(**kwargs):
         raise ValueError("Granularidad 'nope' inválida")
 
     monkeypatch.setattr(evaluation, "retrieve_runs", fake_retrieve)
@@ -840,7 +860,7 @@ def test_runs_endpoint_invalid_input_400(monkeypatch) -> None:
     assert response.status_code == 400
 
 
-def test_endpoint_rejects_invalid_payload() -> None:
+async def test_endpoint_rejects_invalid_payload() -> None:
     with TestClient(app) as client:
         response = client.post(
             "/evaluations",
@@ -850,7 +870,7 @@ def test_endpoint_rejects_invalid_payload() -> None:
     assert response.status_code == 422
 
 
-def test_endpoint_rejects_non_xlsx() -> None:
+async def test_endpoint_rejects_non_xlsx() -> None:
     with TestClient(app) as client:
         response = client.post(
             "/evaluations",
@@ -860,7 +880,7 @@ def test_endpoint_rejects_non_xlsx() -> None:
     assert response.status_code == 400
 
 
-def test_endpoint_rejects_empty_file() -> None:
+async def test_endpoint_rejects_empty_file() -> None:
     with TestClient(app) as client:
         response = client.post(
             "/evaluations",
@@ -870,8 +890,8 @@ def test_endpoint_rejects_empty_file() -> None:
     assert response.status_code == 400
 
 
-def test_endpoint_maps_value_error_to_400(monkeypatch) -> None:
-    def fake_ingest(*args, **kwargs):
+async def test_endpoint_maps_value_error_to_400(monkeypatch) -> None:
+    async def fake_ingest(*args, **kwargs):
         raise ValueError("hoja inválida")
 
     monkeypatch.setattr(evaluation, "ingest_evaluation", fake_ingest)
@@ -888,17 +908,19 @@ def test_endpoint_maps_value_error_to_400(monkeypatch) -> None:
 # --- retrieve_runs ------------------------------------------------------------
 
 
-def _score_one(session: Session, *, platform: str = "claude", scenario_id: str = "esc1") -> str:
+async def _score_one(
+    session: AsyncSession, *, platform: str = "claude", scenario_id: str = "esc1"
+) -> str:
     """Ingest + score a single-file run, returning its run_id."""
     files = [UploadedFile(f"{scenario_id}.xlsx", _conversation_bytes(), scenario_id, "default")]
-    summary = run_evaluation(platform, files, session=session, judge=RecordingJudge(0.8))
+    summary = await run_evaluation(platform, files, session=session, judge=RecordingJudge(0.8))
     return summary["run_id"]
 
 
-def test_retrieve_platform_granularity_stops_at_platform(session: Session, registry) -> None:
-    run_id = _score_one(session)
+async def test_retrieve_platform_granularity_stops_at_platform(session: AsyncSession, registry) -> None:
+    run_id = await _score_one(session)
 
-    runs = retrieve_runs(granularity="platform_executions", session=session)
+    runs = await retrieve_runs(granularity="platform_executions", session=session)
 
     assert len(runs) == 1
     run = runs[0]
@@ -913,10 +935,10 @@ def test_retrieve_platform_granularity_stops_at_platform(session: Session, regis
     assert "scenario_results" not in platform
 
 
-def test_retrieve_scenario_granularity_adds_scenarios(session: Session, registry) -> None:
-    _score_one(session)
+async def test_retrieve_scenario_granularity_adds_scenarios(session: AsyncSession, registry) -> None:
+    await _score_one(session)
 
-    runs = retrieve_runs(granularity="scenario_results", session=session)
+    runs = await retrieve_runs(granularity="scenario_results", session=session)
 
     scenarios = runs[0]["platforms"][0]["scenario_results"]
     assert len(scenarios) == 1
@@ -928,10 +950,10 @@ def test_retrieve_scenario_granularity_adds_scenarios(session: Session, registry
     assert "turns" not in scenario
 
 
-def test_retrieve_metric_granularity_adds_turns_and_scores(session: Session, registry) -> None:
-    _score_one(session)
+async def test_retrieve_metric_granularity_adds_turns_and_scores(session: AsyncSession, registry) -> None:
+    await _score_one(session)
 
-    runs = retrieve_runs(granularity="metric_scores", session=session)
+    runs = await retrieve_runs(granularity="metric_scores", session=session)
 
     scenario = runs[0]["platforms"][0]["scenario_results"][0]
     turns = scenario["turns"]
@@ -947,19 +969,19 @@ def test_retrieve_metric_granularity_adds_turns_and_scores(session: Session, reg
     # even though a trace row is persisted per metric score for direct inspection.
     assert "trace" not in scores[0]
     assert "justification" not in scores[0]
-    trace_rows = session.execute(select(func.count()).select_from(MetricTraceRow)).scalar_one()
-    metric_rows = session.execute(select(func.count()).select_from(MetricScore)).scalar_one()
+    trace_rows = (await session.execute(select(func.count()).select_from(MetricTraceRow))).scalar_one()
+    metric_rows = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
     assert trace_rows == metric_rows
 
 
 # --- retrieve_turn_traces + /turns/{turn_id}/traces ---------------------------
 
 
-def test_retrieve_turn_traces_with_provenance(session: Session, registry) -> None:
-    _score_one(session)
-    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+async def test_retrieve_turn_traces_with_provenance(session: AsyncSession, registry) -> None:
+    await _score_one(session)
+    turn = (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().first()
 
-    traces = retrieve_turn_traces(str(turn.id), session=session)
+    traces = await retrieve_turn_traces(str(turn.id), session=session)
 
     assert len(traces) == 1
     entry = traces[0]
@@ -970,11 +992,11 @@ def test_retrieve_turn_traces_with_provenance(session: Session, registry) -> Non
     assert entry["trace"]["steps"][0]["entries"][0]["value"] == pytest.approx(0.8)
 
 
-def test_retrieve_turn_traces_minimal_omits_provenance(session: Session, registry) -> None:
-    _score_one(session)
-    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+async def test_retrieve_turn_traces_minimal_omits_provenance(session: AsyncSession, registry) -> None:
+    await _score_one(session)
+    turn = (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().first()
 
-    traces = retrieve_turn_traces(str(turn.id), include_provenance=False, session=session)
+    traces = await retrieve_turn_traces(str(turn.id), include_provenance=False, session=session)
 
     entry = traces[0]
     assert set(entry) == {"metric_name", "trace"}
@@ -982,23 +1004,23 @@ def test_retrieve_turn_traces_minimal_omits_provenance(session: Session, registr
     assert entry["trace"]["steps"][0]["entries"][0]["value"] == pytest.approx(0.8)
 
 
-def test_retrieve_turn_traces_unknown_or_malformed_is_none(session: Session, registry) -> None:
-    _score_one(session)
+async def test_retrieve_turn_traces_unknown_or_malformed_is_none(session: AsyncSession, registry) -> None:
+    await _score_one(session)
 
-    assert retrieve_turn_traces("not-a-uuid", session=session) is None
+    assert await retrieve_turn_traces("not-a-uuid", session=session) is None
     assert (
-        retrieve_turn_traces(
+        await retrieve_turn_traces(
             "00000000-0000-0000-0000-000000000000", session=session
         )
         is None
     )
 
 
-def test_turn_traces_endpoint_forwards_and_returns(monkeypatch) -> None:
+async def test_turn_traces_endpoint_forwards_and_returns(monkeypatch) -> None:
     captured: dict = {}
     payload = [{"metric_name": "utilidad", "trace": {"steps": []}}]
 
-    def fake(turn_id, **kwargs):
+    async def fake(turn_id, **kwargs):
         captured["turn_id"] = turn_id
         captured.update(kwargs)
         return payload
@@ -1013,8 +1035,8 @@ def test_turn_traces_endpoint_forwards_and_returns(monkeypatch) -> None:
     assert captured == {"turn_id": "abc", "include_provenance": False}
 
 
-def test_turn_traces_endpoint_unknown_turn_404(monkeypatch) -> None:
-    monkeypatch.setattr(evaluation, "retrieve_turn_traces", lambda *a, **k: None)
+async def test_turn_traces_endpoint_unknown_turn_404(monkeypatch) -> None:
+    monkeypatch.setattr(evaluation, "retrieve_turn_traces", _async_none)
 
     with TestClient(app) as client:
         response = client.get("/turns/nope/traces")
@@ -1022,25 +1044,17 @@ def test_turn_traces_endpoint_unknown_turn_404(monkeypatch) -> None:
     assert response.status_code == 404
 
 
-def test_mcp_retrieve_turn_traces_coalesces_none(monkeypatch) -> None:
-    from scorekeeper import server
-
-    monkeypatch.setattr(evaluation, "retrieve_turn_traces", lambda *a, **k: None)
-    # The MCP tool never 404s: an unknown turn becomes an empty list.
-    assert server.retrieve_turn_traces("nope") == []
-
-
 # --- retrieve_turn_token_usage + /turns/{turn_id}/token-usage -----------------
 
 
-def test_retrieve_turn_token_usage_returns_row(session: Session, registry) -> None:
-    _score_one(session)
-    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+async def test_retrieve_turn_token_usage_returns_row(session: AsyncSession, registry) -> None:
+    await _score_one(session)
+    turn = (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().first()
     turn.token_usage.input_tokens = 120
     turn.token_usage.output_tokens = 45
-    session.flush()
+    await session.flush()
 
-    usage = retrieve_turn_token_usage(str(turn.id), session=session)
+    usage = await retrieve_turn_token_usage(str(turn.id), session=session)
 
     assert usage == {
         "turn_id": str(turn.id),
@@ -1050,16 +1064,16 @@ def test_retrieve_turn_token_usage_returns_row(session: Session, registry) -> No
     }
 
 
-def test_retrieve_turn_token_usage_without_row_reports_zeros(
-    session: Session, registry
+async def test_retrieve_turn_token_usage_without_row_reports_zeros(
+    session: AsyncSession, registry
 ) -> None:
-    _score_one(session)
-    turn = session.execute(select(Turn).order_by(Turn.turn_number)).scalars().first()
+    await _score_one(session)
+    turn = (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().first()
     # A turn with no usage row (e.g. never scored) reports zeros rather than 404ing.
     turn.token_usage = None
-    session.flush()
+    await session.flush()
 
-    usage = retrieve_turn_token_usage(str(turn.id), session=session)
+    usage = await retrieve_turn_token_usage(str(turn.id), session=session)
 
     assert usage == {
         "turn_id": str(turn.id),
@@ -1069,21 +1083,21 @@ def test_retrieve_turn_token_usage_without_row_reports_zeros(
     }
 
 
-def test_retrieve_turn_token_usage_unknown_or_malformed_is_none(
-    session: Session, registry
+async def test_retrieve_turn_token_usage_unknown_or_malformed_is_none(
+    session: AsyncSession, registry
 ) -> None:
-    _score_one(session)
+    await _score_one(session)
 
-    assert retrieve_turn_token_usage("not-a-uuid", session=session) is None
+    assert await retrieve_turn_token_usage("not-a-uuid", session=session) is None
     assert (
-        retrieve_turn_token_usage(
+        await retrieve_turn_token_usage(
             "00000000-0000-0000-0000-000000000000", session=session
         )
         is None
     )
 
 
-def test_turn_token_usage_endpoint_forwards_and_returns(monkeypatch) -> None:
+async def test_turn_token_usage_endpoint_forwards_and_returns(monkeypatch) -> None:
     captured: dict = {}
     payload = {
         "turn_id": "abc",
@@ -1092,7 +1106,7 @@ def test_turn_token_usage_endpoint_forwards_and_returns(monkeypatch) -> None:
         "total_tokens": 13,
     }
 
-    def fake(turn_id, **kwargs):
+    async def fake(turn_id, **kwargs):
         captured["turn_id"] = turn_id
         return payload
 
@@ -1106,8 +1120,8 @@ def test_turn_token_usage_endpoint_forwards_and_returns(monkeypatch) -> None:
     assert captured == {"turn_id": "abc"}
 
 
-def test_turn_token_usage_endpoint_unknown_turn_404(monkeypatch) -> None:
-    monkeypatch.setattr(evaluation, "retrieve_turn_token_usage", lambda *a, **k: None)
+async def test_turn_token_usage_endpoint_unknown_turn_404(monkeypatch) -> None:
+    monkeypatch.setattr(evaluation, "retrieve_turn_token_usage", _async_none)
 
     with TestClient(app) as client:
         response = client.get("/turns/nope/token-usage")
@@ -1115,24 +1129,16 @@ def test_turn_token_usage_endpoint_unknown_turn_404(monkeypatch) -> None:
     assert response.status_code == 404
 
 
-def test_mcp_retrieve_turn_token_usage_coalesces_none(monkeypatch) -> None:
-    from scorekeeper import server
-
-    monkeypatch.setattr(evaluation, "retrieve_turn_token_usage", lambda *a, **k: None)
-    # The MCP tool never 404s: an unknown turn becomes an empty object.
-    assert server.retrieve_turn_token_usage("nope") == {}
-
-
 # --- retrieve_scenario_turns + /scenarios/{scenario_id}/turns -----------------
 
 
-def test_retrieve_scenario_turns_returns_content_and_scores(
-    session: Session, registry
+async def test_retrieve_scenario_turns_returns_content_and_scores(
+    session: AsyncSession, registry
 ) -> None:
-    _score_one(session)
-    scenario = session.execute(select(ScenarioResult)).scalars().one()
+    await _score_one(session)
+    scenario = (await session.execute(select(ScenarioResult))).scalars().one()
 
-    turns = retrieve_scenario_turns(str(scenario.id), session=session)
+    turns = await retrieve_scenario_turns(str(scenario.id), session=session)
 
     assert [t["turn_number"] for t in turns] == [1, 2]
     first = turns[0]
@@ -1149,11 +1155,11 @@ def test_retrieve_scenario_turns_returns_content_and_scores(
     assert "trace" not in scores[0]
 
 
-def test_scenario_serialization_exposes_id(session: Session, registry) -> None:
-    _score_one(session)
-    scenario = session.execute(select(ScenarioResult)).scalars().one()
+async def test_scenario_serialization_exposes_id(session: AsyncSession, registry) -> None:
+    await _score_one(session)
+    scenario = (await session.execute(select(ScenarioResult))).scalars().one()
 
-    runs = retrieve_runs(granularity="scenario_results", session=session)
+    runs = await retrieve_runs(granularity="scenario_results", session=session)
 
     serialized = runs[0]["platforms"][0]["scenario_results"][0]
     # The UUID handle GET /scenarios/{id}/turns takes, alongside the readable label.
@@ -1161,35 +1167,35 @@ def test_scenario_serialization_exposes_id(session: Session, registry) -> None:
     assert serialized["scenario_id"] == "esc1"
 
 
-def test_retrieve_scenario_turns_empty_scenario_returns_list(
-    session: Session,
+async def test_retrieve_scenario_turns_empty_scenario_returns_list(
+    session: AsyncSession,
 ) -> None:
     execution = PlatformExecution(platform="claude", run=BenchmarkRun())
     scenario = ScenarioResult(
         scenario_id="vacio", use_case="default", platform_execution=execution
     )
     session.add(scenario)
-    session.commit()
+    await session.commit()
 
     # A scenario with no turns yields [] (not None — it exists).
-    assert retrieve_scenario_turns(str(scenario.id), session=session) == []
+    assert await retrieve_scenario_turns(str(scenario.id), session=session) == []
 
 
-def test_retrieve_scenario_turns_unknown_or_malformed_is_none(
-    session: Session, registry
+async def test_retrieve_scenario_turns_unknown_or_malformed_is_none(
+    session: AsyncSession, registry
 ) -> None:
-    _score_one(session)
+    await _score_one(session)
 
-    assert retrieve_scenario_turns("not-a-uuid", session=session) is None
+    assert await retrieve_scenario_turns("not-a-uuid", session=session) is None
     assert (
-        retrieve_scenario_turns(
+        await retrieve_scenario_turns(
             "00000000-0000-0000-0000-000000000000", session=session
         )
         is None
     )
 
 
-def test_scenario_turns_endpoint_forwards_and_returns(monkeypatch) -> None:
+async def test_scenario_turns_endpoint_forwards_and_returns(monkeypatch) -> None:
     captured: dict = {}
     payload = [
         {
@@ -1211,7 +1217,7 @@ def test_scenario_turns_endpoint_forwards_and_returns(monkeypatch) -> None:
         }
     ]
 
-    def fake(scenario_id):
+    async def fake(scenario_id):
         captured["scenario_id"] = scenario_id
         return payload
 
@@ -1225,8 +1231,8 @@ def test_scenario_turns_endpoint_forwards_and_returns(monkeypatch) -> None:
     assert captured == {"scenario_id": "abc"}
 
 
-def test_scenario_turns_endpoint_unknown_404(monkeypatch) -> None:
-    monkeypatch.setattr(evaluation, "retrieve_scenario_turns", lambda *a, **k: None)
+async def test_scenario_turns_endpoint_unknown_404(monkeypatch) -> None:
+    monkeypatch.setattr(evaluation, "retrieve_scenario_turns", _async_none)
 
     with TestClient(app) as client:
         response = client.get("/scenarios/nope/turns")
@@ -1234,81 +1240,81 @@ def test_scenario_turns_endpoint_unknown_404(monkeypatch) -> None:
     assert response.status_code == 404
 
 
-def test_retrieve_default_granularity_is_scenario(session: Session, registry) -> None:
-    _score_one(session)
+async def test_retrieve_default_granularity_is_scenario(session: AsyncSession, registry) -> None:
+    await _score_one(session)
 
-    runs = retrieve_runs(session=session)
+    runs = await retrieve_runs(session=session)
 
     platform = runs[0]["platforms"][0]
     assert "scenario_results" in platform
     assert "turns" not in platform["scenario_results"][0]
 
 
-def test_retrieve_platform_filter(session: Session, registry) -> None:
-    _score_one(session, platform="claude")
+async def test_retrieve_platform_filter(session: AsyncSession, registry) -> None:
+    await _score_one(session, platform="claude")
 
-    assert len(retrieve_runs(platform="claude", session=session)) == 1
+    assert len(await retrieve_runs(platform="claude", session=session)) == 1
     # Exact match: a different platform yields nothing.
-    assert retrieve_runs(platform="gemini", session=session) == []
+    assert await retrieve_runs(platform="gemini", session=session) == []
 
 
-def test_retrieve_run_id_filter(session: Session, registry) -> None:
-    run_id = _score_one(session, scenario_id="esc1")
-    _score_one(session, scenario_id="esc2")
+async def test_retrieve_run_id_filter(session: AsyncSession, registry) -> None:
+    run_id = await _score_one(session, scenario_id="esc1")
+    await _score_one(session, scenario_id="esc2")
 
-    runs = retrieve_runs(run_id=run_id, session=session)
+    runs = await retrieve_runs(run_id=run_id, session=session)
     assert len(runs) == 1
     assert runs[0]["run_id"] == run_id
     # Unknown / malformed ids resolve to an empty list, never an error.
-    assert retrieve_runs(run_id="not-a-uuid", session=session) == []
-    assert retrieve_runs(run_id="00000000-0000-0000-0000-000000000000", session=session) == []
+    assert await retrieve_runs(run_id="not-a-uuid", session=session) == []
+    assert await retrieve_runs(run_id="00000000-0000-0000-0000-000000000000", session=session) == []
 
 
-def test_retrieve_date_range_filters_scoring_window(session: Session, registry) -> None:
-    _score_one(session)
-    platform_exec = session.execute(select(PlatformExecution)).scalars().one()
+async def test_retrieve_date_range_filters_scoring_window(session: AsyncSession, registry) -> None:
+    await _score_one(session)
+    platform_exec = (await session.execute(select(PlatformExecution))).scalars().one()
     platform_exec.started_at = datetime(2026, 7, 10, 12, 0, 0)
     platform_exec.finished_at = datetime(2026, 7, 10, 12, 5, 0)
-    session.commit()
+    await session.commit()
 
     # The scoring window falls inside July.
-    assert len(retrieve_runs(start_date="2026-07-01", end_date="2026-07-31", session=session)) == 1
+    assert len(await retrieve_runs(start_date="2026-07-01", end_date="2026-07-31", session=session)) == 1
     # started_at (07-10) precedes an August lower bound -> excluded.
-    assert retrieve_runs(start_date="2026-08-01", session=session) == []
+    assert await retrieve_runs(start_date="2026-08-01", session=session) == []
     # finished_at (07-10) exceeds an early-July upper bound -> excluded.
-    assert retrieve_runs(end_date="2026-07-05", session=session) == []
+    assert await retrieve_runs(end_date="2026-07-05", session=session) == []
 
 
-def test_retrieve_date_bound_excludes_unscored(session: Session, registry) -> None:
-    ingest_evaluation(
+async def test_retrieve_date_bound_excludes_unscored(session: AsyncSession, registry) -> None:
+    await ingest_evaluation(
         "claude",
         [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")],
         session=session,
     )
 
     # No date filter: the queued run is returned.
-    assert len(retrieve_runs(session=session)) == 1
+    assert len(await retrieve_runs(session=session)) == 1
     # A date bound excludes it — started_at/finished_at stay NULL until scored.
-    assert retrieve_runs(start_date="2020-01-01", session=session) == []
+    assert await retrieve_runs(start_date="2020-01-01", session=session) == []
 
 
-def test_retrieve_invalid_granularity_raises(session: Session) -> None:
+async def test_retrieve_invalid_granularity_raises(session: AsyncSession) -> None:
     with pytest.raises(ValueError):
-        retrieve_runs(granularity="turnos", session=session)
+        await retrieve_runs(granularity="turnos", session=session)
 
 
-def test_retrieve_invalid_date_raises(session: Session) -> None:
+async def test_retrieve_invalid_date_raises(session: AsyncSession) -> None:
     with pytest.raises(ValueError):
-        retrieve_runs(start_date="ayer", session=session)
+        await retrieve_runs(start_date="ayer", session=session)
 
 
 # --- POST /captures -----------------------------------------------------------
 
 
-def test_captures_endpoint_ingests_without_enqueue(monkeypatch) -> None:
+async def test_captures_endpoint_ingests_without_enqueue(monkeypatch) -> None:
     captured: dict = {}
 
-    def fake_ingest(platform, files, *, session=None):
+    async def fake_ingest(platform, files, *, session=None):
         captured["platform"] = platform
         captured["files"] = files
         return "run-cap"
@@ -1351,13 +1357,13 @@ def test_captures_endpoint_ingests_without_enqueue(monkeypatch) -> None:
     assert json.loads(upload.content.decode()) == upload.messages
 
 
-def test_captures_endpoint_per_conversation_overrides(monkeypatch) -> None:
+async def test_captures_endpoint_per_conversation_overrides(monkeypatch) -> None:
     captured: dict = {}
-    monkeypatch.setattr(
-        evaluation,
-        "ingest_evaluation",
-        lambda platform, files, **kw: captured.update(files=files) or "run-cap",
-    )
+    async def fake_ingest(platform, files, **kw):
+        captured.update(files=files)
+        return "run-cap"
+
+    monkeypatch.setattr(evaluation, "ingest_evaluation", fake_ingest)
     monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: None)
 
     with TestClient(app) as client:
@@ -1384,7 +1390,7 @@ def test_captures_endpoint_per_conversation_overrides(monkeypatch) -> None:
     assert upload.filename == "esc1"
 
 
-def test_captures_endpoint_rejects_contentless_conversation() -> None:
+async def test_captures_endpoint_rejects_contentless_conversation() -> None:
     with TestClient(app) as client:
         response = client.post(
             "/captures",
@@ -1400,16 +1406,16 @@ def test_captures_endpoint_rejects_contentless_conversation() -> None:
     assert "vacio" in response.json()["detail"]
 
 
-def test_captures_endpoint_requires_conversations() -> None:
+async def test_captures_endpoint_requires_conversations() -> None:
     with TestClient(app) as client:
         response = client.post("/captures", json={"platform": "claude", "conversations": []})
 
     assert response.status_code == 422
 
 
-def test_captured_messages_reach_turns_without_a_spreadsheet(session: Session) -> None:
+async def test_captured_messages_reach_turns_without_a_spreadsheet(session: AsyncSession) -> None:
     """An UploadedFile carrying messages skips the .xlsx parser end to end."""
-    run_id = ingest_evaluation(
+    run_id = await ingest_evaluation(
         "claude",
         [
             UploadedFile(
@@ -1427,7 +1433,11 @@ def test_captured_messages_reach_turns_without_a_spreadsheet(session: Session) -
         session=session,
     )
 
-    scenario = session.scalars(select(ScenarioResult)).one()
+    scenario = (
+        await session.scalars(
+            select(ScenarioResult).options(selectinload(ScenarioResult.turns))
+        )
+    ).one()
     assert scenario.scenario_id == "esc-captura"
     assert scenario.source_ref == "https://claude.ai/chat/abc"
     # Turns were derived from role alternation: two user+model pairs.
@@ -1437,10 +1447,11 @@ def test_captured_messages_reach_turns_without_a_spreadsheet(session: Session) -
         (2, "Adiós", "Hasta luego"),
     ]
     assert scenario.raw_conversation["messages"][0]["turn"] == 1
-    assert str(session.get(BenchmarkRun, uuid.UUID(run_id)).status) == "ingerido"
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
+    assert str(run.status) == "ingerido"
 
 
-def test_captured_citations_reach_turn_context(session: Session) -> None:
+async def test_captured_citations_reach_turn_context(session: AsyncSession) -> None:
     """Sources scraped off a chat UI land on the turn as ``retrieved_context_source``.
 
     Mirrors what the extension's Copilot adapter produces: a turn whose answer
@@ -1452,7 +1463,7 @@ def test_captured_citations_reach_turn_context(session: Session) -> None:
         "\n\nforbes.com\nhttps://www.forbes.com/lists/global2000/"
     )
 
-    ingest_evaluation(
+    await ingest_evaluation(
         "copilot",
         [
             UploadedFile(
@@ -1469,7 +1480,7 @@ def test_captured_citations_reach_turn_context(session: Session) -> None:
         session=session,
     )
 
-    turn = session.scalars(select(ScenarioResult)).one().turns[0]
+    turn = (await session.scalars(select(ScenarioResult))).one().turns[0]
     # Both model messages joined into one response, and the context survived even
     # though it hung off the second of them.
     assert turn.response == "Conectar para continuar\nTres noticias"

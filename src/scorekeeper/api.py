@@ -1,4 +1,6 @@
+import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,7 @@ from pydantic import BaseModel, Field
 
 from scorekeeper import evaluation, tasks
 from scorekeeper.config import get_settings
+from scorekeeper.database import engine
 from scorekeeper.logging_config import configure_logging
 from scorekeeper.retrieval.credentials import service as auth_providers
 from scorekeeper.retrieval.credentials.service import (
@@ -26,9 +29,16 @@ settings = get_settings()
 configure_logging(settings.log_level)
 logger = structlog.get_logger("scorekeeper.api")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Drain the asyncpg connection pool on shutdown."""
+    yield
+    await engine.dispose()
+
+
 # The database schema is owned by Alembic — run `alembic upgrade head`
 # before starting the app (the compose `migrate` service does this).
-app = FastAPI(title="Scorekeeper Results API", version="0.1.0")
+app = FastAPI(title="Scorekeeper Results API", version="0.1.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.allowed_origins,
@@ -138,12 +148,12 @@ class TurnSelectionResponse(BaseModel):
 
 
 @app.get("/health")
-def health() -> dict[str, str]:
+async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.post("/evaluations", response_model=EvaluationEnqueuedResponse, status_code=202)
-def create_evaluation(
+async def create_evaluation(
     files: list[UploadFile] = File(...),
     payload: str = Form(...),
 ) -> EvaluationEnqueuedResponse:
@@ -182,7 +192,7 @@ def create_evaluation(
             raise HTTPException(
                 status_code=400, detail=f"El archivo {filename!r} no es un .xlsx."
             )
-        content = upload.file.read()
+        content = await upload.read()
         if not content:
             raise HTTPException(
                 status_code=400, detail=f"El archivo {filename!r} está vacío."
@@ -199,7 +209,7 @@ def create_evaluation(
         )
 
     try:
-        run_id = evaluation.ingest_evaluation(parsed_payload.platform, uploads)
+        run_id = await evaluation.ingest_evaluation(parsed_payload.platform, uploads)
     except ValueError as exc:
         # Empty inputs or an unparseable sheet — a client error.
         logger.warning("POST /evaluations rechazado: %s", exc)
@@ -210,7 +220,7 @@ def create_evaluation(
 
 
 @app.post("/captures", response_model=EvaluationEnqueuedResponse, status_code=202)
-def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
+async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
     """Ingest conversations captured from a chat UI and persist them for scoring.
 
     The JSON twin of ``POST /evaluations`` for clients that already hold the turns
@@ -257,7 +267,7 @@ def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
         )
 
     try:
-        run_id = evaluation.ingest_evaluation(payload.platform, uploads)
+        run_id = await evaluation.ingest_evaluation(payload.platform, uploads)
     except ValueError as exc:
         logger.warning("POST /captures rechazado: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -271,7 +281,7 @@ def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
     response_model=EvaluationEnqueuedResponse,
     status_code=202,
 )
-def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
+async def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
     """Start scoring a previously-ingested run (the trigger decoupled from ingestion).
 
     Flips a run from ``ingerido`` to ``en_cola`` and enqueues the Celery pipeline
@@ -281,13 +291,15 @@ def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
     never enqueued twice.
     """
     try:
-        status = evaluation.start_run(run_id)
+        status = await evaluation.start_run(run_id)
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     if status is None:
         raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
 
-    tasks.enqueue_run(run_id)
+    # enqueue_run publishes over kombu's sync SQLAlchemy transport (a blocking DB
+    # round-trip), so it must not run on the event loop.
+    await asyncio.to_thread(tasks.enqueue_run, run_id)
     logger.info("POST /evaluations/%s/start en cola", run_id)
     return EvaluationEnqueuedResponse(run_id=run_id, status=status)
 
@@ -296,7 +308,7 @@ def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
     "/evaluations/{run_id}/turns/selection",
     response_model=TurnSelectionResponse,
 )
-def select_turns(run_id: str, payload: TurnSelectionRequest) -> TurnSelectionResponse:
+async def select_turns(run_id: str, payload: TurnSelectionRequest) -> TurnSelectionResponse:
     """Mark a subset of a run's turns as selected (or not) for scoring.
 
     Scoring is opt-in per turn: only turns flagged ``is_selected`` are evaluated by
@@ -306,7 +318,7 @@ def select_turns(run_id: str, payload: TurnSelectionRequest) -> TurnSelectionRes
     ``409`` when the run has already left the ``ingerido`` state (already started).
     """
     try:
-        updated = evaluation.set_turn_selection(
+        updated = await evaluation.set_turn_selection(
             run_id, payload.turn_ids, payload.is_selected
         )
     except ValueError as exc:
@@ -324,7 +336,7 @@ def select_turns(run_id: str, payload: TurnSelectionRequest) -> TurnSelectionRes
 
 
 @app.get("/evaluations/{run_id}", response_model=EvaluationResponse)
-def get_evaluation(run_id: str) -> EvaluationResponse:
+async def get_evaluation(run_id: str) -> EvaluationResponse:
     """Return a run's current status and summary (poll this after ``POST``).
 
     ``status`` walks ``ingerido → en_cola → en_recuperacion → en_proceso →
@@ -332,7 +344,7 @@ def get_evaluation(run_id: str) -> EvaluationResponse:
     ``POST /evaluations/{run_id}/start`` enqueues it. The platform's ``average_score``
     stays ``null`` until scoring finishes. ``404`` when the ``run_id`` is unknown.
     """
-    summary = evaluation.get_run_summary(run_id)
+    summary = await evaluation.get_run_summary(run_id)
     if summary is None:
         raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
     return EvaluationResponse.model_validate(summary)
@@ -361,7 +373,7 @@ class ScenarioTurn(BaseModel):
 
 
 @app.get("/scenarios/{scenario_id}/turns", response_model=list[ScenarioTurn])
-def get_scenario_turns(scenario_id: str) -> list[dict]:
+async def get_scenario_turns(scenario_id: str) -> list[dict]:
     """Return a scenario's turns, in ``turn_number`` order.
 
     ``scenario_id`` is a ``ScenarioResult`` id (its UUID) — the unique handle for one
@@ -373,7 +385,7 @@ def get_scenario_turns(scenario_id: str) -> list[dict]:
     ``retrieved_context_source``), rolled-up ``turn_score`` and per-metric scores.
     ``404`` when the ``scenario_id`` is unknown or malformed.
     """
-    turns = evaluation.retrieve_scenario_turns(scenario_id)
+    turns = await evaluation.retrieve_scenario_turns(scenario_id)
     if turns is None:
         raise HTTPException(
             status_code=404, detail=f"El escenario {scenario_id!r} no existe."
@@ -382,7 +394,7 @@ def get_scenario_turns(scenario_id: str) -> list[dict]:
 
 
 @app.get("/turns/{turn_id}/traces")
-def get_turn_traces(
+async def get_turn_traces(
     turn_id: str,
     provenance: bool = Query(
         True, description="Incluir judge_model y rubric_version por métrica."
@@ -395,7 +407,7 @@ def get_turn_traces(
     ``judge_model`` and ``rubric_version``; ``provenance=false`` returns the minimal
     shape. ``404`` when the ``turn_id`` is unknown or malformed.
     """
-    traces = evaluation.retrieve_turn_traces(turn_id, include_provenance=provenance)
+    traces = await evaluation.retrieve_turn_traces(turn_id, include_provenance=provenance)
     if traces is None:
         raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
     return traces
@@ -411,21 +423,21 @@ class TurnTokenUsage(BaseModel):
 
 
 @app.get("/turns/{turn_id}/token-usage", response_model=TurnTokenUsage)
-def get_turn_token_usage(turn_id: str) -> dict:
+async def get_turn_token_usage(turn_id: str) -> dict:
     """Return the LLM token usage for scoring one turn (no aggregation).
 
     The turn's 1:1 ``TurnTokenUsage``: ``input_tokens``, ``output_tokens`` and the
     derived ``total_tokens``. A turn that was never scored reports zeros. ``404`` when
     the ``turn_id`` is unknown or malformed.
     """
-    usage = evaluation.retrieve_turn_token_usage(turn_id)
+    usage = await evaluation.retrieve_turn_token_usage(turn_id)
     if usage is None:
         raise HTTPException(status_code=404, detail=f"El turno {turn_id!r} no existe.")
     return usage
 
 
 @app.get("/runs")
-def list_runs(
+async def list_runs(
     run_id: str | None = Query(None, description="Limita a una sola evaluación."),
     platform: str | None = Query(None, description="Coincidencia exacta de plataforma."),
     start_date: str | None = Query(
@@ -441,9 +453,9 @@ def list_runs(
 ) -> list[dict]:
     """Retrieve full scored details for the runs matching the filters.
 
-    The HTTP twin of the MCP ``retrieve`` tool. All filters are optional and
-    AND-combined; ``granularity`` controls depth (``platform_executions`` →
-    ``scenario_results`` → ``metric_scores``). Returns a list ordered by creation date;
+    All filters are optional and AND-combined; ``granularity`` controls depth
+    (``platform_executions`` → ``scenario_results`` → ``metric_scores``).
+    Returns a list ordered by creation date;
     an unknown ``run_id`` yields ``[]``. ``400`` for an unknown ``granularity`` or an
     unparseable date.
 
@@ -451,7 +463,7 @@ def list_runs(
     persisted for direct inspection but not surfaced through this API.
     """
     try:
-        return evaluation.retrieve_runs(
+        return await evaluation.retrieve_runs(
             run_id=run_id,
             platform=platform,
             start_date=start_date,
@@ -522,20 +534,20 @@ class AuthProviderRead(BaseModel):
 
 
 @app.get("/auth-providers", response_model=list[AuthProviderRead])
-def list_auth_providers(
+async def list_auth_providers(
     provider: str | None = Query(None, description="Filtra por tipo de proveedor."),
     host: str | None = Query(None, description="Coincidencia exacta de host."),
     enabled: bool | None = Query(None, description="Filtra por estado habilitado."),
 ) -> list[dict[str, Any]]:
     """List configured credential providers (filters optional, AND-combined)."""
-    return auth_providers.list_providers(provider=provider, host=host, enabled=enabled)
+    return await auth_providers.list_providers(provider=provider, host=host, enabled=enabled)
 
 
 @app.post("/auth-providers", response_model=AuthProviderRead, status_code=201)
-def create_auth_provider(body: AuthProviderCreate) -> dict[str, Any]:
+async def create_auth_provider(body: AuthProviderCreate) -> dict[str, Any]:
     """Create a credential provider row. ``409`` on a duplicate ``(provider, host)``."""
     try:
-        return auth_providers.create_provider(body.model_dump())
+        return await auth_providers.create_provider(body.model_dump())
     except ProviderValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ProviderConflictError as exc:
@@ -543,22 +555,22 @@ def create_auth_provider(body: AuthProviderCreate) -> dict[str, Any]:
 
 
 @app.get("/auth-providers/{provider_id}", response_model=AuthProviderRead)
-def get_auth_provider(provider_id: UUID) -> dict[str, Any]:
+async def get_auth_provider(provider_id: UUID) -> dict[str, Any]:
     """Return one credential provider. ``404`` when the id is unknown."""
-    row = auth_providers.get_provider(provider_id)
+    row = await auth_providers.get_provider(provider_id)
     if row is None:
         raise HTTPException(status_code=404, detail=f"El proveedor {provider_id} no existe.")
     return row
 
 
 @app.patch("/auth-providers/{provider_id}", response_model=AuthProviderRead)
-def update_auth_provider(provider_id: UUID, body: AuthProviderUpdate) -> dict[str, Any]:
+async def update_auth_provider(provider_id: UUID, body: AuthProviderUpdate) -> dict[str, Any]:
     """Partially update a credential provider. ``404`` unknown; ``409`` on a duplicate key."""
     changes = body.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(status_code=422, detail="No hay campos para actualizar.")
     try:
-        row = auth_providers.update_provider(provider_id, changes)
+        row = await auth_providers.update_provider(provider_id, changes)
     except ProviderValidationError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ProviderConflictError as exc:
@@ -569,9 +581,9 @@ def update_auth_provider(provider_id: UUID, body: AuthProviderUpdate) -> dict[st
 
 
 @app.delete("/auth-providers/{provider_id}", status_code=204)
-def delete_auth_provider(provider_id: UUID) -> None:
+async def delete_auth_provider(provider_id: UUID) -> None:
     """Delete a credential provider. ``404`` when the id is unknown."""
-    if not auth_providers.delete_provider(provider_id):
+    if not await auth_providers.delete_provider(provider_id):
         raise HTTPException(status_code=404, detail=f"El proveedor {provider_id} no existe.")
 
 

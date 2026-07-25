@@ -1,8 +1,6 @@
 # Scorekeeper
 
-Scorekeeper is an mcp server that benchmarks AI assistant platforms (Copilot, Gemini, Claude) by loading each conversation (user and model interactions) from a `.xlsx` file, storing every turn, and scoring each turn with an LLM-as-a-judge. Per-turn metric scores roll up into scenario- and platform-level averages. All scenarios, prompts, and evaluation outputs are in spanish.
-
-For a C4 view of how the pieces fit together (context, containers, and the retrieval components), see [docs/architecture.md](docs/architecture.md).
+Scorekeeper is a prototype server that benchmarks AI assistant platforms (Copilot, Gemini, Claude) by loading each conversation (user and model interactions) from a browser extension storing every turn, and scoring each turn with an LLM-as-a-judge. Per-turn metric scores roll up into scenario- and platform-level averages. All scenarios, prompts, and evaluation outputs currently are in spanish.
 
 ## Run everything with Docker
 
@@ -12,11 +10,11 @@ docker compose up --build
 
 The services are then available at:
 
-- MCP Streamable HTTP: `http://localhost:8000/mcp`
+- HTTP API: `http://localhost:8001`
 - Frontend: `http://localhost:8080`
 - PostgreSQL: `localhost:5432`
 
-## Run the MCP server locally
+## Run the API locally
 
 Install dependencies:
 
@@ -24,20 +22,20 @@ Install dependencies:
 uv sync --extra dev
 ```
 
-Run over stdio (the default):
+Run the HTTP API (uvicorn on `API_HOST`/`API_PORT`, `0.0.0.0:8001` by default):
 
 ```bash
-uv run scorekeeper-mcp --transport stdio
+uv run scorekeeper-api
 ```
 
-Run over Streamable HTTP:
+Ingestion (`POST /evaluations`, `POST /captures`) only enqueues work — retrieval and
+scoring run in a Celery worker, so start one too or runs stay in `en_cola`:
 
 ```bash
-uv run scorekeeper-mcp --transport http
+uv run celery -A scorekeeper.celery_app:celery_app worker --loglevel=info
 ```
 
-Transport can also be selected with `MCP_TRANSPORT=stdio|http`. Without a
-`DATABASE_URL`, local commands use `scorekeeper.db` through SQLite. Copy
+Without a `DATABASE_URL`, local commands use `scorekeeper.db` through SQLite. Copy
 `.env.example` to `.env` to use the Compose PostgreSQL instance from the host.
 
 ### Judge providers
@@ -51,18 +49,18 @@ the loaded model named by `LMSTUDIO_JUDGE_MODEL`, so every metric runs against
 whatever LM Studio has loaded; `answer_relevance` additionally needs an embedding
 model loaded (`LMSTUDIO_EMBEDDING_MODEL`). See `.env.example` for all knobs.
 
-### Tools
+### Reading results
 
-- `retrieve` — fetch full scored details for the runs matching a set of filters
-  (`run_id`, `platform`, a `start_date`/`end_date` scoring-window range), at a
-  chosen `granularity` (`platform_executions`, `scenario_results`, or
-  `metric_scores`). See [docs/mcp.md](docs/mcp.md).
+`GET /runs` returns full scored details for the runs matching a set of filters
+(`run_id`, `platform`, a `start_date`/`end_date` scoring-window range), at a chosen
+`granularity` (`platform_executions`, `scenario_results`, or `metric_scores`). See
+[docs/apis.md](docs/apis.md) for every endpoint.
 
 ## Database migrations
 
 The schema is owned by [Alembic](https://alembic.sqlalchemy.org/), not by the
 application — the services no longer create tables on startup. Under Docker, the
-one-shot `migrate` service runs `alembic upgrade head` before `mcp` and `api`
+one-shot `migrate` service runs `alembic upgrade head` before `api` and `worker`
 start, so the schema is always current.
 
 Run migrations manually against the database named by `DATABASE_URL`:

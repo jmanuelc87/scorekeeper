@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import asyncio
 import os
 import tempfile
 import uuid
@@ -41,7 +42,8 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from scorekeeper.database import (
     BenchmarkRun,
@@ -49,10 +51,10 @@ from scorekeeper.database import (
     PlatformExecution,
     RetrievedContextDocument,
     ScenarioResult,
-    SessionLocal,
     SourceFile,
     Turn,
     TurnTokenUsage,
+    session_scope,
 )
 from scorekeeper.config import get_settings
 from scorekeeper.importer import normalize_messages, parse_conversation
@@ -154,11 +156,11 @@ def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return turns
 
 
-def ingest_evaluation(
+async def ingest_evaluation(
     platform: str,
     files: list[UploadedFile],
     *,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
 ) -> str:
     """Parse ``files`` and persist a queued run for ``platform``; return its ``run_id``.
 
@@ -182,89 +184,86 @@ def ingest_evaluation(
     if not files:
         raise ValueError("Se requiere al menos un archivo.")
 
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        # Seed the use_case -> metric table so resolve_scenario finds metrics;
-        # without this every turn scores None and every scenario is "fallido".
-        sync_selection(db)
-        db.flush()
+    async with session_scope(session) as db:
+        try:
+            # Seed the use_case -> metric table so resolve_scenario finds metrics;
+            # without this every turn scores None and every scenario is "fallido".
+            await sync_selection(db)
+            await db.flush()
 
-        # Parse each file once and record its provenance as a SourceFile.
-        parsed: list[tuple[UploadedFile, list[dict[str, Any]], SourceFile]] = []
-        for upload in files:
-            messages = _parse_upload(upload)
-            logger.info(
-                "Analizado %s: %d mensaje(s) -> %d turno(s)",
-                upload.filename,
-                len(messages),
-                len(project_turns(messages)),
-            )
-            source_file = SourceFile(
-                filename=upload.filename,
-                file_hash=hashlib.sha256(upload.content).hexdigest(),
-            )
-            db.add(source_file)
-            parsed.append((upload, messages, source_file))
-
-        run = BenchmarkRun(status=STATUS_INGERIDO)
-        # A run references a single source file; only meaningful with one upload.
-        if len(parsed) == 1:
-            run.source_file = parsed[0][2]
-
-        # One PlatformExecution per distinct resolved platform (first-seen order);
-        # each file's optional override wins over the run-level fallback.
-        executions: dict[str, PlatformExecution] = {}
-        for upload, messages, _ in parsed:
-            resolved = upload.platform or platform
-            platform_exec = executions.get(resolved)
-            if platform_exec is None:
-                platform_exec = PlatformExecution(platform=resolved, run=run)
-                executions[resolved] = platform_exec
-            scenario = ScenarioResult(
-                scenario_id=upload.scenario_id,
-                use_case=upload.use_case,
-                source_ref=upload.filename,
-                raw_conversation={"messages": messages},
-                platform_execution=platform_exec,
-            )
-            for turn in project_turns(messages):
-                # Store the raw context cell; the retrieval pipeline (score-time worker)
-                # fetches/extracts it into ``retrieved_documents`` — nothing is decoupled here.
-                turn_row = Turn(
-                    turn_number=turn["turn_number"],
-                    prompt=turn["prompt"],
-                    response=turn["response"],
-                    expected_output=turn["expected_output"],
-                    retrieved_context_source=turn["retrieved_context_source"],
+            # Parse each file once and record its provenance as a SourceFile.
+            parsed: list[tuple[UploadedFile, list[dict[str, Any]], SourceFile]] = []
+            for upload in files:
+                messages = await _parse_upload(upload)
+                logger.info(
+                    "Analizado %s: %d mensaje(s) -> %d turno(s)",
+                    upload.filename,
+                    len(messages),
+                    len(project_turns(messages)),
                 )
-                scenario.turns.append(turn_row)
+                source_file = SourceFile(
+                    filename=upload.filename,
+                    file_hash=hashlib.sha256(upload.content).hexdigest(),
+                )
+                db.add(source_file)
+                parsed.append((upload, messages, source_file))
 
-        db.add(run)
-        db.commit()
-        turn_total = sum(
-            len(s.turns) for pe in run.platform_executions for s in pe.scenario_results
-        )
-        logger.info(
-            "Run %s ingerido: %d plataforma(s) × %d archivo(s) = %d turno(s).",
-            run.id,
-            len(executions),
-            len(parsed),
-            turn_total,
-        )
-        return str(run.id)
-    except Exception:
-        db.rollback()
-        raise
-    finally:
-        if owns_session:
-            db.close()
+            run = BenchmarkRun(status=STATUS_INGERIDO)
+            # A run references a single source file; only meaningful with one upload.
+            if len(parsed) == 1:
+                run.source_file = parsed[0][2]
+
+            # One PlatformExecution per distinct resolved platform (first-seen order);
+            # each file's optional override wins over the run-level fallback.
+            executions: dict[str, PlatformExecution] = {}
+            for upload, messages, _ in parsed:
+                resolved = upload.platform or platform
+                platform_exec = executions.get(resolved)
+                if platform_exec is None:
+                    platform_exec = PlatformExecution(platform=resolved, run=run)
+                    executions[resolved] = platform_exec
+                scenario = ScenarioResult(
+                    scenario_id=upload.scenario_id,
+                    use_case=upload.use_case,
+                    source_ref=upload.filename,
+                    raw_conversation={"messages": messages},
+                    platform_execution=platform_exec,
+                )
+                for turn in project_turns(messages):
+                    # Store the raw context cell; the retrieval pipeline (score-time worker)
+                    # fetches/extracts it into ``retrieved_documents`` — nothing is decoupled here.
+                    turn_row = Turn(
+                        turn_number=turn["turn_number"],
+                        prompt=turn["prompt"],
+                        response=turn["response"],
+                        expected_output=turn["expected_output"],
+                        retrieved_context_source=turn["retrieved_context_source"],
+                    )
+                    scenario.turns.append(turn_row)
+
+            db.add(run)
+            # Counted from the parsed input rather than by walking the committed run tree:
+            # the relationships were built in memory here, but re-reading them after the
+            # commit would be a lazy load the async session cannot serve.
+            turn_total = sum(len(project_turns(messages)) for _, messages, _ in parsed)
+            await db.commit()
+            logger.info(
+                "Run %s ingerido: %d plataforma(s) × %d archivo(s) = %d turno(s).",
+                run.id,
+                len(executions),
+                len(parsed),
+                turn_total,
+            )
+            return str(run.id)
+        except Exception:
+            await db.rollback()
+            raise
 
 
-def score_run(
+async def score_run(
     run_id: str,
     *,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
     judge: Judge | None = None,
 ) -> dict[str, Any]:
     """Score a previously-ingested run and persist the results.
@@ -278,43 +277,39 @@ def score_run(
     Raises ``ValueError`` when ``run_id`` is unknown. On any scoring failure the run
     is marked ``fallido`` (a terminal state for pollers) and the error re-raised.
     """
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        run = _load_run(db, run_id)
+    async with session_scope(session) as db:
+        run = await _load_run(db, run_id, _run_tree())
         if run is None:
             raise ValueError(f"El run {run_id} no existe.")
 
         run.status = STATUS_EN_PROCESO
-        db.commit()
+        await db.commit()
 
         turn_total = sum(
             len(s.turns) for pe in run.platform_executions for s in pe.scenario_results
         )
         logger.info("Puntuando run %s: %d turno(s) con el juez…", run.id, turn_total)
         try:
-            EvalRunner(db, judge).run_benchmark(run)  # scores everything and commits
+            await EvalRunner(db, judge).run_benchmark(run)  # scores everything, commits
         except Exception:
-            db.rollback()
-            run = _load_run(db, run_id)
+            # rollback expires every instance, so the reload carries the loaders again.
+            await db.rollback()
+            run = await _load_run(db, run_id, _run_tree())
             if run is not None:
                 run.status = STATUS_FALLIDO
-                db.commit()
+                await db.commit()
             raise
 
         run.status = _run_status(run)
-        db.commit()
+        await db.commit()
         logger.info("Run %s finalizado con estado %s", run.id, run.status)
         return _summarize(run)
-    finally:
-        if owns_session:
-            db.close()
 
 
-def retrieve_run(
+async def retrieve_run(
     run_id: str,
     *,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
     pipeline: RetrievalPipeline | None = None,
 ) -> dict[str, Any]:
     """Run the retrieval pipeline over a queued run, populating each turn's context.
@@ -333,15 +328,13 @@ def retrieve_run(
     to that session (tests inject a fake). This is the retrieval half the worker runs before
     scoring. Returns the run summary.
     """
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        run = _load_run(db, run_id)
+    async with session_scope(session) as db:
+        run = await _load_run(db, run_id, _run_tree(metric_scores=False))
         if run is None:
             raise ValueError(f"El run {run_id} no existe.")
 
         run.status = STATUS_EN_RECUPERACION
-        db.commit()
+        await db.commit()
 
         orchestrator = pipeline or RetrievalOrchestrator(
             session=db, encryption_key=get_settings().auth_encryption_key
@@ -354,26 +347,25 @@ def retrieve_run(
                         # Skip retrieval for turns that won't be scored; their
                         # retrieved context is only used by their own metrics.
                         if turn.is_selected:
-                            _retrieve_turn(turn, orchestrator)
-                    db.commit()  # atomic-write unit: one scenario at a time
-                _purge_cache(orchestrator, platform_exec)
+                            await _retrieve_turn(turn, orchestrator)
+                    await db.commit()  # atomic-write unit: one scenario at a time
+                await _purge_cache(orchestrator, platform_exec)
         except Exception:
-            db.rollback()
-            run = _load_run(db, run_id)
+            # rollback expires every instance, so the reload carries the loaders again.
+            await db.rollback()
+            run = await _load_run(db, run_id, _run_tree(metric_scores=False))
             if run is not None:
                 run.status = STATUS_FALLIDO
-                db.commit()
-            _purge_cache(orchestrator)  # a failed phase leaves no downloads behind either
+                await db.commit()
+            # a failed phase leaves no downloads behind either
+            await _purge_cache(orchestrator)
             raise
 
         logger.info("Recuperación completada para run %s", run.id)
         return _summarize(run)
-    finally:
-        if owns_session:
-            db.close()
 
 
-def _purge_cache(
+async def _purge_cache(
     pipeline: RetrievalPipeline, platform_exec: PlatformExecution | None = None
 ) -> None:
     """Release the documents downloaded for one platform execution (best-effort).
@@ -386,20 +378,20 @@ def _purge_cache(
     """
     label = platform_exec.platform if platform_exec is not None else "?"
     try:
-        removed = pipeline.purge_cache()
+        removed = await pipeline.purge_cache()
     except Exception:  # noqa: BLE001 — cleanup must never break a completed retrieval
         logger.warning("No se pudo limpiar la caché de %s", label, exc_info=True)
         return
     logger.info("Plataforma %s: %d documento(s) liberado(s) de la caché", label, removed)
 
 
-def _retrieve_turn(turn: Turn, pipeline: RetrievalPipeline) -> None:
+async def _retrieve_turn(turn: Turn, pipeline: RetrievalPipeline) -> None:
     """Populate one turn's ``retrieved_documents`` from its raw context cell (best-effort)."""
     turn.retrieved_documents.clear()  # idempotent when a run is retried
     cell = (turn.retrieved_context_source or "").strip()
     if not cell:
         return
-    report = pipeline.run(cell)
+    report = await pipeline.run(cell)
     for rank, document in enumerate(report.to_context().documents):
         turn.retrieved_documents.append(RetrievedContextDocument.from_document(document, rank))
     summary = RetrievalSummary.from_outcomes(report.outcomes)
@@ -411,11 +403,11 @@ def _retrieve_turn(turn: Turn, pipeline: RetrievalPipeline) -> None:
     )
 
 
-def run_evaluation(
+async def run_evaluation(
     platform: str,
     files: list[UploadedFile],
     *,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
     judge: Judge | None = None,
     pipeline: RetrievalPipeline | None = None,
 ) -> dict[str, Any]:
@@ -429,43 +421,35 @@ def run_evaluation(
     orchestrator onto the Celery worker. ``pipeline`` is injectable so tests avoid
     network/LLM calls.
     """
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        run_id = ingest_evaluation(platform, files, session=db)
-        _select_all_turns(db, run_id)
-        retrieve_run(run_id, session=db, pipeline=pipeline)
-        return score_run(run_id, session=db, judge=judge)
-    finally:
-        if owns_session:
-            db.close()
+    async with session_scope(session) as db:
+        run_id = await ingest_evaluation(platform, files, session=db)
+        await _select_all_turns(db, run_id)
+        await retrieve_run(run_id, session=db, pipeline=pipeline)
+        return await score_run(run_id, session=db, judge=judge)
 
 
-def _select_all_turns(db: Session, run_id: str) -> None:
+async def _select_all_turns(db: AsyncSession, run_id: str) -> None:
     """Mark every turn of a run selected for scoring (the "evaluate everything" default)."""
-    run = _load_run(db, run_id)
+    run = await _load_run(db, run_id, _run_tree(metric_scores=False, retrieval=False))
     if run is None:
         return
     for platform_exec in run.platform_executions:
         for scenario in platform_exec.scenario_results:
             for turn in scenario.turns:
                 turn.is_selected = True
-    db.commit()
+    await db.commit()
 
 
-def get_run_summary(run_id: str, *, session: Session | None = None) -> dict[str, Any] | None:
+async def get_run_summary(
+    run_id: str, *, session: AsyncSession | None = None
+) -> dict[str, Any] | None:
     """Return a run's current status/summary for polling, or ``None`` if unknown."""
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        run = _load_run(db, run_id)
+    async with session_scope(session) as db:
+        run = await _load_run(db, run_id, _run_tree(metric_scores=False, retrieval=False))
         return _summarize(run) if run is not None else None
-    finally:
-        if owns_session:
-            db.close()
 
 
-def start_run(run_id: str, *, session: Session | None = None) -> str | None:
+async def start_run(run_id: str, *, session: AsyncSession | None = None) -> str | None:
     """Move an ingested run to ``en_cola`` so it can be enqueued for scoring.
 
     Decouples the start of evaluation from ingestion: :func:`ingest_evaluation` leaves
@@ -476,10 +460,8 @@ def start_run(run_id: str, *, session: Session | None = None) -> str | None:
     unknown/invalid. Raises ``ValueError`` when the run is not in the ``ingerido`` state
     (already started), so a run is never enqueued twice.
     """
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        run = _load_run(db, run_id)
+    async with session_scope(session) as db:
+        run = await _load_run(db, run_id)
         if run is None:
             return None
         if run.status != STATUS_INGERIDO:
@@ -488,20 +470,17 @@ def start_run(run_id: str, *, session: Session | None = None) -> str | None:
                 f"(estado actual: '{run.status}')."
             )
         run.status = STATUS_EN_COLA
-        db.commit()
+        await db.commit()
         logger.info("Run %s encolado para puntuación.", run_id)
         return STATUS_EN_COLA
-    finally:
-        if owns_session:
-            db.close()
 
 
-def set_turn_selection(
+async def set_turn_selection(
     run_id: str,
     turn_ids: list[str],
     is_selected: bool,
     *,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
 ) -> int | None:
     """Flag the given turns of a run as selected/deselected for scoring.
 
@@ -512,10 +491,8 @@ def set_turn_selection(
     (selection must happen before starting). Turn ids that don't belong to the run
     (or are malformed) are ignored.
     """
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        run = _load_run(db, run_id)
+    async with session_scope(session) as db:
+        run = await _load_run(db, run_id, _run_tree(metric_scores=False, retrieval=False))
         if run is None:
             return None
         if run.status != STATUS_INGERIDO:
@@ -536,21 +513,18 @@ def set_turn_selection(
                     if turn.id in wanted:
                         turn.is_selected = is_selected
                         updated += 1
-        db.commit()
+        await db.commit()
         logger.info(
             "Run %s: %d turno(s) marcados is_selected=%s.", run_id, updated, is_selected
         )
         return updated
-    finally:
-        if owns_session:
-            db.close()
 
 
-def retrieve_turn_traces(
+async def retrieve_turn_traces(
     turn_id: str,
     *,
     include_provenance: bool = True,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
 ) -> list[dict[str, Any]] | None:
     """Structured metric traces for one turn, or ``None`` if the turn is unknown.
 
@@ -560,25 +534,22 @@ def retrieve_turn_traces(
     ``rubric_version``. A malformed or unknown ``turn_id`` yields ``None`` (the HTTP
     layer maps that to ``404``); a turn with no scores yields ``[]``.
     """
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        turn = _load_turn(db, turn_id)
+    async with session_scope(session) as db:
+        turn = await _load_turn(
+            db, turn_id, selectinload(Turn.metric_scores).selectinload(MetricScore.trace)
+        )
         if turn is None:
             return None
         return [
             _serialize_metric_trace(score, include_provenance)
             for score in turn.metric_scores
         ]
-    finally:
-        if owns_session:
-            db.close()
 
 
-def retrieve_turn_token_usage(
+async def retrieve_turn_token_usage(
     turn_id: str,
     *,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
 ) -> dict[str, Any] | None:
     """LLM token usage for scoring one turn, or ``None`` if the turn is unknown.
 
@@ -589,22 +560,17 @@ def retrieve_turn_token_usage(
     usage row) reports zeros. A malformed or unknown ``turn_id`` yields ``None`` (the
     HTTP layer maps that to ``404``).
     """
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        turn = _load_turn(db, turn_id)
+    async with session_scope(session) as db:
+        turn = await _load_turn(db, turn_id, selectinload(Turn.token_usage))
         if turn is None:
             return None
         return _serialize_turn_token_usage(turn)
-    finally:
-        if owns_session:
-            db.close()
 
 
-def retrieve_scenario_turns(
+async def retrieve_scenario_turns(
     scenario_id: str,
     *,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
 ) -> list[dict[str, Any]] | None:
     """Return one scenario's turns in ``turn_number`` order, or ``None`` if unknown.
 
@@ -619,26 +585,21 @@ def retrieve_scenario_turns(
     malformed or unknown ``scenario_id`` yields ``None`` (the HTTP layer maps that to
     ``404``); a scenario with no turns yields ``[]``.
     """
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        scenario = _load_scenario(db, scenario_id)
+    async with session_scope(session) as db:
+        scenario = await _load_scenario(db, scenario_id)
         if scenario is None:
             return None
         return [_serialize_scenario_turn(turn) for turn in scenario.turns]
-    finally:
-        if owns_session:
-            db.close()
 
 
-def retrieve_runs(
+async def retrieve_runs(
     *,
     run_id: str | None = None,
     platform: str | None = None,
     start_date: str | None = None,
     end_date: str | None = None,
     granularity: str = GRANULARITY_SCENARIO,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
 ) -> list[dict[str, Any]]:
     """Return full scored details for the runs matching the given filters.
 
@@ -673,9 +634,7 @@ def retrieve_runs(
         except ValueError:
             return []
 
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
+    async with session_scope(session) as db:
         stmt = (
             select(BenchmarkRun)
             .join(BenchmarkRun.platform_executions)
@@ -690,11 +649,8 @@ def retrieve_runs(
             stmt = stmt.where(PlatformExecution.started_at >= start)
         if end is not None:
             stmt = stmt.where(PlatformExecution.finished_at <= end)
-        runs = db.execute(stmt).scalars().unique().all()
+        runs = (await db.execute(stmt)).scalars().unique().all()
         return [_serialize_run(run, granularity) for run in runs]
-    finally:
-        if owns_session:
-            db.close()
 
 
 def _parse_date(value: str | None, field: str) -> datetime | None:
@@ -709,35 +665,74 @@ def _parse_date(value: str | None, field: str) -> datetime | None:
         ) from exc
 
 
+def _run_tree(*, metric_scores: bool = True, retrieval: bool = True):
+    """Eager-load the whole run tree — the loader every write path uses.
+
+    ``score_run``/``retrieve_run`` walk BenchmarkRun → PlatformExecution →
+    ScenarioResult → Turn → {metric_scores(+trace), retrieved_documents, token_usage}.
+    Under an ``AsyncSession`` an unloaded relationship is not a slow query but a
+    ``MissingGreenlet``, so the tree is loaded up front rather than lazily.
+
+    ``MetricScore.trace`` is required, not an optimization: clearing
+    ``turn.metric_scores`` cascades delete-orphan into it, which the unit of work
+    resolves *at flush time* — the least obvious place to take a lazy load.
+    """
+    turn_opts = [selectinload(Turn.token_usage)]
+    if metric_scores:
+        turn_opts.append(selectinload(Turn.metric_scores).selectinload(MetricScore.trace))
+    if retrieval:
+        turn_opts.append(selectinload(Turn.retrieved_documents))
+    return (
+        selectinload(BenchmarkRun.platform_executions)
+        .selectinload(PlatformExecution.scenario_results)
+        .selectinload(ScenarioResult.turns)
+        .options(*turn_opts)
+    )
+
+
 def _load_options(granularity: str):
-    """Eager-load the run tree down to the depth ``granularity`` requires (no N+1)."""
-    scenarios = selectinload(PlatformExecution.scenario_results)
+    """Eager-load the run tree down to the depth ``granularity`` requires (no N+1).
+
+    Turns are loaded at *every* granularity, not just ``metric_scores``:
+    ``_serialize_run`` always calls ``_run_progress``, which counts a scenario's turns.
+    """
+    turns = selectinload(ScenarioResult.turns)
     if granularity == GRANULARITY_METRIC:
-        scenarios = scenarios.selectinload(ScenarioResult.turns).selectinload(
-            Turn.metric_scores
-        )
-    return selectinload(BenchmarkRun.platform_executions).options(scenarios)
+        turns = turns.selectinload(Turn.metric_scores)
+    return (
+        selectinload(BenchmarkRun.platform_executions)
+        .selectinload(PlatformExecution.scenario_results)
+        .options(turns)
+    )
 
 
-def _load_run(db: Session, run_id: str) -> BenchmarkRun | None:
-    """Load a ``BenchmarkRun`` by its string id, or ``None`` for an unknown/invalid id."""
+async def _load_run(db: AsyncSession, run_id: str, *options) -> BenchmarkRun | None:
+    """Load a ``BenchmarkRun`` by its string id, or ``None`` for an unknown/invalid id.
+
+    A ``select()`` rather than ``session.get()``: get() returns an identity-map hit
+    without applying loader options, so a run already in the session (``run_evaluation``
+    threads one session through ingest → retrieve → score) would come back with its
+    relationships unloaded and fail on first access.
+    """
     try:
         key = uuid.UUID(run_id)
     except ValueError:
         return None
-    return db.get(BenchmarkRun, key)
+    stmt = select(BenchmarkRun).where(BenchmarkRun.id == key).options(*options)
+    return (await db.execute(stmt)).scalars().one_or_none()
 
 
-def _load_turn(db: Session, turn_id: str) -> Turn | None:
+async def _load_turn(db: AsyncSession, turn_id: str, *options) -> Turn | None:
     """Load a ``Turn`` by its string id, or ``None`` for an unknown/invalid id."""
     try:
         key = uuid.UUID(turn_id)
     except ValueError:
         return None
-    return db.get(Turn, key)
+    stmt = select(Turn).where(Turn.id == key).options(*options)
+    return (await db.execute(stmt)).scalars().one_or_none()
 
 
-def _load_scenario(db: Session, scenario_id: str) -> ScenarioResult | None:
+async def _load_scenario(db: AsyncSession, scenario_id: str) -> ScenarioResult | None:
     """Load a ``ScenarioResult`` by its string id, eager-loading turns + metric scores.
 
     Returns ``None`` for an unknown/invalid id. Eager-loads the turn tree (turns
@@ -753,16 +748,19 @@ def _load_scenario(db: Session, scenario_id: str) -> ScenarioResult | None:
         .where(ScenarioResult.id == key)
         .options(selectinload(ScenarioResult.turns).selectinload(Turn.metric_scores))
     )
-    return db.execute(stmt).scalars().one_or_none()
+    return (await db.execute(stmt)).scalars().one_or_none()
 
 
-def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:
+async def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:
     """Write ``upload`` to a temp ``.xlsx`` and parse it into raw messages.
 
     ``parse_conversation`` needs a filesystem path (openpyxl opens by path), so the
     in-memory upload is spilled to a short-lived temp file that is always removed.
     An upload that already carries ``messages`` (a browser capture) skips the
     spreadsheet entirely and is only normalized.
+
+    The spreadsheet path is blocking file + CPU work and this now runs on the event
+    loop (the API's routes are coroutines), so it is offloaded to a worker thread.
     """
     if upload.messages is not None:
         messages = normalize_messages(upload.messages)
@@ -774,10 +772,15 @@ def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:
                 message["retrieved_context_source"] = message.pop("retrieved_context")
         return messages
 
+    return await asyncio.to_thread(_parse_xlsx_bytes, upload.content)
+
+
+def _parse_xlsx_bytes(content: bytes) -> list[dict[str, Any]]:
+    """Spill ``content`` to a temp ``.xlsx`` and parse it (blocking; run off-loop)."""
     fd, path = tempfile.mkstemp(suffix=".xlsx")
     try:
         with os.fdopen(fd, "wb") as tmp:
-            tmp.write(upload.content)
+            tmp.write(content)
         return parse_conversation(path)
     finally:
         os.unlink(path)
@@ -979,8 +982,8 @@ def _serialize_scenario_turn(turn: Turn) -> dict[str, Any]:
 
 def _serialize_turn(turn: Turn) -> dict[str, Any]:
     # The structured ``trace`` is intentionally not surfaced here: it is persisted
-    # on the ``metric_traces`` table for direct inspection, but neither read surface
-    # (HTTP ``/runs`` nor the MCP ``retrieve`` tool) exposes it.
+    # on the ``metric_traces`` table for direct inspection, but the read surface
+    # (HTTP ``/runs``) does not expose it.
     return {
         "turn_id": str(turn.id),
         "turn_number": turn.turn_number,

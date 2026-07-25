@@ -88,9 +88,10 @@ class UsageAccumulator:
 
 # The accumulator active on the current context, if any. Default None → recording is
 # a no-op. A ``ContextVar`` (not a plain global) so concurrent turns/threads can each
-# scope their own accumulator; note ThreadPoolExecutor workers do NOT inherit the
-# submitter's context, so the value must be set *inside* the worker (see
-# ``collect_usage`` and its use in the runner).
+# scope their own accumulator. The runner sets it *inside* each worker (see
+# ``collect_usage``): ``asyncio.to_thread`` gives the worker a copy of the caller's
+# context, so setting it there scopes the accumulator to that one evaluate() and cannot
+# leak back to the caller or across to a sibling metric.
 _usage_var: contextvars.ContextVar[UsageAccumulator | None] = contextvars.ContextVar(
     "scorekeeper_usage_accumulator", default=None
 )
@@ -112,10 +113,9 @@ def record_usage(*, input_tokens: int | None, output_tokens: int | None) -> None
 def collect_usage(accumulator: UsageAccumulator) -> Generator[UsageAccumulator]:
     """Activate ``accumulator`` for judge calls made inside the ``with`` block.
 
-    MUST be entered inside the thread that will make the judge calls (a
-    ThreadPoolExecutor worker starts with an empty context and does not inherit the
-    submitter's). Resets the context var on exit so the accumulator does not leak to
-    later work scheduled on a reused worker thread.
+    Entered inside the thread that makes the judge calls, so each metric's evaluate()
+    scopes its own activation. Resets the context var on exit so the accumulator does
+    not leak to later work scheduled on a reused worker thread.
     """
     token = _usage_var.set(accumulator)
     try:

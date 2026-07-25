@@ -15,11 +15,12 @@ Design:
 * **Skip-metric-continue** — a metric that raises is logged and skipped; the turn still
   scores from the metrics that succeeded, and scenario ``status`` records whether the
   scoring was complete, partial, or a total failure.
-* **Metrics evaluate concurrently within a turn** — each metric's judge calls run on
-  their own thread (one thread per metric), since they are independent I/O-bound HTTP
-  requests. Turns stay **sequential** (the running ``history`` is fed forward, so a
-  turn depends on the ones before it), and all session writes stay on the owning
-  thread — only the ORM-free ``metric.evaluate`` calls are threaded.
+* **Metrics evaluate concurrently within a turn** — each metric's judge calls are
+  awaited together (``asyncio.gather`` over ``asyncio.to_thread``), since they are
+  independent I/O-bound HTTP requests against *blocking* LLM SDKs. Turns stay
+  **sequential** (the running ``history`` is fed forward, so a turn depends on the ones
+  before it), and all session writes stay on the event loop — only the ORM-free
+  ``metric.evaluate`` calls are offloaded to worker threads.
 
 Commit boundary: the **turn is the atomic unit of durability** — a turn's metric
 judge calls all run before its scores are written, then ``run_turn`` commits each
@@ -32,12 +33,11 @@ platform ``average_score`` in ``run_platform``.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import random
-import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.config import get_settings
 from scorekeeper.database import (
@@ -69,11 +69,11 @@ STATUS_FALLIDO = "fallido"
 class EvalRunner:
     """Scores stored turns with each scenario's selected metrics.
 
-    Construct with a ``Session`` and, optionally, a ``Judge`` (defaults to the
+    Construct with an ``AsyncSession`` and, optionally, a ``Judge`` (defaults to the
     configured judge from ``make_judge()``). Tests inject a stub judge.
     """
 
-    def __init__(self, session: Session, judge: Judge | None = None) -> None:
+    def __init__(self, session: AsyncSession, judge: Judge | None = None) -> None:
         self.session = session
         self.judge = judge or make_judge()
         settings = get_settings()
@@ -81,7 +81,7 @@ class EvalRunner:
         self._turn_delay_max = settings.turn_delay_max_seconds
 
     # ---- Level 1: whole run -------------------------------------------------
-    def run_benchmark(self, run: BenchmarkRun) -> None:
+    async def run_benchmark(self, run: BenchmarkRun) -> None:
         """Score every platform execution in ``run`` and commit."""
         logger.info(
             "Run %s: puntuando %d ejecución(es) de plataforma",
@@ -89,12 +89,12 @@ class EvalRunner:
             len(run.platform_executions),
         )
         for platform_exec in run.platform_executions:
-            self.run_platform(platform_exec)
-        self.session.commit()
+            await self.run_platform(platform_exec)
+        await self.session.commit()
         logger.info("Run %s: todas las plataformas puntuadas", run.id)
 
     # ---- Level 2: one platform ---------------------------------------------
-    def run_platform(self, platform_exec: PlatformExecution) -> None:
+    async def run_platform(self, platform_exec: PlatformExecution) -> None:
         """Score every scenario for one platform and roll up its average."""
         logger.info(
             "Plataforma %s: puntuando %d escenario(s)",
@@ -104,11 +104,11 @@ class EvalRunner:
         platform_exec.started_at = _now()
         scenario_scores: list[float | None] = []
         for scenario in platform_exec.scenario_results:
-            self.run_scenario(scenario)
+            await self.run_scenario(scenario)
             scenario_scores.append(scenario.average_score)
         platform_exec.average_score = platform_average(scenario_scores)
         platform_exec.finished_at = _now()
-        self.session.flush()
+        await self.session.flush()
         logger.info(
             "Plataforma %s finalizada: promedio=%s",
             platform_exec.platform,
@@ -116,7 +116,7 @@ class EvalRunner:
         )
 
     # ---- Level 3: one scenario (conversation) ------------------------------
-    def run_scenario(self, scenario: ScenarioResult) -> None:
+    async def run_scenario(self, scenario: ScenarioResult) -> None:
         """Score every turn of one conversation, roll up its average, and commit.
 
         Metric selection follows ``scenario.use_case`` — a comma-separated list of
@@ -128,7 +128,7 @@ class EvalRunner:
         ``run_turn``); this final commit persists the scenario roll-up
         (``average_score`` / ``status``).
         """
-        metrics = resolve_scenario(self.session, scenario.use_case)
+        metrics = await resolve_scenario(self.session, scenario.use_case)
         logger.info(
             "Escenario %s (use_case=%s): %d turno(s), métricas=%s",
             scenario.scenario_id,
@@ -143,13 +143,13 @@ class EvalRunner:
             # history so a later selected turn's judge sees the full exchange.
             if turn.is_selected:
                 if turn_scores:  # pace only between turns actually scored
-                    self._pace_between_turns()
-                self.run_turn(turn, metrics, history)
+                    await self._pace_between_turns()
+                await self.run_turn(turn, metrics, history)
                 turn_scores.append(turn.turn_score)
             history.append((turn.prompt, turn.response))
         scenario.average_score = scenario_average(turn_scores)
         scenario.status = _scenario_status(scenario)
-        self.session.commit()
+        await self.session.commit()
         logger.info(
             "Escenario %s finalizado: estado=%s, promedio=%s",
             scenario.scenario_id,
@@ -157,7 +157,7 @@ class EvalRunner:
             scenario.average_score,
         )
 
-    def _pace_between_turns(self) -> None:
+    async def _pace_between_turns(self) -> None:
         """Pause a random interval between consecutive turns to spread out judge calls.
 
         The pause is drawn uniformly from the configured
@@ -170,10 +170,10 @@ class EvalRunner:
         high = max(low, self._turn_delay_max)
         delay = random.uniform(low, high)
         logger.debug("Pausa de %.2fs antes del siguiente turno", delay)
-        time.sleep(delay)
+        await asyncio.sleep(delay)
 
     # ---- Level 4: one turn --------------------------------------------------
-    def run_turn(
+    async def run_turn(
         self,
         turn: Turn,
         metrics: list[Metric],
@@ -181,9 +181,9 @@ class EvalRunner:
     ) -> None:
         """Evaluate every metric on one turn, persist scores, roll up the turn.
 
-        The metrics evaluate concurrently — one thread per metric — since each is an
-        independent judge call; their results are then written back serially on this
-        thread. A metric that raises is logged and skipped (skip-metric-continue); the
+        The metrics evaluate concurrently — one worker thread per metric — since each is
+        an independent judge call; their results are then written back serially on the
+        event loop. A metric that raises is logged and skipped (skip-metric-continue); the
         turn scores from the survivors. Existing scores are cleared first so a re-run
         is idempotent (no duplicate ``MetricScore`` rows).
 
@@ -200,7 +200,7 @@ class EvalRunner:
         # One accumulator for the whole turn — every metric thread adds each judge
         # call's tokens to it (see _evaluate_metrics), so the snapshot is the turn total.
         usage = UsageAccumulator()
-        for result in self._evaluate_metrics(view, metrics, turn.turn_number, usage):
+        for result in await self._evaluate_metrics(view, metrics, turn.turn_number, usage):
             turn.metric_scores.append(
                 MetricScore(
                     metric_name=result.metric_name,
@@ -210,7 +210,7 @@ class EvalRunner:
                     rubric_version=result.rubric_version,
                 )
             )
-            self.session.commit()  # persist each surviving metric's score
+            await self.session.commit()  # persist each surviving metric's score
             logger.info(
                 "Turno %s · métrica %s = %s",
                 turn.turn_number,
@@ -219,7 +219,7 @@ class EvalRunner:
             )
         turn.turn_score = turn_score(turn.metric_scores)
         self._record_turn_usage(turn, usage)
-        self.session.commit()
+        await self.session.commit()
         logger.info(
             "Turno %s puntuado: turn_score=%s (%d métrica(s) exitosa(s))",
             turn.turn_number,
@@ -227,25 +227,25 @@ class EvalRunner:
             len(turn.metric_scores),
         )
 
-    def _evaluate_metrics(
+    async def _evaluate_metrics(
         self,
         view: TurnView,
         metrics: list[Metric],
         turn_number: int,
         usage: UsageAccumulator,
     ) -> list[MetricResult]:
-        """Evaluate every metric concurrently — one thread each — and return the
+        """Evaluate every metric concurrently — one worker thread each — and return the
         surviving results in metric-declaration order.
 
-        Only ``metric.evaluate`` runs off-thread: it takes the ORM-free ``view`` and
-        the shared, thread-safe ``judge`` and touches no session state. Each worker
+        Only ``metric.evaluate`` runs off the event loop: it takes the ORM-free ``view``
+        and the shared, thread-safe ``judge``, touches no session state, and drives a
+        *blocking* LLM SDK — hence ``to_thread`` rather than a bare await. Each worker
         activates the shared per-turn ``usage`` accumulator for the duration of its
-        evaluate() (``collect_usage`` must run *inside* the worker — ThreadPoolExecutor
-        threads do not inherit the caller's context — and it resets on exit so nothing
-        leaks to the next task on a reused thread). Results are placed by metric index
-        so the caller writes ``MetricScore`` rows in a stable order regardless of which
-        judge call finishes first. A metric that raises is logged and dropped
-        (skip-metric-continue).
+        evaluate() and resets it on exit, so nothing leaks to the next task on a reused
+        thread. ``gather`` yields results in *argument* order, which is what keeps the
+        ``MetricScore`` rows in a stable order regardless of which judge call finishes
+        first; ``return_exceptions`` is what keeps a failing metric from cancelling its
+        siblings (skip-metric-continue) — it is logged and dropped.
         """
         if not metrics:
             return []
@@ -254,24 +254,23 @@ class EvalRunner:
             with collect_usage(usage):
                 return metric.evaluate(view, self.judge)
 
-        results: list[MetricResult | None] = [None] * len(metrics)
-        with ThreadPoolExecutor(max_workers=len(metrics)) as pool:
-            futures = {
-                pool.submit(_evaluate, metric): index
-                for index, metric in enumerate(metrics)
-            }
-            for future in as_completed(futures):
-                index = futures[future]
-                try:
-                    results[index] = future.result()
-                except Exception as exc:  # skip-metric-continue
-                    logger.warning(
-                        "Métrica %s falló en turno %s: %s",
-                        metrics[index].name,
-                        turn_number,
-                        exc,
-                    )
-        return [result for result in results if result is not None]
+        outcomes = await asyncio.gather(
+            *(asyncio.to_thread(_evaluate, metric) for metric in metrics),
+            return_exceptions=True,
+        )
+
+        results: list[MetricResult] = []
+        for metric, outcome in zip(metrics, outcomes):
+            if isinstance(outcome, BaseException):  # skip-metric-continue
+                logger.warning(
+                    "Métrica %s falló en turno %s: %s",
+                    metric.name,
+                    turn_number,
+                    outcome,
+                )
+                continue
+            results.append(outcome)
+        return results
 
     @staticmethod
     def _record_turn_usage(turn: Turn, usage: UsageAccumulator) -> None:

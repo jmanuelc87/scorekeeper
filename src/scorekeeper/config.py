@@ -3,12 +3,21 @@ from functools import lru_cache
 from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+# Async driver -> the sync equivalent kombu's SQLAlchemy broker transport needs. The app
+# itself always speaks the async driver; only Celery's broker takes the sync detour (see
+# ``Settings.sync_database_url``), so one DATABASE_URL stays the single source of truth.
+_SYNC_SCHEMES = {
+    "postgresql+asyncpg": "postgresql+psycopg",
+    "sqlite+aiosqlite": "sqlite",
+}
+
 
 class Settings(BaseSettings):
-    database_url: str = "sqlite:///./scorekeeper.db"
-    mcp_transport: str = "stdio"
-    mcp_host: str = "0.0.0.0"
-    mcp_port: int = 8000
+    # Must name an *async* SQLAlchemy driver — the engine is a create_async_engine.
+    # Note asyncpg does not speak libpq query parameters: "?sslmode=require" is silently
+    # ignored (TLS goes through connect_args={"ssl": ...}), and a bare "postgres://"
+    # scheme is rejected.
+    database_url: str = "sqlite+aiosqlite:///./scorekeeper.db"
     api_host: str = "0.0.0.0"
     api_port: int = 8001
     cors_origins: str = "http://localhost:5173,http://localhost:8080"
@@ -100,9 +109,16 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
     @property
+    def sync_database_url(self) -> str:
+        """``database_url`` with its async driver swapped for the sync equivalent."""
+        scheme, sep, rest = self.database_url.partition("://")
+        return f"{_SYNC_SCHEMES.get(scheme, scheme)}{sep}{rest}"
+
+    @property
     def broker_url(self) -> str:
-        # kombu's SQLAlchemy transport is the app's DB URL with an "sqla+" prefix.
-        return self.celery_broker_url or f"sqla+{self.database_url}"
+        # kombu's SQLAlchemy transport is a *sync* DBAPI URL with an "sqla+" prefix — it
+        # cannot drive asyncpg, hence sync_database_url rather than database_url.
+        return self.celery_broker_url or f"sqla+{self.sync_database_url}"
 
 
 @lru_cache

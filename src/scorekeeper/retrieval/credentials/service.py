@@ -21,10 +21,10 @@ from uuid import UUID
 
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.config import get_settings
-from scorekeeper.database import AuthProviderConfig, SessionLocal
+from scorekeeper.database import AuthProviderConfig, session_scope
 from scorekeeper.retrieval.credentials.registry import CredentialProviderRegistry
 from scorekeeper.retrieval.credentials.secrets import encrypt_secret
 
@@ -97,17 +97,15 @@ def _apply_private_key(
     row.private_key_encrypted = token
 
 
-def list_providers(
+async def list_providers(
     *,
     provider: str | None = None,
     host: str | None = None,
     enabled: bool | None = None,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
 ) -> list[dict[str, Any]]:
     """List provider rows, optionally filtered, ordered by ``(provider, host)``."""
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
+    async with session_scope(session) as db:
         stmt = select(AuthProviderConfig)
         if provider is not None:
             stmt = stmt.where(AuthProviderConfig.provider == provider)
@@ -116,30 +114,22 @@ def list_providers(
         if enabled is not None:
             stmt = stmt.where(AuthProviderConfig.enabled.is_(enabled))
         stmt = stmt.order_by(AuthProviderConfig.provider, AuthProviderConfig.host)
-        return [_serialize(row) for row in db.scalars(stmt)]
-    finally:
-        if owns_session:
-            db.close()
+        return [_serialize(row) for row in await db.scalars(stmt)]
 
 
-def get_provider(
-    provider_id: UUID, *, session: Session | None = None
+async def get_provider(
+    provider_id: UUID, *, session: AsyncSession | None = None
 ) -> dict[str, Any] | None:
     """Return one provider's safe view, or ``None`` when the id is unknown."""
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        row = db.get(AuthProviderConfig, provider_id)
+    async with session_scope(session) as db:
+        row = await db.get(AuthProviderConfig, provider_id)
         return _serialize(row) if row is not None else None
-    finally:
-        if owns_session:
-            db.close()
 
 
-def create_provider(
+async def create_provider(
     data: dict[str, Any],
     *,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
     encryption_key: str | None = None,
 ) -> dict[str, Any]:
     """Create a provider row from validated ``data``.
@@ -152,9 +142,7 @@ def create_provider(
     private_key = values.pop("private_key", None)
     _validate_kind(values.get("provider", ""))
 
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
+    async with session_scope(session) as db:
         row = AuthProviderConfig(
             **{k: v for k, v in values.items() if k in _WRITABLE_FIELDS}
         )
@@ -162,24 +150,21 @@ def create_provider(
             _apply_private_key(row, private_key, encryption_key)
         db.add(row)
         try:
-            db.commit()
+            await db.commit()
         except IntegrityError as exc:
-            db.rollback()
+            await db.rollback()
             raise ProviderConflictError(
                 f"Ya existe un proveedor {row.provider!r} para el host {row.host!r}"
             ) from exc
-        db.refresh(row)
+        await db.refresh(row)
         return _serialize(row)
-    finally:
-        if owns_session:
-            db.close()
 
 
-def update_provider(
+async def update_provider(
     provider_id: UUID,
     changes: dict[str, Any],
     *,
-    session: Session | None = None,
+    session: AsyncSession | None = None,
     encryption_key: str | None = None,
 ) -> dict[str, Any] | None:
     """Partially update a provider row; returns its new view, or ``None`` if unknown.
@@ -193,10 +178,8 @@ def update_provider(
     if "provider" in changes and changes["provider"] is not None:
         _validate_kind(changes["provider"])
 
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        row = db.get(AuthProviderConfig, provider_id)
+    async with session_scope(session) as db:
+        row = await db.get(AuthProviderConfig, provider_id)
         if row is None:
             return None
         for field, value in changes.items():
@@ -209,30 +192,22 @@ def update_provider(
                 row.private_key_encrypted = None
                 row.private_key_salt = None
         try:
-            db.commit()
+            await db.commit()
         except IntegrityError as exc:
-            db.rollback()
+            await db.rollback()
             raise ProviderConflictError(
                 f"Ya existe un proveedor {row.provider!r} para el host {row.host!r}"
             ) from exc
-        db.refresh(row)
+        await db.refresh(row)
         return _serialize(row)
-    finally:
-        if owns_session:
-            db.close()
 
 
-def delete_provider(provider_id: UUID, *, session: Session | None = None) -> bool:
+async def delete_provider(provider_id: UUID, *, session: AsyncSession | None = None) -> bool:
     """Delete a provider row. Returns ``True`` when a row was removed, ``False`` if unknown."""
-    owns_session = session is None
-    db = SessionLocal() if session is None else session
-    try:
-        row = db.get(AuthProviderConfig, provider_id)
+    async with session_scope(session) as db:
+        row = await db.get(AuthProviderConfig, provider_id)
         if row is None:
             return False
-        db.delete(row)
-        db.commit()
+        await db.delete(row)
+        await db.commit()
         return True
-    finally:
-        if owns_session:
-            db.close()

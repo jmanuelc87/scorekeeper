@@ -16,6 +16,7 @@ platform execution's turns are retrieved, dropping the downloaded bytes it no lo
 
 from __future__ import annotations
 
+import asyncio
 from typing import TYPE_CHECKING
 
 from scorekeeper.config import get_settings
@@ -37,7 +38,7 @@ from scorekeeper.retrieval.types import (
 )
 
 if TYPE_CHECKING:
-    from sqlalchemy.orm import Session
+    from sqlalchemy.ext.asyncio import AsyncSession
 
     from scorekeeper.retrieval.protocols import (
         AuthProvider,
@@ -61,7 +62,7 @@ class RetrievalOrchestrator:
 
     def __init__(
         self,
-        session: "Session | None" = None,
+        session: "AsyncSession | None" = None,
         *,
         encryption_key: str | None = None,
         parser: "SourceRefParser | None" = None,
@@ -79,11 +80,12 @@ class RetrievalOrchestrator:
 
     # -- RetrievalPipeline protocol -----------------------------------------------------
 
-    def run(self, cell: str) -> RetrievalReport:
+    async def run(self, cell: str) -> RetrievalReport:
         """Parse ``cell`` and retrieve every reference into a ``RetrievalReport``."""
         source_format = self._parser.detect(cell)
         try:
-            refs = self._parser.parse(cell)
+            # The parser drives a blocking LLM call; keep it off the event loop.
+            refs = await asyncio.to_thread(self._parser.parse, cell)
         except Exception as exc:  # the (LLM) parse path failed — record one PARSE_ERROR.
             placeholder = SourceRef(name="", url=cell.strip()[:_PARSE_ERROR_SNIPPET], rank=0)
             outcome = RetrievalOutcome(
@@ -92,21 +94,21 @@ class RetrievalOrchestrator:
                 error=f"No se pudo interpretar la celda: {exc}",
             )
             return RetrievalReport(source_format=source_format, outcomes=[outcome])
-        return RetrievalReport(
-            source_format=source_format,
-            outcomes=[self._run_ref(ref) for ref in refs],
-        )
+        # Sequential on purpose: outcomes keep the reference order of the cell, and the
+        # fetch cache dedups best when the same URL is not requested concurrently.
+        outcomes = [await self._run_ref(ref) for ref in refs]
+        return RetrievalReport(source_format=source_format, outcomes=outcomes)
 
-    def purge_cache(self) -> int:
+    async def purge_cache(self) -> int:
         """Drop the documents fetched so far, delegating to the fetch stage's cache."""
-        return self._fetcher.purge_cache()
+        return await self._fetcher.purge_cache()
 
     # -- per-reference stage threading --------------------------------------------------
 
-    def _run_ref(self, source: SourceRef) -> RetrievalOutcome:
+    async def _run_ref(self, source: SourceRef) -> RetrievalOutcome:
         """Thread one reference locate → authorize → fetch → extract → assemble."""
         locator = self._resolver.resolve(source)
-        decision = self._auth.classify(locator)
+        decision = await self._auth.classify(locator)
 
         if decision.status is AuthStatus.MISSING_CREDENTIALS:
             return RetrievalOutcome(
@@ -126,7 +128,7 @@ class RetrievalOrchestrator:
             )
 
         try:
-            client = self._auth.client(locator)
+            client = await self._auth.client(locator)
         except (CredentialError, SecretError) as exc:  # gated host, client won't build
             return RetrievalOutcome(
                 source=source,
@@ -137,7 +139,7 @@ class RetrievalOrchestrator:
             )
 
         try:
-            document = self._fetcher.fetch(locator, client)
+            document = await self._fetcher.fetch(locator, client)
         except FetchError as exc:
             return RetrievalOutcome(
                 source=source,
@@ -148,7 +150,8 @@ class RetrievalOrchestrator:
             )
 
         try:
-            extracted = self._extractor.extract(document, locator)
+            # markitdown/pypdf conversion is blocking CPU work.
+            extracted = await asyncio.to_thread(self._extractor.extract, document, locator)
         except PageNotFoundError as exc:
             return RetrievalOutcome(
                 source=source,
