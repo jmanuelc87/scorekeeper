@@ -30,7 +30,7 @@ from scorekeeper.core.retrieved_context import RetrievedContext, RetrievedDocume
 
 # Run-level status a benchmark run carries while its documents are being retrieved,
 # so ``GET /evaluations`` can surface the retrieval phase. Defined here alongside the
-# taxonomy; ``evaluation.STATUS_*`` and the API serializer adopt it in a later phase.
+# taxonomy; ``services.status.STATUS_*`` and the API serializer adopt it in a later phase.
 # Follow-on rollup states (documented, not yet emitted): ``recuperacion_parcial`` when
 # some documents failed and ``recuperacion_fallida`` when the phase itself failed.
 STATUS_EN_RECUPERACION = "en_recuperacion"

@@ -4,7 +4,7 @@ Scorekeeper scores each conversation **turn** on one or more metrics using an
 LLM-as-a-judge. This page describes the metric taxonomy — the classes that define
 *what* a metric is and *how* it is scored — and how to add your own.
 
-The taxonomy lives in `src/scorekeeper/metrics/` and is **database-free and
+The taxonomy lives in `src/scorekeeper/core/metrics/` and is **database-free and
 LLM-free**: metrics run against a plain projection of a turn and call the judge
 through a swappable seam, so the whole package is unit-testable without a
 database or a live model. The concrete metrics themselves are project-specific,
@@ -302,7 +302,7 @@ derived and recomputable.
 
 ## Adding a metric
 
-1. Create a module `src/scorekeeper/metrics/catalog/<nombre>.py`.
+1. Create a module `src/scorekeeper/core/metrics/catalog/<nombre>.py`.
 2. Subclass `SingleRubricMetric` (one rubric) or `MultiStepMetric` (several
    steps). Set `name`, `category`, `scale`, `weight`, and — for single-rubric —
    the Spanish `rubric`.
@@ -314,7 +314,7 @@ derived and recomputable.
 6. Add a unit test (see below).
 
 ```python
-# src/scorekeeper/metrics/catalog/claridad.py
+# src/scorekeeper/core/metrics/catalog/claridad.py
 from scorekeeper.core.metrics.base import SingleRubricMetric
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.registry import register
@@ -335,7 +335,7 @@ class Claridad(SingleRubricMetric):
 ```
 
 ```python
-# src/scorekeeper/metrics/catalog/__init__.py
+# src/scorekeeper/core/metrics/catalog/__init__.py
 from scorekeeper.core.metrics.catalog import claridad  # noqa: F401
 ```
 

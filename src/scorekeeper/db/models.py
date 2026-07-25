@@ -469,7 +469,7 @@ class DocumentCacheEntry(Base):
     no FK into the run hierarchy; the bytes live on disk, not in the DB.
 
     Rows are **transient**: they are deleted with their blobs once the platform execution's
-    retrieval finishes (``evaluation.retrieve_run``), since the extracted markdown on
+    retrieval finishes (``services.retrieval.retrieve_run``), since the extracted markdown on
     ``retrieved_documents`` is the durable record of what was retrieved.
     """
 

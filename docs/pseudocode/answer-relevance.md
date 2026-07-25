@@ -6,7 +6,7 @@ actually asked. Generate `n` candidate questions from the answer, embed them
 alongside the original question, and average the cosine similarity.
 
 - Metric name: `answer_relevance`
-- Class: `AnswerRelevance` — `src/scorekeeper/metrics/catalog/answer_relevance.py`
+- Class: `AnswerRelevance` — `src/scorekeeper/core/metrics/catalog/answer_relevance.py`
 - Category: `RAG` · Scale: `Unit()` 0–1 · Weight: 1.0 · **higher is better**
 - Prose reference: [Metrics catalog → `answer_relevance`](../metrics-catalog.md#answer_relevance)
 

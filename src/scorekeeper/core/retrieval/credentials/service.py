@@ -2,7 +2,7 @@
 
 Thin persistence layer over :class:`~scorekeeper.db.models.AuthProviderConfig`, following the
 codebase's session-injection convention (``session`` defaults to ``SessionLocal()``; tests
-inject an in-memory session). The HTTP layer (``scorekeeper.api``) validates input and maps
+inject an in-memory session). The HTTP layer (``scorekeeper.api.v1.auth_providers``) validates input and maps
 these functions' results and exceptions onto status codes.
 
 Two invariants live here, not in the API:

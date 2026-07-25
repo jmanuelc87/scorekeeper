@@ -20,7 +20,7 @@ own result (with ``cached=True`` after the first), and only the first touches th
 The cache is **scoped to a platform execution**, not kept forever: the fetcher remembers every
 URL it served and :meth:`CachingDocumentFetcher.purge_cache` drops exactly those blobs (and
 their ``document_cache`` rows) when retrieval for that execution finishes — see
-``evaluation.retrieve_run``. Downloaded documents therefore do not outlive the execution that
+``services.retrieval.retrieve_run``. Downloaded documents therefore do not outlive the execution that
 needed them.
 """
 
@@ -122,7 +122,7 @@ class CachingDocumentFetcher:
     async def purge_cache(self) -> int:
         """Delete the documents this fetcher served and forget them; return how many went.
 
-        Called when retrieval for a platform execution finishes (``evaluation.retrieve_run``):
+        Called when retrieval for a platform execution finishes (``services.retrieval.retrieve_run``):
         the extracted markdown is already persisted on the turns, so the downloaded bytes have
         no further use. Only this fetcher's own URLs are purged, leaving any other execution's
         cache entries alone. Idempotent — a second call with nothing served removes nothing.

@@ -71,7 +71,7 @@ uv run alembic downgrade -1      # roll back the most recent migration
 uv run alembic current           # show the applied revision
 ```
 
-After changing the models in `src/scorekeeper/database.py`, autogenerate a new
+After changing the models in `src/scorekeeper/db/models.py`, autogenerate a new
 migration and apply it:
 
 ```bash

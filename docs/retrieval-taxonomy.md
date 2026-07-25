@@ -206,4 +206,4 @@ While a benchmark run's documents are being retrieved, the run carries the modul
 `STATUS_EN_RECUPERACION` (`"en_recuperacion"`) so `GET /evaluations` can surface the
 retrieval phase. Two follow-on rollup states are documented but not yet emitted:
 `recuperacion_parcial` (some documents failed) and `recuperacion_fallida` (the phase itself
-failed). `evaluation.STATUS_*` and the API serializer adopt these in a later phase.
+failed). `services.status.STATUS_*` and the API serializer adopt these in a later phase.

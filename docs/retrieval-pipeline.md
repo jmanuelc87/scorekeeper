@@ -190,8 +190,8 @@ retrieves):
 | whole-cell parse failure (e.g. the LLM path) | one `PARSE_ERROR` outcome |
 
 **Run wiring.** The Celery worker runs retrieval *then* scoring for a run via one task,
-`run_pipeline_task(run_id)` (`scorekeeper.tasks`): `evaluation.retrieve_run` then
-`evaluation.score_run`. `retrieve_run` marks the run `en_recuperacion`, and for each turn
+`run_pipeline_task(run_id)` (`scorekeeper.tasks`): `services.retrieval.retrieve_run` then
+`services.scoring.score_run`. `retrieve_run` marks the run `en_recuperacion`, and for each turn
 parses/fetches/extracts its raw `Turn.retrieved_context_source` (captured at ingest) into
 `retrieved_documents` — committing **per scenario**, best-effort, so a hard phase exception
 marks the run `fallido` while per-document failures just shrink the context. Scoring then reads
