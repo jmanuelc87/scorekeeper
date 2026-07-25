@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 
 from alembic import context
 
-from scorekeeper.config import get_settings
+from scorekeeper.config.settings import get_settings
 from scorekeeper.database import Base
 
 # this is the Alembic Config object, which provides

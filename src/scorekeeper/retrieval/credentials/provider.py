@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from scorekeeper.config import get_settings
+from scorekeeper.config.settings import get_settings
 from scorekeeper.database import AuthProviderConfig, session_scope
 from scorekeeper.retrieval.credentials import catalog as _catalog  # noqa: F401  (populate registry)
 from scorekeeper.retrieval.credentials.base import AuthClient, CredentialError

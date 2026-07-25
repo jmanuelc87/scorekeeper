@@ -145,7 +145,7 @@ lazily; injectable in tests), so no extra install is needed.
    PEM on the way in:
    ```python
    from scorekeeper.database import AuthProviderConfig, SessionLocal
-   from scorekeeper.config import get_settings
+   from scorekeeper.config.settings import get_settings
 
    with SessionLocal() as db:
        db.add(AuthProviderConfig.from_sharepoint(

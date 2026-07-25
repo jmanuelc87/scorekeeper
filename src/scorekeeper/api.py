@@ -13,9 +13,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from scorekeeper import evaluation, tasks
-from scorekeeper.config import get_settings
+from scorekeeper.config.settings import get_settings
 from scorekeeper.database import engine
-from scorekeeper.logging_config import configure_logging
+from scorekeeper.utils.logging_config import configure_logging
 from scorekeeper.retrieval.credentials import service as auth_providers
 from scorekeeper.retrieval.credentials.service import (
     ProviderConflictError,

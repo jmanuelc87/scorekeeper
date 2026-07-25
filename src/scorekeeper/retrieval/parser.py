@@ -164,7 +164,7 @@ class LlmSourceRefParser:
         if self._client is None:
             import openai  # lazy: only needed when building a real client
 
-            from scorekeeper.config import get_settings
+            from scorekeeper.config.settings import get_settings
 
             settings = get_settings()
             self._client = openai.OpenAI(

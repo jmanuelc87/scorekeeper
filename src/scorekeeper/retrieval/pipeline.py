@@ -19,7 +19,7 @@ from __future__ import annotations
 import asyncio
 from typing import TYPE_CHECKING
 
-from scorekeeper.config import get_settings
+from scorekeeper.config.settings import get_settings
 from scorekeeper.retrieval.credentials import CredentialError, SecretError, StoredAuthProvider
 from scorekeeper.retrieval.extract import (
     ExtractError,

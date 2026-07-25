@@ -14,7 +14,7 @@ import logging
 import pytest
 import structlog
 
-from scorekeeper import logging_config
+from scorekeeper.utils import logging_config
 
 
 @pytest.fixture(autouse=True)

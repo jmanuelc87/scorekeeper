@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from pydantic import BaseModel
 
-from scorekeeper.config import Settings
+from scorekeeper.config.settings import Settings
 from scorekeeper.metrics.base import TurnView
 from scorekeeper.metrics.judge import JudgeStep, JudgeVerdict
 from scorekeeper.metrics import judges as judges_pkg

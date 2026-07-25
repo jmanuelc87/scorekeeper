@@ -23,7 +23,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.config import get_settings
+from scorekeeper.config.settings import get_settings
 from scorekeeper.database import AuthProviderConfig, session_scope
 from scorekeeper.retrieval.credentials.registry import CredentialProviderRegistry
 from scorekeeper.retrieval.credentials.secrets import encrypt_secret

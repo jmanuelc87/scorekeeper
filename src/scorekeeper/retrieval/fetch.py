@@ -31,7 +31,7 @@ import logging
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from scorekeeper.config import get_settings
+from scorekeeper.config.settings import get_settings
 from scorekeeper.retrieval.store import DocumentStore
 from scorekeeper.retrieval.types import DocumentLocator, FetchedDocument
 

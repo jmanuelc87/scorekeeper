@@ -56,7 +56,7 @@ from scorekeeper.database import (
     TurnTokenUsage,
     session_scope,
 )
-from scorekeeper.config import get_settings
+from scorekeeper.config.settings import get_settings
 from scorekeeper.importer import normalize_messages, parse_conversation
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.selection import sync_selection

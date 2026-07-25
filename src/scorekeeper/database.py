@@ -32,7 +32,7 @@ from sqlalchemy.orm import (
     relationship,
 )
 
-from scorekeeper.config import get_settings
+from scorekeeper.config.settings import get_settings
 from scorekeeper.retrieved_context import RetrievedDocument
 
 # JSONB on PostgreSQL, plain JSON on the SQLite fallback.

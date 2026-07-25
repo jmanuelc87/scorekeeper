@@ -146,7 +146,7 @@ request path) processes **only the selected turns**:
 6. Roll the run status up to `completado` / `parcial` / `fallido` and commit.
 
 > **Prerequisites.** The database schema must already exist (`alembic upgrade head`)
-> and the configured judge must have a valid API key (see `scorekeeper.config`). The
+> and the configured judge must have a valid API key (see `scorekeeper.config.settings`). The
 > worker must be running to make progress past `en_cola`, a client must select the turns
 > to score (`PATCH /evaluations/{run_id}/turns/selection`) — nothing is scored otherwise —
 > and call `POST /evaluations/{run_id}/start` to move a run past `ingerido`.
