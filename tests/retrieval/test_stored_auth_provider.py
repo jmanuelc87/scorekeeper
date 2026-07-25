@@ -2,13 +2,10 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
 
-import pytest
-from sqlalchemy import create_engine
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.database import AuthProviderConfig, Base
+from scorekeeper.database import AuthProviderConfig
 from scorekeeper.retrieval import (
     AuthClient,
     AuthProvider,
@@ -21,14 +18,6 @@ from scorekeeper.retrieval import (
 
 _KEY = "clave-maestra"
 _HOST = "cognitactix-my.sharepoint.com"
-
-
-@pytest.fixture
-def session() -> Iterator[Session]:
-    engine = create_engine("sqlite://")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        yield session
 
 
 def _sharepoint_row(*, host: str = _HOST, enabled: bool = True) -> AuthProviderConfig:
@@ -53,67 +42,67 @@ def _locator(host: str) -> DocumentLocator:
     )
 
 
-def test_configured_host_is_satisfied(session: Session) -> None:
+async def test_configured_host_is_satisfied(session: AsyncSession) -> None:
     session.add(_sharepoint_row())
-    session.commit()
+    await session.commit()
     provider = StoredAuthProvider(session=session, encryption_key=_KEY)
-    decision = provider.classify(_locator(_HOST))
+    decision = await provider.classify(_locator(_HOST))
     assert decision.requirement is AuthRequirement.REQUIRED
     assert decision.status is AuthStatus.SATISFIED
     assert decision.provider == "sharepoint"
     assert provider.headers(_locator(_HOST)) == {}
 
 
-def test_unconfigured_host_is_public(session: Session) -> None:
+async def test_unconfigured_host_is_public(session: AsyncSession) -> None:
     session.add(_sharepoint_row())
-    session.commit()
+    await session.commit()
     provider = StoredAuthProvider(session=session, encryption_key=_KEY)
-    decision = provider.classify(_locator("eleconomista.com.mx"))
+    decision = await provider.classify(_locator("eleconomista.com.mx"))
     assert decision.requirement is AuthRequirement.PUBLIC
     assert decision.status is AuthStatus.NOT_NEEDED
     assert decision.provider is None
 
 
-def test_disabled_row_is_ignored(session: Session) -> None:
+async def test_disabled_row_is_ignored(session: AsyncSession) -> None:
     session.add(_sharepoint_row(enabled=False))
-    session.commit()
+    await session.commit()
     provider = StoredAuthProvider(session=session, encryption_key=_KEY)
-    assert provider.classify(_locator(_HOST)).requirement is AuthRequirement.PUBLIC
+    assert (await provider.classify(_locator(_HOST))).requirement is AuthRequirement.PUBLIC
 
 
-def test_subdomain_matches_configured_host(session: Session) -> None:
+async def test_subdomain_matches_configured_host(session: AsyncSession) -> None:
     session.add(_sharepoint_row(host="sharepoint.com"))
-    session.commit()
+    await session.commit()
     provider = StoredAuthProvider(session=session, encryption_key=_KEY)
     # A subdomain of the configured host is gated; a look-alike suffix is not.
-    assert provider.classify(_locator("a.b.sharepoint.com")).requirement is AuthRequirement.REQUIRED
-    assert provider.classify(_locator("notsharepoint.com")).requirement is AuthRequirement.PUBLIC
+    assert (await provider.classify(_locator("a.b.sharepoint.com"))).requirement is AuthRequirement.REQUIRED
+    assert (await provider.classify(_locator("notsharepoint.com"))).requirement is AuthRequirement.PUBLIC
 
 
-def test_host_matching_is_case_insensitive(session: Session) -> None:
+async def test_host_matching_is_case_insensitive(session: AsyncSession) -> None:
     session.add(_sharepoint_row())
-    session.commit()
+    await session.commit()
     provider = StoredAuthProvider(session=session, encryption_key=_KEY)
-    assert provider.classify(_locator(_HOST.upper())).status is AuthStatus.SATISFIED
+    assert (await provider.classify(_locator(_HOST.upper()))).status is AuthStatus.SATISFIED
 
 
-def test_missing_encryption_key_is_missing_credentials(session: Session) -> None:
+async def test_missing_encryption_key_is_missing_credentials(session: AsyncSession) -> None:
     session.add(_sharepoint_row())
-    session.commit()
+    await session.commit()
     provider = StoredAuthProvider(session=session, encryption_key=None)
-    decision = provider.classify(_locator(_HOST))
+    decision = await provider.classify(_locator(_HOST))
     assert decision.requirement is AuthRequirement.REQUIRED
     assert decision.status is AuthStatus.MISSING_CREDENTIALS
 
 
-def test_wrong_encryption_key_is_missing_credentials(session: Session) -> None:
+async def test_wrong_encryption_key_is_missing_credentials(session: AsyncSession) -> None:
     session.add(_sharepoint_row())
-    session.commit()
+    await session.commit()
     provider = StoredAuthProvider(session=session, encryption_key="otra-clave")
-    assert provider.classify(_locator(_HOST)).status is AuthStatus.MISSING_CREDENTIALS
+    assert (await provider.classify(_locator(_HOST))).status is AuthStatus.MISSING_CREDENTIALS
 
 
-def test_client_builds_generic_auth_client(session: Session, monkeypatch) -> None:
+async def test_client_builds_generic_auth_client(session: AsyncSession, monkeypatch) -> None:
     import sys
     import types
 
@@ -131,15 +120,15 @@ def test_client_builds_generic_auth_client(session: Session, monkeypatch) -> Non
     monkeypatch.setitem(sys.modules, "office365.sharepoint.client_context", mod)
 
     session.add(_sharepoint_row())
-    session.commit()
+    await session.commit()
     provider = StoredAuthProvider(session=session, encryption_key=_KEY)
-    client = provider.client(_locator(_HOST))
+    client = await provider.client(_locator(_HOST))
     assert isinstance(client, AuthClient)
     assert client.kind == "sharepoint"
     # Public hosts get no client; the built client is cached per host.
-    assert provider.client(_locator("eleconomista.com.mx")) is None
-    assert provider.client(_locator(_HOST)) is client
+    assert await provider.client(_locator("eleconomista.com.mx")) is None
+    assert await provider.client(_locator(_HOST)) is client
 
 
-def test_conforms_to_auth_provider_protocol(session: Session) -> None:
+async def test_conforms_to_auth_provider_protocol(session: AsyncSession) -> None:
     assert isinstance(StoredAuthProvider(session=session, encryption_key=_KEY), AuthProvider)

@@ -3,16 +3,15 @@
 from __future__ import annotations
 
 import uuid
-from collections.abc import Iterator
 from io import BytesIO
 
 import pytest
 from openpyxl import Workbook
-from sqlalchemy import create_engine, select
-from sqlalchemy.orm import Session
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper import evaluation, tasks
-from scorekeeper.database import Base, BenchmarkRun, Turn
+from scorekeeper.database import BenchmarkRun, Turn
 from scorekeeper.evaluation import UploadedFile, ingest_evaluation, retrieve_run
 from scorekeeper.retrieval.types import (
     STATUS_EN_RECUPERACION,
@@ -37,11 +36,11 @@ class _FakePipeline:
         # how many times the cache was released and that it happened after the turns ran.
         self.purges: list[int] = []
 
-    def purge_cache(self) -> int:
+    async def purge_cache(self) -> int:
         self.purges.append(len(self.calls))
         return len(self.calls)
 
-    def run(self, cell: str) -> RetrievalReport:
+    async def run(self, cell: str) -> RetrievalReport:
         self.calls.append(cell)
         if self._raise is not None:
             raise self._raise
@@ -55,14 +54,6 @@ class _FakePipeline:
         return RetrievalReport(source_format=SourceFormat.PLAINTEXT, outcomes=[outcome])
 
 
-@pytest.fixture
-def session() -> Iterator[Session]:
-    engine = create_engine("sqlite://")
-    Base.metadata.create_all(engine)
-    with Session(engine) as session:
-        yield session
-
-
 def _xlsx(header: list[str], rows: list[list[object]]) -> bytes:
     wb = Workbook()
     ws = wb.active
@@ -74,69 +65,69 @@ def _xlsx(header: list[str], rows: list[list[object]]) -> bytes:
     return buf.getvalue()
 
 
-def _ingest_one_turn_with_context(session: Session, cell: str) -> str:
+async def _ingest_one_turn_with_context(session: AsyncSession, cell: str) -> str:
     content = _xlsx(
         ["turn", "role", "content", "retrieved_context"],
         [[1, "user", "pregunta", cell], [1, "model", "respuesta", ""]],
     )
     files = [UploadedFile(filename="esc.xlsx", content=content, scenario_id="esc")]
-    return ingest_evaluation("claude", files, session=session)
+    return await ingest_evaluation("claude", files, session=session)
 
 
 # -- retrieve_run --------------------------------------------------------------------------
 
 
-def test_retrieve_run_populates_documents_and_sets_status(session: Session) -> None:
-    run_id = _ingest_one_turn_with_context(session, "manual (https://h/x.html)")
+async def test_retrieve_run_populates_documents_and_sets_status(session: AsyncSession) -> None:
+    run_id = await _ingest_one_turn_with_context(session, "manual (https://h/x.html)")
     pipeline = _FakePipeline()
 
-    retrieve_run(run_id, session=session, pipeline=pipeline)
+    await retrieve_run(run_id, session=session, pipeline=pipeline)
 
-    turn = session.execute(select(Turn)).scalars().one()
+    turn = (await session.execute(select(Turn))).scalars().one()
     assert [d.content for d in turn.retrieved_documents] == ["md::manual (https://h/x.html)"]
     # Retrieval leaves the run in the retrieval phase; scoring advances it afterwards.
-    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     assert run.status == STATUS_EN_RECUPERACION
     assert pipeline.calls == ["manual (https://h/x.html)"]
 
 
-def test_retrieve_run_skips_turns_without_source(session: Session) -> None:
+async def test_retrieve_run_skips_turns_without_source(session: AsyncSession) -> None:
     # No retrieved_context column at all → no source, pipeline never runs.
     content = _xlsx(["turn", "role", "content"], [[1, "user", "hola"], [1, "model", "hey"]])
     files = [UploadedFile(filename="esc.xlsx", content=content, scenario_id="esc")]
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
     pipeline = _FakePipeline()
 
-    retrieve_run(run_id, session=session, pipeline=pipeline)
+    await retrieve_run(run_id, session=session, pipeline=pipeline)
 
-    turn = session.execute(select(Turn)).scalars().one()
+    turn = (await session.execute(select(Turn))).scalars().one()
     assert turn.retrieved_documents == []
     assert pipeline.calls == []
 
 
-def test_retrieve_run_hard_failure_marks_fallido(session: Session) -> None:
-    run_id = _ingest_one_turn_with_context(session, "algo")
+async def test_retrieve_run_hard_failure_marks_fallido(session: AsyncSession) -> None:
+    run_id = await _ingest_one_turn_with_context(session, "algo")
     pipeline = _FakePipeline(raise_exc=RuntimeError("kaboom"))
 
     with pytest.raises(RuntimeError):
-        retrieve_run(run_id, session=session, pipeline=pipeline)
+        await retrieve_run(run_id, session=session, pipeline=pipeline)
 
-    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     assert run.status == STATUS_FALLIDO
 
 
-def test_retrieve_run_is_idempotent(session: Session) -> None:
-    run_id = _ingest_one_turn_with_context(session, "algo")
-    retrieve_run(run_id, session=session, pipeline=_FakePipeline())
-    retrieve_run(run_id, session=session, pipeline=_FakePipeline())  # re-run
-    turn = session.execute(select(Turn)).scalars().one()
+async def test_retrieve_run_is_idempotent(session: AsyncSession) -> None:
+    run_id = await _ingest_one_turn_with_context(session, "algo")
+    await retrieve_run(run_id, session=session, pipeline=_FakePipeline())
+    await retrieve_run(run_id, session=session, pipeline=_FakePipeline())  # re-run
+    turn = (await session.execute(select(Turn))).scalars().one()
     assert len(turn.retrieved_documents) == 1  # cleared + repopulated, not doubled
 
 
 # -- cache cleanup -------------------------------------------------------------------------
 
 
-def test_retrieve_run_purges_cache_once_per_platform_execution(session: Session) -> None:
+async def test_retrieve_run_purges_cache_once_per_platform_execution(session: AsyncSession) -> None:
     # Two scenarios under one platform execution: the cache is released when the execution
     # finishes, not after every scenario, and only once every turn has been retrieved.
     files = [
@@ -150,38 +141,38 @@ def test_retrieve_run_purges_cache_once_per_platform_execution(session: Session)
         )
         for i in (1, 2)
     ]
-    run_id = ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
     pipeline = _FakePipeline()
 
-    retrieve_run(run_id, session=session, pipeline=pipeline)
+    await retrieve_run(run_id, session=session, pipeline=pipeline)
 
     assert pipeline.calls == ["ref-1", "ref-2"]
     assert pipeline.purges == [2]  # one purge, after both scenarios ran
 
 
-def test_retrieve_run_purges_cache_on_failure(session: Session) -> None:
-    run_id = _ingest_one_turn_with_context(session, "algo")
+async def test_retrieve_run_purges_cache_on_failure(session: AsyncSession) -> None:
+    run_id = await _ingest_one_turn_with_context(session, "algo")
     pipeline = _FakePipeline(raise_exc=RuntimeError("kaboom"))
 
     with pytest.raises(RuntimeError):
-        retrieve_run(run_id, session=session, pipeline=pipeline)
+        await retrieve_run(run_id, session=session, pipeline=pipeline)
 
     assert pipeline.purges == [1]  # a failed phase leaves no downloads behind
 
 
-def test_retrieve_run_survives_a_cache_cleanup_failure(session: Session) -> None:
+async def test_retrieve_run_survives_a_cache_cleanup_failure(session: AsyncSession) -> None:
     class _UnpurgeablePipeline(_FakePipeline):
-        def purge_cache(self) -> int:
+        async def purge_cache(self) -> int:
             raise OSError("disco de solo lectura")
 
-    run_id = _ingest_one_turn_with_context(session, "algo")
+    run_id = await _ingest_one_turn_with_context(session, "algo")
 
-    retrieve_run(run_id, session=session, pipeline=_UnpurgeablePipeline())
+    await retrieve_run(run_id, session=session, pipeline=_UnpurgeablePipeline())
 
     # The retrieved context is already persisted; cleanup trouble must not undo it.
-    turn = session.execute(select(Turn)).scalars().one()
+    turn = (await session.execute(select(Turn))).scalars().one()
     assert len(turn.retrieved_documents) == 1
-    run = session.get(BenchmarkRun, uuid.UUID(run_id))
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     assert run.status == STATUS_EN_RECUPERACION
 
 
@@ -189,9 +180,18 @@ def test_retrieve_run_survives_a_cache_cleanup_failure(session: Session) -> None
 
 
 def test_run_pipeline_task_runs_retrieval_before_scoring(monkeypatch) -> None:
+    # Deliberately a *sync* test: the Celery task is sync and drives the async pipeline
+    # through its own asyncio.run(), which cannot nest inside a running event loop.
     order: list[str] = []
-    monkeypatch.setattr(evaluation, "retrieve_run", lambda rid: order.append("retrieve"))
-    monkeypatch.setattr(evaluation, "score_run", lambda rid: order.append("score"))
+
+    async def _retrieve(rid: str) -> None:
+        order.append("retrieve")
+
+    async def _score(rid: str) -> None:
+        order.append("score")
+
+    monkeypatch.setattr(evaluation, "retrieve_run", _retrieve)
+    monkeypatch.setattr(evaluation, "score_run", _score)
 
     tasks.run_pipeline_task("run-123")
 

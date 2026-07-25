@@ -22,7 +22,7 @@ mcp = FastMCP(
 
 
 @mcp.tool()
-def retrieve(
+async def retrieve(
     run_id: str | None = None,
     platform: str | None = None,
     start_date: str | None = None,
@@ -47,7 +47,7 @@ def retrieve(
     o ``metric_scores`` (añade cada turno y sus puntajes por métrica). Devuelve una
     lista ordenada por fecha de creación.
     """
-    return evaluation.retrieve_runs(
+    return await evaluation.retrieve_runs(
         run_id=run_id,
         platform=platform,
         start_date=start_date,
@@ -57,7 +57,7 @@ def retrieve(
 
 
 @mcp.tool()
-def retrieve_turn_traces(turn_id: str, provenance: bool = True) -> list[dict]:
+async def retrieve_turn_traces(turn_id: str, provenance: bool = True) -> list[dict]:
     """Recupera las trazas estructuradas de las métricas de un turno.
 
     Devuelve una entrada por métrica evaluada en el turno: su ``metric_name`` y su
@@ -67,11 +67,11 @@ def retrieve_turn_traces(turn_id: str, provenance: bool = True) -> list[dict]:
     se obtiene de ``retrieve`` con ``granularity="metric_scores"``. Un ``turn_id``
     desconocido o inválido devuelve una lista vacía.
     """
-    return evaluation.retrieve_turn_traces(turn_id, include_provenance=provenance) or []
+    return await evaluation.retrieve_turn_traces(turn_id, include_provenance=provenance) or []
 
 
 @mcp.tool()
-def retrieve_turn_token_usage(turn_id: str) -> dict:
+async def retrieve_turn_token_usage(turn_id: str) -> dict:
     """Recupera el uso de tokens del LLM al puntuar un turno (sin agregación).
 
     Devuelve el ``TurnTokenUsage`` 1:1 del turno: ``input_tokens``, ``output_tokens``
@@ -80,7 +80,7 @@ def retrieve_turn_token_usage(turn_id: str) -> dict:
     ``granularity="metric_scores"``. Un ``turn_id`` desconocido o inválido devuelve un
     objeto vacío.
     """
-    return evaluation.retrieve_turn_token_usage(turn_id) or {}
+    return await evaluation.retrieve_turn_token_usage(turn_id) or {}
 
 
 def main() -> None:

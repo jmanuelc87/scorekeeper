@@ -15,15 +15,14 @@ The store follows the codebase's session-injection convention (``session`` defau
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Iterator
-from contextlib import contextmanager
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
 from sqlalchemy import select
-from sqlalchemy.orm import Session
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.database import DocumentCacheEntry, SessionLocal
+from scorekeeper.database import DocumentCacheEntry, session_scope
 from scorekeeper.retrieval.types import DocType
 
 # Blob filename extension per document type (cosmetic; the SHA is the real key).
@@ -44,21 +43,9 @@ class CachedBlob:
 class DocumentStore:
     """Filesystem blob cache indexed by the ``document_cache`` table."""
 
-    def __init__(self, root: str | Path, *, session: Session | None = None) -> None:
+    def __init__(self, root: str | Path, *, session: AsyncSession | None = None) -> None:
         self._root = Path(root)
         self._session = session
-
-    @contextmanager
-    def _session_scope(self) -> Iterator[Session]:
-        """Yield the injected session, or a fresh one closed afterwards."""
-        if self._session is not None:
-            yield self._session
-        else:
-            db = SessionLocal()
-            try:
-                yield db
-            finally:
-                db.close()
 
     @staticmethod
     def _sha(url: str) -> str:
@@ -67,14 +54,14 @@ class DocumentStore:
     def _relpath(self, sha: str, doc_type: DocType) -> str:
         return f"{sha[:2]}/{sha}{_EXTENSIONS.get(doc_type, '.bin')}"
 
-    def get(self, url: str) -> CachedBlob | None:
+    async def get(self, url: str) -> CachedBlob | None:
         """Return the cached blob for ``url``, or ``None`` on a miss.
 
         A ``document_cache`` row whose blob file is missing (evicted out-of-band) is treated
         as a miss so the caller re-downloads.
         """
-        with self._session_scope() as db:
-            entry = db.scalar(
+        async with session_scope(self._session) as db:
+            entry = await db.scalar(
                 select(DocumentCacheEntry).where(DocumentCacheEntry.url == url)
             )
             if entry is None:
@@ -90,7 +77,7 @@ class DocumentStore:
                 size_bytes=entry.size_bytes,
             )
 
-    def put(
+    async def put(
         self,
         url: str,
         *,
@@ -105,8 +92,8 @@ class DocumentStore:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(body)
 
-        with self._session_scope() as db:
-            entry = db.scalar(
+        async with session_scope(self._session) as db:
+            entry = await db.scalar(
                 select(DocumentCacheEntry).where(DocumentCacheEntry.url == url)
             )
             if entry is None:
@@ -117,7 +104,7 @@ class DocumentStore:
             entry.doc_type = doc_type.value
             entry.content_type = content_type
             entry.size_bytes = len(body)
-            db.commit()
+            await db.commit()
 
         return CachedBlob(
             body=body,
@@ -127,7 +114,7 @@ class DocumentStore:
             size_bytes=len(body),
         )
 
-    def purge(self, urls: Iterable[str]) -> int:
+    async def purge(self, urls: Iterable[str]) -> int:
         """Delete the cached blobs for ``urls`` and their index rows; return how many went.
 
         Scoped on purpose: only the URLs handed in are removed, so a concurrent execution's
@@ -136,17 +123,17 @@ class DocumentStore:
         directories are pruned so the cache root does not fill with husks.
         """
         removed = 0
-        with self._session_scope() as db:
+        async with session_scope(self._session) as db:
             for url in set(urls):
-                entry = db.scalar(
+                entry = await db.scalar(
                     select(DocumentCacheEntry).where(DocumentCacheEntry.url == url)
                 )
                 if entry is None:
                     continue
                 self._unlink(self._root / entry.cache_path)
-                db.delete(entry)
+                await db.delete(entry)
                 removed += 1
-            db.commit()
+            await db.commit()
         return removed
 
     @staticmethod

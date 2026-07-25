@@ -22,7 +22,7 @@ services:
     # the ones that must differ inside the Docker network (env wins over env_file).
     env_file: .env
     environment: &backend-environment
-      DATABASE_URL: postgresql+psycopg://scorekeeper:scorekeeper@database:5432/scorekeeper
+      DATABASE_URL: postgresql+asyncpg://scorekeeper:scorekeeper@database:5432/scorekeeper
       MCP_TRANSPORT: http
     depends_on:
       database:
