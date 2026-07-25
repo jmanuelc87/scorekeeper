@@ -16,8 +16,8 @@ from scorekeeper import evaluation, tasks
 from scorekeeper.config.settings import get_settings
 from scorekeeper.db.connection import engine
 from scorekeeper.utils.logging_config import configure_logging
-from scorekeeper.retrieval.credentials import service as auth_providers
-from scorekeeper.retrieval.credentials.service import (
+from scorekeeper.core.retrieval.credentials import service as auth_providers
+from scorekeeper.core.retrieval.credentials.service import (
     ProviderConflictError,
     ProviderValidationError,
 )

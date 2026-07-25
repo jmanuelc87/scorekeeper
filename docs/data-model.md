@@ -20,12 +20,12 @@ Scores flow upward:
 - a turn's `turn_score` is the **weighted mean of its `MetricScore` values,
   normalized to [0, 1]**. Metrics score on their own scale (1-5, 0-1, boolean);
   each raw score is normalized and weighted using the metric's `scale`/`weight`,
-  which live in code (`scorekeeper.metrics`) keyed by `metric_name`,
+  which live in code (`scorekeeper.core.metrics`) keyed by `metric_name`,
 - a scenario's `average_score` averages its turns' `turn_score`,
 - a platform's `average_score` averages its scenarios' `average_score`.
 
 `MetricScore.score` stores the **raw** score in the metric's own scale;
-normalization happens at rollup (`scorekeeper.metrics.rollup`). Because scale and
+normalization happens at rollup (`scorekeeper.core.metrics.rollup`). Because scale and
 weight are code metadata (not stored per score), recomputing an old run applies
 the *current* weights/scales — `rubric_version` captures rubric drift but not
 weight drift. This is acceptable for a benchmarking tool whose rollups are
@@ -33,7 +33,7 @@ derived and recomputable.
 
 Which metrics apply to a scenario is data, stored in **ScenarioMetric** and keyed
 by `use_case`. Each metric class declares its scenarios via the `@register`
-decorator; `scorekeeper.metrics.selection.sync_selection` materializes that
+decorator; `scorekeeper.core.metrics.selection.sync_selection` materializes that
 declaration into the table, and the scoring runner reads it to pick the metric
 subset per scenario.
 
@@ -253,7 +253,7 @@ from `retrieved_context_source`.
 
 One document a RAG answer was grounded on, for groundedness metrics. Decoupled from the
 turn into its own table — one row per document, ordered within a turn by `rank`
-(retriever order). The in-memory `RetrievedContext` (`scorekeeper.retrieved_context`) is
+(retriever order). The in-memory `RetrievedContext` (`scorekeeper.core.retrieved_context`) is
 assembled from these rows; a turn with no rows has no retrieved context.
 
 | Column | Type | Notes |
@@ -327,7 +327,7 @@ one row per turn.
 
 Which metric applies to which scenario `use_case`. The metric taxonomy lives in
 code; this table is the queryable projection of each metric's decorator-declared
-scenarios, materialized by `scorekeeper.metrics.selection.sync_selection`.
+scenarios, materialized by `scorekeeper.core.metrics.selection.sync_selection`.
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -339,7 +339,7 @@ scenarios, materialized by `scorekeeper.metrics.selection.sync_selection`.
 
 Per-provider authentication settings for the retrieval pipeline's authorize stage
 (`table auth_providers`). A single table with a `provider` discriminator backs the
-credential taxonomy in `scorekeeper.retrieval.credentials`: one enabled row per gated
+credential taxonomy in `scorekeeper.core.retrieval.credentials`: one enabled row per gated
 `host` supplies the settings its `CredentialProvider` needs to build an authenticated
 client. Standalone — no FK into the run hierarchy. The provider's secret (a certificate
 private key or an OAuth2 client secret) is stored **encrypted** (Fernet token + per-row salt),

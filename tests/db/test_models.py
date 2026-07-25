@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 
 from scorekeeper.db.models import AuthProviderConfig, RetrievedContextDocument
-from scorekeeper.retrieval.credentials.secrets import SecretError
-from scorekeeper.retrieved_context import RetrievedDocument
+from scorekeeper.core.retrieval.credentials.secrets import SecretError
+from scorekeeper.core.retrieved_context import RetrievedDocument
 
 
 def test_from_document_maps_fields_and_rank() -> None:

@@ -60,7 +60,7 @@ flowchart TD
 
 ### `Metric`
 
-`scorekeeper.metrics.base.Metric` is the abstract base. **Metadata is class-level;
+`scorekeeper.core.metrics.base.Metric` is the abstract base. **Metadata is class-level;
 behavior is the `evaluate()` method.**
 
 | Attribute | Meaning |
@@ -172,7 +172,7 @@ class SeguridadFactual(MultiStepMetric):
 ### Scales and normalization
 
 Metrics score on their own scale; rollup needs a common range. Each `Scale`
-(`scorekeeper.metrics.scale`) knows how to map a raw score to `[0, 1]`:
+(`scorekeeper.core.metrics.scale`) knows how to map a raw score to `[0, 1]`:
 
 | Scale | Range | `normalize` |
 | --- | --- | --- |
@@ -185,14 +185,14 @@ at rollup, so the stored value stays interpretable in the rubric's own terms.
 
 ### Categories
 
-`MetricCategory` (`scorekeeper.metrics.category`) is a data-only `StrEnum`
+`MetricCategory` (`scorekeeper.core.metrics.category`) is a data-only `StrEnum`
 used for grouping and dashboards. It currently defines a single value, `RAG`;
 add categories here as needed — they carry no behavior.
 
 ### The Judge seam
 
 Metrics never import an LLM SDK. They depend on the `Judge` **Protocol**
-(`scorekeeper.metrics.judge`):
+(`scorekeeper.core.metrics.judge`):
 
 ```python
 class Judge(Protocol):
@@ -217,7 +217,7 @@ a bare schema, bare vectors — carry no usage envelope). Instead the concrete j
 push each call's usage into an *ambient* accumulator:
 
 - The judges read the SDK response's usage `getattr`-safely and call
-  `record_usage(...)` (`scorekeeper.metrics.judges.base`), normalizing providers to
+  `record_usage(...)` (`scorekeeper.core.metrics.judges.base`), normalizing providers to
   input/output (Anthropic `input`/`output_tokens`, OpenAI
   `prompt`/`completion_tokens`; embeddings report input only). A response without
   usage — or any judge stub that never calls `record_usage` — contributes `0`.
@@ -238,7 +238,7 @@ on their own.
 ## Registry and the `@register` decorator
 
 Concrete metrics register themselves with `@register`
-(`scorekeeper.metrics.registry`), co-located with the class. The decorator also
+(`scorekeeper.core.metrics.registry`), co-located with the class. The decorator also
 carries the **scenarios** the metric applies to:
 
 ```python
@@ -250,7 +250,7 @@ class Utilidad(SingleRubricMetric): ...
 ```
 
 `MetricRegistry` provides `get(name)`, `create(name)` (instantiate),
-`all()`, `add(cls)`, and `clear()`. Importing `scorekeeper.metrics.catalog`
+`all()`, `add(cls)`, and `clear()`. Importing `scorekeeper.core.metrics.catalog`
 imports every metric module, which is what populates the registry — so **every
 metric module must be imported from `catalog/__init__.py`**.
 
@@ -273,7 +273,7 @@ the *authoring source of truth is the decorator on each class*:
 
 ```python
 from scorekeeper.db.connection import SessionLocal
-from scorekeeper.metrics.selection import sync_selection, resolve
+from scorekeeper.core.metrics.selection import sync_selection, resolve
 
 with SessionLocal() as session:
     sync_selection(session)          # materialize decorator scenarios → table
@@ -283,7 +283,7 @@ with SessionLocal() as session:
 
 ## Rollup
 
-`scorekeeper.metrics.rollup.turn_score(scores)` computes a turn's score as the
+`scorekeeper.core.metrics.rollup.turn_score(scores)` computes a turn's score as the
 **weighted mean of normalized metric scores**. It takes anything with
 `metric_name` and `score` (e.g. `MetricScore` rows), looks up each metric's
 `scale`/`weight` in the registry, normalizes, and weights:
@@ -315,10 +315,10 @@ derived and recomputable.
 
 ```python
 # src/scorekeeper/metrics/catalog/claridad.py
-from scorekeeper.metrics.base import SingleRubricMetric
-from scorekeeper.metrics.category import MetricCategory
-from scorekeeper.metrics.registry import register
-from scorekeeper.metrics.scale import Likert
+from scorekeeper.core.metrics.base import SingleRubricMetric
+from scorekeeper.core.metrics.category import MetricCategory
+from scorekeeper.core.metrics.registry import register
+from scorekeeper.core.metrics.scale import Likert
 
 RUBRICA_CLARIDAD = """\
 Evalúa la CLARIDAD de la respuesta (1-5): {prompt} {response}
@@ -336,7 +336,7 @@ class Claridad(SingleRubricMetric):
 
 ```python
 # src/scorekeeper/metrics/catalog/__init__.py
-from scorekeeper.metrics.catalog import claridad  # noqa: F401
+from scorekeeper.core.metrics.catalog import claridad  # noqa: F401
 ```
 
 ## Testing

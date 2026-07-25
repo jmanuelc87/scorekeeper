@@ -63,7 +63,7 @@ platform). Parsing and persistence happen synchronously (so a malformed sheet is
 rejected here). Ingestion is **decoupled** from scoring: this endpoint does not start
 anything — the run lands at status `ingerido` and stays there until
 `POST /evaluations/{run_id}/start` enqueues it. This is the glue between the parser
-(`scorekeeper.importer`) and the scoring runner (`scorekeeper.runner`).
+(`scorekeeper.core.importer`) and the scoring runner (`scorekeeper.core.runner`).
 
 - **Content type:** `multipart/form-data`
 - **Parts:**
@@ -71,7 +71,7 @@ anything — the run lands at status `ingerido` and stays there until
     conversation). The sheet uses the columns the importer understands (`role` and
     `content` required; `turn`, `retrieved_context`, `expected_output` optional,
     English or Spanish headers). See [Evaluation metrics](evaluation-metrics.md) and
-    `scorekeeper.importer`.
+    `scorekeeper.core.importer`.
   - `payload` — a JSON string with the run metadata (below).
 
 ### `payload` fields
@@ -179,7 +179,7 @@ decoupled from scoring: the run lands at `ingerido` and starts only via
 `POST /evaluations/{run_id}/start`.
 
 Both endpoints converge immediately: the messages are normalized by
-`scorekeeper.importer.normalize_messages` (the same role aliasing and turn numbering
+`scorekeeper.core.importer.normalize_messages` (the same role aliasing and turn numbering
 the `.xlsx` parser uses) and persisted by the same `ingest_evaluation`, so a captured
 conversation is indistinguishable downstream from an uploaded one.
 

@@ -47,7 +47,7 @@ from scorekeeper.evaluation import (
     set_turn_selection,
     start_run,
 )
-from scorekeeper.metrics.base import (
+from scorekeeper.core.metrics.base import (
     Metric,
     MetricResult,
     MetricTrace,
@@ -55,11 +55,11 @@ from scorekeeper.metrics.base import (
     TraceStep,
     TurnView,
 )
-from scorekeeper.metrics.catalog.hallucination import split_context_docs
-from scorekeeper.metrics.category import MetricCategory
-from scorekeeper.metrics.judge import JudgeVerdict
-from scorekeeper.metrics.registry import MetricRegistry
-from scorekeeper.metrics.scale import Unit
+from scorekeeper.core.metrics.catalog.hallucination import split_context_docs
+from scorekeeper.core.metrics.category import MetricCategory
+from scorekeeper.core.metrics.judge import JudgeVerdict
+from scorekeeper.core.metrics.registry import MetricRegistry
+from scorekeeper.core.metrics.scale import Unit
 
 
 # --- Fakes --------------------------------------------------------------------

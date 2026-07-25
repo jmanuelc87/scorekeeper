@@ -31,13 +31,13 @@ class Settings(BaseSettings):
     # CELERY_BROKER_URL to point at a dedicated broker (e.g. Redis) instead.
     celery_broker_url: str | None = None
 
-    # LLM-as-a-judge configuration (see scorekeeper.metrics.judges).
+    # LLM-as-a-judge configuration (see scorekeeper.core.metrics.judges).
     judge_provider: str = "anthropic"  # "anthropic" | "openai" | "lmstudio"
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
     # Override the OpenAI API base URL (e.g. an OpenAI-compatible gateway or a local
     # proxy). None uses the SDK default (https://api.openai.com/v1). Consumed by the
-    # retrieval parser's direct OpenAI client (see scorekeeper.retrieval.parser).
+    # retrieval parser's direct OpenAI client (see scorekeeper.core.retrieval.parser).
     openai_base_url: str | None = None
     anthropic_judge_model: str = "claude-opus-4-8"
     openai_judge_model: str = "gpt-5.6-sol"
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # these route that step to a specific model of the active provider, so bulk
     # extraction (EXTRACT) can run on a cheaper/faster model than the decisive rubric
     # scoring (SCORE). Unset (None) → the provider's default judge model above (see
-    # scorekeeper.metrics.judges). There is deliberately no VERIFY override: the only
+    # scorekeeper.core.metrics.judges). There is deliberately no VERIFY override: the only
     # per-item verification (faithfulness) pins its own models per instance instead of
     # routing through the judge's step config, so a VERIFY knob would be a no-op.
     judge_extract_model: str | None = None
@@ -63,18 +63,18 @@ class Settings(BaseSettings):
     # Embeddings for similarity-based metrics (e.g. answer relevance). Anthropic
     # offers no embedding endpoint, so embeddings always run through OpenAI; when
     # the judge provider is Anthropic, an OpenAI-backed embedder is attached iff
-    # openai_api_key is set (see scorekeeper.metrics.judges.make_judge).
+    # openai_api_key is set (see scorekeeper.core.metrics.judges.make_judge).
     openai_embedding_model: str = "text-embedding-3-small"
     # Override the judge system prompt at runtime; None uses the built-in default.
     judge_system_prompt: str | None = None
     # Trace every LLM API call the judge makes (op, model, step, turn, sizes,
-    # latency, outcome) to the ``scorekeeper.metrics.judges.tracing`` logger. Purely
+    # latency, outcome) to the ``scorekeeper.core.metrics.judges.tracing`` logger. Purely
     # observational — wraps the judge in a TracingJudge and never alters scoring.
     judge_trace_enabled: bool = False
 
     # Local filesystem directory for the retrieval pipeline's fetch cache. Fetched document
     # bytes are stored here (indexed by the ``document_cache`` table) so a document is
-    # downloaded at most once per platform execution (see scorekeeper.retrieval.fetch). The
+    # downloaded at most once per platform execution (see scorekeeper.core.retrieval.fetch). The
     # entries are purged when that execution's retrieval finishes, so the directory does not
     # accumulate documents across runs (see evaluation.retrieve_run).
     retrieval_cache_dir: str = "./retrieval-cache"
@@ -82,7 +82,7 @@ class Settings(BaseSettings):
     # Master secret for the retrieval pipeline's credential store. Certificate private
     # keys configured per provider (the ``auth_providers`` table) are stored encrypted:
     # a per-row salt derives a key from this secret (PBKDF2) to encrypt/decrypt the PEM
-    # (see scorekeeper.retrieval.credentials.secrets). Unset (None) → SharePoint providers
+    # (see scorekeeper.core.retrieval.credentials.secrets). Unset (None) → SharePoint providers
     # cannot build a client and gated documents resolve to MISSING_CREDENTIALS.
     auth_encryption_key: str | None = None
 

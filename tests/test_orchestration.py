@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scorekeeper import evaluation, tasks
 from scorekeeper.db.models import BenchmarkRun, Turn
 from scorekeeper.evaluation import UploadedFile, ingest_evaluation, retrieve_run
-from scorekeeper.retrieval.types import (
+from scorekeeper.core.retrieval.types import (
     STATUS_EN_RECUPERACION,
     DocType,
     DocumentLocator,
@@ -23,7 +23,7 @@ from scorekeeper.retrieval.types import (
     SourceFormat,
     SourceRef,
 )
-from scorekeeper.runner import STATUS_FALLIDO
+from scorekeeper.core.runner import STATUS_FALLIDO
 
 
 class _FakePipeline:

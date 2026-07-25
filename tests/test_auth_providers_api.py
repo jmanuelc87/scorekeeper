@@ -19,7 +19,7 @@ import pytest
 from httpx import ASGITransport
 
 from scorekeeper.api import app
-from scorekeeper.retrieval.credentials import service
+from scorekeeper.core.retrieval.credentials import service
 
 
 @pytest.fixture

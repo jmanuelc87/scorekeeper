@@ -58,13 +58,13 @@ from scorekeeper.db.models import (
 from scorekeeper.db.repositories import runs as run_repo
 from scorekeeper.db.repositories import scenarios as scenario_repo
 from scorekeeper.db.repositories import turns as turn_repo
-from scorekeeper.importer import normalize_messages, parse_conversation
-from scorekeeper.metrics.judge import Judge
-from scorekeeper.metrics.selection import sync_selection
-from scorekeeper.retrieval.pipeline import RetrievalOrchestrator
-from scorekeeper.retrieval.protocols import RetrievalPipeline
-from scorekeeper.retrieval.types import STATUS_EN_RECUPERACION, RetrievalSummary
-from scorekeeper.runner import (
+from scorekeeper.core.importer import normalize_messages, parse_conversation
+from scorekeeper.core.metrics.judge import Judge
+from scorekeeper.core.metrics.selection import sync_selection
+from scorekeeper.core.retrieval.pipeline import RetrievalOrchestrator
+from scorekeeper.core.retrieval.protocols import RetrievalPipeline
+from scorekeeper.core.retrieval.types import STATUS_EN_RECUPERACION, RetrievalSummary
+from scorekeeper.core.runner import (
     STATUS_COMPLETADO,
     STATUS_FALLIDO,
     STATUS_PARCIAL,

@@ -1,14 +1,14 @@
 # Retrieval taxonomy
 
 The type system behind the [retrieval pipeline](retrieval-pipeline.md) lives in
-`scorekeeper.retrieval.types`: the enums, the per-document outcome/status taxonomy, and the
+`scorekeeper.core.retrieval.types`: the enums, the per-document outcome/status taxonomy, and the
 pydantic value objects that flow between stages. This module carries **no** network, PDF,
 HTML, or auth logic — its only behaviour is the pure **assemble** helpers
 (`ExtractedContent.to_document`, `RetrievalOutcome.assembled`, `RetrievalReport.to_context`)
 and `RetrievalSummary.from_outcomes`. The stage *implementations* live behind the `Protocol`
-interfaces in `scorekeeper.retrieval.protocols`.
+interfaces in `scorekeeper.core.retrieval.protocols`.
 
-Every stage ultimately targets the storage contract in `scorekeeper.retrieved_context`:
+Every stage ultimately targets the storage contract in `scorekeeper.core.retrieved_context`:
 a `{"documents": [{name, document, content, url}, ...]}` object ordered by retriever rank,
 persisted as [`RetrievedDocument`](data-model.md#retrieveddocument) child rows of a turn.
 
@@ -164,7 +164,7 @@ Credentials come from one of two `AuthProvider` implementations: `HostRuleAuthPr
 resolves against an injected host → bearer-token map and carries them via `headers`, while
 `StoredAuthProvider` reads the `auth_providers` table and carries them via a generic
 `AuthClient` (`AuthProvider.client`). A row's `provider` kind selects a `CredentialProvider`
-from the registry (`scorekeeper.retrieval.credentials`); the concrete **SharePoint** provider
+from the registry (`scorekeeper.core.retrieval.credentials`); the concrete **SharePoint** provider
 authenticates with an Azure AD client certificate, whose private key is stored encrypted
 (per-row salt) and decrypted with `AUTH_ENCRYPTION_KEY` when the client is built. With no
 configured row (or no master key), gated documents resolve to `MISSING_CREDENTIALS` →

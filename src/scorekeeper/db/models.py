@@ -36,7 +36,7 @@ from sqlalchemy.orm import (
     relationship,
 )
 
-from scorekeeper.retrieved_context import RetrievedDocument
+from scorekeeper.core.retrieved_context import RetrievedDocument
 
 # JSONB on PostgreSQL, plain JSON on the SQLite fallback.
 JsonColumn = JSON().with_variant(JSONB, "postgresql")
@@ -178,14 +178,14 @@ class Turn(Base):
     response_time_ms: Mapped[int | None] = mapped_column(Integer, default=None)
     turn_score: Mapped[float | None] = mapped_column(Float, default=None)
     # Raw ``retrieved_context`` cell (ranked source references) captured at ingest; the
-    # retrieval pipeline (scorekeeper.retrieval) parses/fetches/extracts it into the
+    # retrieval pipeline (scorekeeper.core.retrieval) parses/fetches/extracts it into the
     # ``retrieved_documents`` child rows. None = the sheet had no context column.
     retrieved_context_source: Mapped[str | None] = mapped_column(Text, default=None)
 
     scenario_result: Mapped[ScenarioResult] = relationship(back_populates="turns")
     # Retrieved context a RAG answer was grounded on, for groundedness-style metrics —
     # one child row per document, ordered by retriever rank. The pydantic
-    # ``RetrievedContext`` (scorekeeper.retrieved_context) is the in-memory assembly of
+    # ``RetrievedContext`` (scorekeeper.core.retrieved_context) is the in-memory assembly of
     # these rows. No rows = no retrieved context for this turn.
     retrieved_documents: Mapped[list[RetrievedContextDocument]] = relationship(
         back_populates="turn",
@@ -276,7 +276,7 @@ class MetricScore(Base):
 class MetricTrace(Base):
     """The structured trace a metric produced for one turn (1:1 with MetricScore).
 
-    Distinct from the Pydantic ``scorekeeper.metrics.base.MetricTrace`` domain
+    Distinct from the Pydantic ``scorekeeper.core.metrics.base.MetricTrace`` domain
     model — this is its persisted mirror. ``steps`` holds the same list the domain
     model's ``steps`` field carries (each step: label/summary/entries).
     """
@@ -320,9 +320,9 @@ class TurnTokenUsage(Base):
 class ScenarioMetric(Base):
     """Which metric applies to which scenario ``use_case``.
 
-    The metric taxonomy lives in code (see ``scorekeeper.metrics``); this table is
+    The metric taxonomy lives in code (see ``scorekeeper.core.metrics``); this table is
     the queryable projection of each metric's decorator-declared scenarios,
-    materialized by ``scorekeeper.metrics.selection.sync_selection``. The scoring
+    materialized by ``scorekeeper.core.metrics.selection.sync_selection``. The scoring
     runner reads it to pick the metric subset for a scenario. ``metric_name`` is a
     plain string validated against the code registry (no FK, since there is no
     metric-definitions table). ``use_case == "default"`` is the fallback set.
@@ -341,10 +341,10 @@ class AuthProviderConfig(Base):
 
     A single table with a ``provider`` discriminator (the provider *kind*, e.g.
     ``"sharepoint"``) backs the credential taxonomy in
-    ``scorekeeper.retrieval.credentials``: one enabled row per gated ``host`` supplies the
+    ``scorekeeper.core.retrieval.credentials``: one enabled row per gated ``host`` supplies the
     settings its :class:`CredentialProvider` needs to build an authenticated client. The
     certificate ``private_key`` is never stored in the clear — it is encrypted with a
-    per-row salt (see ``scorekeeper.retrieval.credentials.secrets``); the plaintext columns
+    per-row salt (see ``scorekeeper.core.retrieval.credentials.secrets``); the plaintext columns
     hold only non-secret identifiers. ``settings`` is kind-specific overflow for future
     providers whose fields do not map onto the SharePoint columns.
     """
@@ -391,7 +391,7 @@ class AuthProviderConfig(Base):
         enabled: bool = True,
     ) -> "AuthProviderConfig":
         """Build a ``sharepoint`` row, encrypting ``private_key`` under ``encryption_key``."""
-        from scorekeeper.retrieval.credentials.secrets import encrypt_secret
+        from scorekeeper.core.retrieval.credentials.secrets import encrypt_secret
 
         salt, token = encrypt_secret(private_key, encryption_key)
         return cls(
@@ -424,7 +424,7 @@ class AuthProviderConfig(Base):
         ``settings`` JSON overflow; the client secret is encrypted into the shared secret
         columns like any other provider's secret.
         """
-        from scorekeeper.retrieval.credentials.secrets import encrypt_secret
+        from scorekeeper.core.retrieval.credentials.secrets import encrypt_secret
 
         salt, token = encrypt_secret(client_secret, encryption_key)
         settings: dict[str, Any] = {"token_url": token_url}
@@ -448,7 +448,7 @@ class AuthProviderConfig(Base):
         per-row salt. Raises ``SecretError`` when no secret is stored or ``encryption_key`` is
         wrong.
         """
-        from scorekeeper.retrieval.credentials.secrets import SecretError, decrypt_secret
+        from scorekeeper.core.retrieval.credentials.secrets import SecretError, decrypt_secret
 
         if not self.private_key_encrypted or not self.private_key_salt:
             raise SecretError(f"El proveedor {self.provider} no tiene un secreto almacenado")
@@ -463,7 +463,7 @@ class DocumentCacheEntry(Base):
     """Index of documents cached on the local filesystem by the fetch stage.
 
     One row per distinct source ``url`` (unique), pointing at the cached blob under
-    ``settings.retrieval_cache_dir``. The fetch stage (``scorekeeper.retrieval.fetch``) reads
+    ``settings.retrieval_cache_dir``. The fetch stage (``scorekeeper.core.retrieval.fetch``) reads
     this to avoid re-downloading a document already on disk, so a URL is fetched at most once
     per platform execution even though the pipeline may reference it many times. Standalone —
     no FK into the run hierarchy; the bytes live on disk, not in the DB.
