@@ -13,6 +13,7 @@ Model Context Protocol — see [MCP tools](mcp.md).
 | `GET /health`                | Liveness probe. |
 | `POST /evaluations`          | Ingest conversation `.xlsx` files for scoring (per-file platform, defaulting to the payload platform). Persists at `ingerido`; does **not** start scoring. |
 | `POST /captures`             | Ingest conversations captured from a chat UI as JSON for scoring (the browser extension's entry point). Persists at `ingerido`; does **not** start scoring. |
+| `PATCH /evaluations/{run_id}/turns/selection` | Select (or deselect) which of an ingested run's turns are scored — scoring is **opt-in per turn**. Must be called before `/start`. |
 | `POST /evaluations/{run_id}/start` | Start scoring an ingested run: flip it from `ingerido` to `en_cola` and **enqueue** the pipeline. |
 | `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity (HTTP twin of the MCP `retrieve` tool). |
@@ -31,9 +32,15 @@ Retrieval (fetching/extracting each turn's source documents) and scoring (the LL
 per metric per turn) are both slow, so they run **off the request path**. Ingestion is also
 **decoupled from the start of scoring**: `POST /evaluations` (and `POST /captures`) parses the
 upload and persists the run tree synchronously at status `ingerido`, then returns `202` — it
-does **not** enqueue anything. Scoring starts only when a client calls
-`POST /evaluations/{run_id}/start`, which flips the run to `en_cola` and enqueues one Celery
-job. A separate **worker** process (`celery -A scorekeeper.celery_app:celery_app worker`)
+does **not** enqueue anything. Scoring is also **opt-in per turn**: an ingested turn's
+`Turn.is_selected` defaults to `false`, and both worker phases (retrieval and scoring) skip
+any turn that is not selected — so a run scored without selecting turns scores nothing. A
+client picks the subset with `PATCH /evaluations/{run_id}/turns/selection` before starting.
+(An unselected turn is still fed to later selected turns' judge **history**, so the
+conversation the judge sees stays complete; it just isn't scored itself.) Scoring starts only
+when a client calls `POST /evaluations/{run_id}/start`, which flips the run to `en_cola` and
+enqueues one Celery job. A separate **worker** process
+(`celery -A scorekeeper.celery_app:celery_app worker`)
 consumes the queue and runs the pipeline orchestrator `run_pipeline_task`: **retrieval first,
 then scoring** (`evaluation.retrieve_run` → `evaluation.score_run`). The broker is the app's own
 Postgres (kombu's SQLAlchemy transport — no extra service); there is no Celery result backend,
@@ -118,26 +125,32 @@ On the request (`ingest_evaluation`):
    `retrieved_context` cell is stored verbatim on `Turn.retrieved_context_source` — it is
    **not** interpreted here; the retrieval pipeline handles it in the worker.
 3. Build and commit the `BenchmarkRun → PlatformExecution → ScenarioResult → Turn`
-   tree — one `PlatformExecution` per distinct platform — with status `ingerido`.
-   Nothing is enqueued; the run waits for `POST /evaluations/{run_id}/start`.
+   tree — one `PlatformExecution` per distinct platform — with status `ingerido`. Every
+   `Turn` lands with `is_selected = false`. Nothing is enqueued; the run waits for a client
+   to select turns (`PATCH /evaluations/{run_id}/turns/selection`) and call
+   `POST /evaluations/{run_id}/start`.
 
 After `POST /evaluations/{run_id}/start` flips the run to `en_cola` and enqueues the
 pipeline job (carrying just the `run_id`), the worker (`run_pipeline_task`, off the
-request path):
+request path) processes **only the selected turns**:
 
 4. **Retrieval** (`retrieve_run`): mark the run `en_recuperacion` and run the retrieval
-   pipeline over each turn's `retrieved_context_source`, populating `retrieved_documents`
-   (best-effort; commits **per scenario**).
+   pipeline over each **selected** turn's `retrieved_context_source`, populating
+   `retrieved_documents` (best-effort; commits **per scenario**). Unselected turns are
+   skipped (no retrieval work).
 5. **Scoring** (`score_run`): mark the run `en_proceso` and score with
-   `EvalRunner.run_benchmark` (one `MetricScore` per metric per turn, reading the
-   just-retrieved context), rolling scores up to scenario, platform, and run level. The
+   `EvalRunner.run_benchmark` (one `MetricScore` per metric per **selected** turn, reading
+   the just-retrieved context), rolling scores up to scenario, platform, and run level. The
    runner also commits **per scenario**, so partial progress survives an interruption.
+   Unselected turns are never scored (their `turn_score` stays `null`) but still feed the
+   conversation history the judge sees.
 6. Roll the run status up to `completado` / `parcial` / `fallido` and commit.
 
 > **Prerequisites.** The database schema must already exist (`alembic upgrade head`)
 > and the configured judge must have a valid API key (see `scorekeeper.config`). The
-> worker must be running to make progress past `en_cola`, and a client must call
-> `POST /evaluations/{run_id}/start` to move a run past `ingerido`.
+> worker must be running to make progress past `en_cola`, a client must select the turns
+> to score (`PATCH /evaluations/{run_id}/turns/selection`) — nothing is scored otherwise —
+> and call `POST /evaluations/{run_id}/start` to move a run past `ingerido`.
 
 ### Response `202`
 
@@ -218,11 +231,51 @@ Identical to `POST /evaluations` — the run is persisted at `ingerido`. Call
 | `422`  | The body fails schema validation (empty `platform`, empty `conversations`, a conversation with no `messages`). |
 | `400`  | A conversation's messages are all blank, or ingest rejected the run. Nothing is persisted. |
 
+## `PATCH /evaluations/{run_id}/turns/selection`
+
+Select (or deselect) which of an ingested run's turns are scored. Scoring is **opt-in per
+turn**: a freshly ingested turn is not selected (`Turn.is_selected = false`), and the worker
+skips unselected turns in **both** retrieval and scoring — so a run started without selecting
+any turn scores nothing. Call this to pick the subset to evaluate **before**
+`POST /evaluations/{run_id}/start`.
+
+The `run_id` is the one returned by `POST /evaluations` or `POST /captures`; the turn ids are
+the `turn_id`s discoverable from [`GET /scenarios/{scenario_id}/turns`](#get-scenariosscenario_idturns)
+(or `GET /runs?granularity=metric_scores`). The call is bulk and idempotent: it flags every
+listed turn that belongs to the run to `is_selected`, ignoring ids that don't belong to the
+run (or aren't valid UUIDs), and reports how many turns it actually changed. Selecting is
+allowed **only while the run is still `ingerido`** — once it has been started, the selection
+is frozen.
+
+- **Content type:** `application/json`
+
+| Field         | Type       | Required | Default | Description |
+|---------------|------------|----------|---------|-------------|
+| `turn_ids`    | `string[]` | yes      | —       | Turn UUIDs to (de)select. Ids not belonging to the run, or malformed, are ignored. |
+| `is_selected` | `boolean`  | no       | `true`  | `true` selects the listed turns for scoring; `false` deselects them. |
+
+### Response `200`
+
+```json
+{"run_id": "b1f2…", "updated": 3}
+```
+
+- `updated` — how many turns were actually changed (listed ids that belong to the run).
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | No run with that `run_id` exists (unknown or malformed id). |
+| `409`  | The run is no longer in the `ingerido` state (already started/queued/scored); the selection is frozen once scoring begins. |
+
 ## `POST /evaluations/{run_id}/start`
 
 Start scoring a previously-ingested run — the explicit trigger decoupled from
 ingestion. Flips the run from `ingerido` to `en_cola` and enqueues the Celery pipeline
-(retrieval + LLM scoring). This is the only way a run moves past `ingerido`.
+(retrieval + LLM scoring). This is the only way a run moves past `ingerido`. Only the
+turns selected via `PATCH /evaluations/{run_id}/turns/selection` are retrieved and scored;
+if none were selected, the run completes without producing any scores.
 
 - **Content type:** none (no body); the `run_id` is the one returned by
   `POST /evaluations` or `POST /captures`.
@@ -507,7 +560,17 @@ curl -X POST http://localhost:8001/evaluations \
 # {"run_id":"b1f2…","status":"ingerido"}
 ```
 
-Start scoring (decoupled from ingestion) → run moves to `en_cola`:
+Select which turns to score (opt-in; do this before starting) → returns how many were flagged:
+
+```bash
+curl -X PATCH http://localhost:8001/evaluations/b1f2…/turns/selection \
+  -H 'Content-Type: application/json' \
+  -d '{"turn_ids": ["7c9e…", "8d0f…"], "is_selected": true}'
+# {"run_id":"b1f2…","updated":2}
+```
+
+Start scoring (decoupled from ingestion) → run moves to `en_cola`. Only the selected turns
+are scored:
 
 ```bash
 curl -X POST http://localhost:8001/evaluations/b1f2…/start
@@ -615,7 +678,8 @@ dedicated broker (e.g. Redis) instead of Postgres.
 
 - Endpoint & request/response models — `src/scorekeeper/api.py`
 - Ingest / retrieve / score split + polling — `src/scorekeeper/evaluation.py`
-  (`ingest_evaluation`, `retrieve_run`, `score_run`, `get_run_summary`, `run_evaluation`)
+  (`ingest_evaluation`, `set_turn_selection`, `retrieve_run`, `score_run`, `get_run_summary`,
+  `run_evaluation`)
 - Read paths — `src/scorekeeper/evaluation.py` (`retrieve_runs`, `retrieve_scenario_turns`,
   `retrieve_turn_traces`, `retrieve_turn_token_usage`)
 - Retrieval orchestrator — `src/scorekeeper/retrieval/pipeline.py` (`RetrievalOrchestrator`)
