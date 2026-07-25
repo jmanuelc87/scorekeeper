@@ -138,11 +138,14 @@ class EvalRunner:
         )
         history: list[tuple[str, str]] = []
         turn_scores: list[float | None] = []
-        for index, turn in enumerate(scenario.turns):
-            if index > 0:
-                await self._pace_between_turns()
-            await self.run_turn(turn, metrics, history)
-            turn_scores.append(turn.turn_score)
+        for turn in scenario.turns:
+            # Only selected turns are scored, but every turn feeds the conversation
+            # history so a later selected turn's judge sees the full exchange.
+            if turn.is_selected:
+                if turn_scores:  # pace only between turns actually scored
+                    await self._pace_between_turns()
+                await self.run_turn(turn, metrics, history)
+                turn_scores.append(turn.turn_score)
             history.append((turn.prompt, turn.response))
         scenario.average_score = scenario_average(turn_scores)
         scenario.status = _scenario_status(scenario)

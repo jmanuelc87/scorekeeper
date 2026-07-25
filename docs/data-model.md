@@ -83,6 +83,7 @@ erDiagram
         Integer turn_number
         Text prompt
         Text response
+        Boolean is_selected
         Text expected_output
         Text retrieved_context_source
         Integer response_time_ms
@@ -235,6 +236,7 @@ One user/model exchange within a conversation, evaluated on its own.
 | `turn_number` | Integer | Order of the turn within the conversation. |
 | `prompt` | Text | User message. |
 | `response` | Text | Model response. |
+| `is_selected` | Boolean | Whether this turn is scored. Opt-in: defaults to `false`, and the worker skips unselected turns in both retrieval and scoring. Set via `PATCH /evaluations/{run_id}/turns/selection` before the run starts. An unselected turn still feeds later turns' judge history. |
 | `expected_output` | Text | Ground-truth answer for reference-based metrics (e.g. contextual precision); `NULL` when no reference is available. |
 | `retrieved_context_source` | Text | Raw `retrieved_context` cell (ranked source references) captured at ingest; the retrieval pipeline parses/fetches/extracts it into `retrieved_documents`. `NULL` when the sheet had no context column. |
 | `response_time_ms` | Integer | Response latency, if available. |

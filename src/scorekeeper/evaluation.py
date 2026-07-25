@@ -9,18 +9,23 @@ for a **single platform** and its set of files (each file is one scenario, score
 under that one platform), seeds the metric-selection table, runs the evaluation,
 and reports a JSON-serializable summary.
 
-Two phases, split so scoring can run off the request path (see ``scorekeeper.tasks``):
+Ingestion and scoring are split so the start of scoring is decoupled from the upload
+and can run off the request path (see ``scorekeeper.tasks``):
 
 * :func:`ingest_evaluation` — parse the uploads and persist the run tree as
-  ``en_cola`` (*queued*), returning the ``run_id``. Fast; the API runs it inline.
+  ``ingerido`` (*persisted, not started*), returning the ``run_id``. Fast; the API
+  runs it inline. It does **not** start scoring.
+* :func:`start_run` — flip an ingested run from ``ingerido`` to ``en_cola`` (*queued*)
+  so a caller can enqueue it. The explicit trigger the API exposes as
+  ``POST /evaluations/{run_id}/start``.
 * :func:`score_run` — load a queued run by id and score it with the LLM judge.
   Slow; the Celery worker runs it. The runner commits **per scenario** (its
   atomic-write unit), so an interrupted job keeps every scenario it already
   finished. On failure the run is marked ``fallido`` so pollers see a terminal state.
 
-:func:`run_evaluation` runs both phases on one session — the synchronous path kept
-for tests and any in-process caller. :func:`get_run_summary` reads a run's current
-status/summary for polling.
+:func:`run_evaluation` runs ingestion and scoring on one session — the synchronous
+path kept for tests and any in-process caller. :func:`get_run_summary` reads a run's
+current status/summary for polling.
 """
 
 from __future__ import annotations
@@ -71,7 +76,8 @@ DEFAULT_USE_CASE = "default"
 
 # Orchestration-level run statuses that precede scoring (the scoring-complete
 # literals — completado/parcial/fallido — live in ``runner``).
-STATUS_EN_COLA = "en_cola"  # ingested, waiting for a worker
+STATUS_INGERIDO = "ingerido"  # persisted, not yet started
+STATUS_EN_COLA = "en_cola"  # enqueued to Celery, waiting for a worker
 STATUS_EN_PROCESO = "en_proceso"  # a worker is scoring it now
 
 # Retrieval granularity: how deep :func:`retrieve_runs` serializes the run tree.
@@ -162,11 +168,11 @@ async def ingest_evaluation(
     platform — each file lands under ``upload.platform`` when set, otherwise under the
     run-level ``platform`` fallback. Each file becomes one ``ScenarioResult`` (with its
     ``Turn`` rows) attached to its platform's execution. The run is committed with
-    status ``en_cola`` and left unscored; a worker later scores it via
-    :func:`score_run`.
+    status ``ingerido`` (persisted, not yet started) and left unscored; a caller later
+    starts it via :func:`start_run` (which enqueues :func:`score_run`).
 
     This is the fast, on-request half: parsing is synchronous so a malformed sheet is
-    rejected here (as ``ValueError``) before any job is enqueued. ``session`` defaults
+    rejected here (as ``ValueError``) before anything is persisted. ``session`` defaults
     to ``SessionLocal()``; tests inject an in-memory session.
 
     Raises ``ValueError`` when ``platform`` or ``files`` is empty, or when a file
@@ -202,7 +208,7 @@ async def ingest_evaluation(
                 db.add(source_file)
                 parsed.append((upload, messages, source_file))
 
-            run = BenchmarkRun(status=STATUS_EN_COLA)
+            run = BenchmarkRun(status=STATUS_INGERIDO)
             # A run references a single source file; only meaningful with one upload.
             if len(parsed) == 1:
                 run.source_file = parsed[0][2]
@@ -242,7 +248,7 @@ async def ingest_evaluation(
             turn_total = sum(len(project_turns(messages)) for _, messages, _ in parsed)
             await db.commit()
             logger.info(
-                "Run %s en cola: %d plataforma(s) × %d archivo(s) = %d turno(s).",
+                "Run %s ingerido: %d plataforma(s) × %d archivo(s) = %d turno(s).",
                 run.id,
                 len(executions),
                 len(parsed),
@@ -338,7 +344,10 @@ async def retrieve_run(
             for platform_exec in run.platform_executions:
                 for scenario in platform_exec.scenario_results:
                     for turn in scenario.turns:
-                        await _retrieve_turn(turn, orchestrator)
+                        # Skip retrieval for turns that won't be scored; their
+                        # retrieved context is only used by their own metrics.
+                        if turn.is_selected:
+                            await _retrieve_turn(turn, orchestrator)
                     await db.commit()  # atomic-write unit: one scenario at a time
                 await _purge_cache(orchestrator, platform_exec)
         except Exception:
@@ -404,15 +413,31 @@ async def run_evaluation(
 ) -> dict[str, Any]:
     """Ingest ``files``, retrieve their context, and score them under ``platform`` in one call.
 
-    The synchronous path: :func:`ingest_evaluation` → :func:`retrieve_run` → :func:`score_run`
-    on the same session. Kept for tests and in-process callers; the HTTP API instead ingests
-    inline and enqueues the retrieval+scoring orchestrator onto the Celery worker. ``pipeline``
-    is injectable so tests avoid network/LLM calls.
+    The synchronous path: :func:`ingest_evaluation` → select every turn → :func:`retrieve_run`
+    → :func:`score_run` on the same session. Because scoring is opt-in per turn (only
+    ``Turn.is_selected`` turns are evaluated by the worker), this convenience selects all
+    turns so it evaluates the whole file — the HTTP API instead ingests inline, lets the
+    caller pick a subset via the selection endpoint, then enqueues the retrieval+scoring
+    orchestrator onto the Celery worker. ``pipeline`` is injectable so tests avoid
+    network/LLM calls.
     """
     async with session_scope(session) as db:
         run_id = await ingest_evaluation(platform, files, session=db)
+        await _select_all_turns(db, run_id)
         await retrieve_run(run_id, session=db, pipeline=pipeline)
         return await score_run(run_id, session=db, judge=judge)
+
+
+async def _select_all_turns(db: AsyncSession, run_id: str) -> None:
+    """Mark every turn of a run selected for scoring (the "evaluate everything" default)."""
+    run = await _load_run(db, run_id, _run_tree(metric_scores=False, retrieval=False))
+    if run is None:
+        return
+    for platform_exec in run.platform_executions:
+        for scenario in platform_exec.scenario_results:
+            for turn in scenario.turns:
+                turn.is_selected = True
+    await db.commit()
 
 
 async def get_run_summary(
@@ -422,6 +447,77 @@ async def get_run_summary(
     async with session_scope(session) as db:
         run = await _load_run(db, run_id, _run_tree(metric_scores=False, retrieval=False))
         return _summarize(run) if run is not None else None
+
+
+async def start_run(run_id: str, *, session: AsyncSession | None = None) -> str | None:
+    """Move an ingested run to ``en_cola`` so it can be enqueued for scoring.
+
+    Decouples the start of evaluation from ingestion: :func:`ingest_evaluation` leaves
+    the run at ``ingerido`` and a separate call flips it to ``en_cola``, after which the
+    caller enqueues the Celery pipeline. Commits the new status; the caller enqueues.
+
+    Returns the new status (``en_cola``) on success, or ``None`` when the ``run_id`` is
+    unknown/invalid. Raises ``ValueError`` when the run is not in the ``ingerido`` state
+    (already started), so a run is never enqueued twice.
+    """
+    async with session_scope(session) as db:
+        run = await _load_run(db, run_id)
+        if run is None:
+            return None
+        if run.status != STATUS_INGERIDO:
+            raise ValueError(
+                f"El run {run_id} no está en estado '{STATUS_INGERIDO}' "
+                f"(estado actual: '{run.status}')."
+            )
+        run.status = STATUS_EN_COLA
+        await db.commit()
+        logger.info("Run %s encolado para puntuación.", run_id)
+        return STATUS_EN_COLA
+
+
+async def set_turn_selection(
+    run_id: str,
+    turn_ids: list[str],
+    is_selected: bool,
+    *,
+    session: AsyncSession | None = None,
+) -> int | None:
+    """Flag the given turns of a run as selected/deselected for scoring.
+
+    Only selected turns are evaluated by the worker (retrieval + LLM judge); this
+    is how a caller picks the subset to score before starting the run. Returns the
+    number of turns updated, or ``None`` when the ``run_id`` is unknown/invalid.
+    Raises ``ValueError`` when the run has already left the ``ingerido`` state
+    (selection must happen before starting). Turn ids that don't belong to the run
+    (or are malformed) are ignored.
+    """
+    async with session_scope(session) as db:
+        run = await _load_run(db, run_id, _run_tree(metric_scores=False, retrieval=False))
+        if run is None:
+            return None
+        if run.status != STATUS_INGERIDO:
+            raise ValueError(
+                f"El run {run_id} no está en estado '{STATUS_INGERIDO}' "
+                f"(estado actual: '{run.status}')."
+            )
+        wanted: set[uuid.UUID] = set()
+        for raw in turn_ids:
+            try:
+                wanted.add(uuid.UUID(raw))
+            except (ValueError, AttributeError):
+                continue  # ignore malformed ids
+        updated = 0
+        for platform_exec in run.platform_executions:
+            for scenario in platform_exec.scenario_results:
+                for turn in scenario.turns:
+                    if turn.id in wanted:
+                        turn.is_selected = is_selected
+                        updated += 1
+        await db.commit()
+        logger.info(
+            "Run %s: %d turno(s) marcados is_selected=%s.", run_id, updated, is_selected
+        )
+        return updated
 
 
 async def retrieve_turn_traces(

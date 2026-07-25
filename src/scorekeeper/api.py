@@ -122,10 +122,29 @@ class EvaluationResponse(BaseModel):
 
 
 class EvaluationEnqueuedResponse(BaseModel):
-    """Returned by ``POST /evaluations``: the run was queued for a worker to score."""
+    """The ``run_id`` and ``status`` returned by the ingest and start endpoints.
+
+    ``POST /evaluations`` and ``POST /captures`` persist the run and return it at
+    ``ingerido`` (not yet started); ``POST /evaluations/{run_id}/start`` flips it to
+    ``en_cola`` and enqueues a worker.
+    """
 
     run_id: str
     status: str
+
+
+class TurnSelectionRequest(BaseModel):
+    """Which turns of a run to (de)select for scoring, sent to the selection endpoint."""
+
+    turn_ids: list[str]
+    is_selected: bool = True
+
+
+class TurnSelectionResponse(BaseModel):
+    """How many turns the selection endpoint updated."""
+
+    run_id: str
+    updated: int
 
 
 @app.get("/health")
@@ -138,7 +157,7 @@ async def create_evaluation(
     files: list[UploadFile] = File(...),
     payload: str = Form(...),
 ) -> EvaluationEnqueuedResponse:
-    """Ingest uploaded conversation ``.xlsx`` files and enqueue them for scoring.
+    """Ingest uploaded conversation ``.xlsx`` files and persist them for scoring.
 
     ``multipart/form-data``: one or more ``files`` plus a ``payload`` JSON string
     (``platform``, default ``use_case``, and optional per-filename overrides). Each
@@ -146,10 +165,11 @@ async def create_evaluation(
     sets one, otherwise under the payload-level ``platform``.
 
     Returns ``202`` with a ``run_id`` as soon as the upload is parsed and persisted
-    (status ``en_cola``); a Celery worker then runs the retrieval pipeline and the LLM
-    scoring off the request path. Poll ``GET /evaluations/{run_id}`` for progress and
-    results. A malformed sheet or bad input is still rejected synchronously here, before
-    anything queues.
+    (status ``ingerido``). Ingestion is decoupled from scoring: nothing runs until you
+    call ``POST /evaluations/{run_id}/start``, which enqueues the retrieval + LLM
+    scoring pipeline. Poll ``GET /evaluations/{run_id}`` for progress and results. A
+    malformed sheet or bad input is still rejected synchronously here, before anything
+    is persisted.
     """
     try:
         parsed_payload = EvaluationPayload.model_validate_json(payload)
@@ -195,16 +215,13 @@ async def create_evaluation(
         logger.warning("POST /evaluations rechazado: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    # enqueue_run publishes over kombu's sync SQLAlchemy transport (a blocking DB
-    # round-trip), so it must not run on the event loop.
-    await asyncio.to_thread(tasks.enqueue_run, run_id)
-    logger.info("POST /evaluations en cola: run_id=%s", run_id)
-    return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_EN_COLA)
+    logger.info("POST /evaluations ingerido: run_id=%s", run_id)
+    return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_INGERIDO)
 
 
 @app.post("/captures", response_model=EvaluationEnqueuedResponse, status_code=202)
 async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
-    """Ingest conversations captured from a chat UI and enqueue them for scoring.
+    """Ingest conversations captured from a chat UI and persist them for scoring.
 
     The JSON twin of ``POST /evaluations`` for clients that already hold the turns
     and have no spreadsheet to upload — the browser extension in ``extension/``
@@ -212,8 +229,10 @@ async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
     one scenario and follows the same platform rules as an uploaded file: its own
     ``platform`` when set, otherwise the payload-level one.
 
-    Returns ``202`` with a ``run_id``; poll ``GET /evaluations/{run_id}`` for
-    progress and results, exactly as with an upload.
+    Returns ``202`` with a ``run_id`` at status ``ingerido``. Like ``POST
+    /evaluations``, ingestion is decoupled from scoring: call ``POST
+    /evaluations/{run_id}/start`` to enqueue the pipeline, then poll
+    ``GET /evaluations/{run_id}`` for progress and results.
     """
     logger.info(
         "POST /captures: %d conversación(es), plataforma=%s",
@@ -253,20 +272,77 @@ async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
         logger.warning("POST /captures rechazado: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    logger.info("POST /captures ingerido: run_id=%s", run_id)
+    return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_INGERIDO)
+
+
+@app.post(
+    "/evaluations/{run_id}/start",
+    response_model=EvaluationEnqueuedResponse,
+    status_code=202,
+)
+async def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
+    """Start scoring a previously-ingested run (the trigger decoupled from ingestion).
+
+    Flips a run from ``ingerido`` to ``en_cola`` and enqueues the Celery pipeline
+    (retrieval + LLM scoring). Returns ``202`` with ``status`` ``en_cola``; poll
+    ``GET /evaluations/{run_id}`` for progress. ``404`` when the ``run_id`` is unknown,
+    ``409`` when the run is not in the ``ingerido`` state (already started), so a run is
+    never enqueued twice.
+    """
+    try:
+        status = await evaluation.start_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
+
     # enqueue_run publishes over kombu's sync SQLAlchemy transport (a blocking DB
     # round-trip), so it must not run on the event loop.
     await asyncio.to_thread(tasks.enqueue_run, run_id)
-    logger.info("POST /captures en cola: run_id=%s", run_id)
-    return EvaluationEnqueuedResponse(run_id=run_id, status=evaluation.STATUS_EN_COLA)
+    logger.info("POST /evaluations/%s/start en cola", run_id)
+    return EvaluationEnqueuedResponse(run_id=run_id, status=status)
+
+
+@app.patch(
+    "/evaluations/{run_id}/turns/selection",
+    response_model=TurnSelectionResponse,
+)
+async def select_turns(run_id: str, payload: TurnSelectionRequest) -> TurnSelectionResponse:
+    """Mark a subset of a run's turns as selected (or not) for scoring.
+
+    Scoring is opt-in per turn: only turns flagged ``is_selected`` are evaluated by
+    the worker. Call this before ``POST /evaluations/{run_id}/start`` to pick the
+    subset. Turn ids that don't belong to the run are ignored; the response reports
+    how many turns were actually updated. ``404`` when the ``run_id`` is unknown,
+    ``409`` when the run has already left the ``ingerido`` state (already started).
+    """
+    try:
+        updated = await evaluation.set_turn_selection(
+            run_id, payload.turn_ids, payload.is_selected
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if updated is None:
+        raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
+
+    logger.info(
+        "PATCH /evaluations/%s/turns/selection: %d turno(s) is_selected=%s",
+        run_id,
+        updated,
+        payload.is_selected,
+    )
+    return TurnSelectionResponse(run_id=run_id, updated=updated)
 
 
 @app.get("/evaluations/{run_id}", response_model=EvaluationResponse)
 async def get_evaluation(run_id: str) -> EvaluationResponse:
     """Return a run's current status and summary (poll this after ``POST``).
 
-    ``status`` walks ``en_cola → en_proceso → completado|parcial|fallido``; the
-    platform's ``average_score`` stays ``null`` until scoring finishes. ``404`` when
-    the ``run_id`` is unknown.
+    ``status`` walks ``ingerido → en_cola → en_recuperacion → en_proceso →
+    completado|parcial|fallido``; it stays at ``ingerido`` until
+    ``POST /evaluations/{run_id}/start`` enqueues it. The platform's ``average_score``
+    stays ``null`` until scoring finishes. ``404`` when the ``run_id`` is unknown.
     """
     summary = await evaluation.get_run_summary(run_id)
     if summary is None:

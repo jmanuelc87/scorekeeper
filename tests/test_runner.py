@@ -184,14 +184,20 @@ async def _seed_scenario(
     session: AsyncSession,
     exchanges: list[tuple[str, str]],
     use_case: str = USE_CASE,
+    selected: set[int] | None = None,
 ) -> tuple[BenchmarkRun, PlatformExecution, ScenarioResult]:
+    # ``selected`` is the set of 1-based turn numbers to flag for scoring; ``None``
+    # selects every turn (the common case for tests that score the whole scenario).
     run = BenchmarkRun()
     platform_exec = PlatformExecution(platform="claude", run=run)
     scenario = ScenarioResult(
         scenario_id="esc-1", use_case=use_case, platform_execution=platform_exec
     )
     for i, (prompt, response) in enumerate(exchanges, start=1):
-        scenario.turns.append(Turn(turn_number=i, prompt=prompt, response=response))
+        is_selected = selected is None or i in selected
+        scenario.turns.append(
+            Turn(turn_number=i, prompt=prompt, response=response, is_selected=is_selected)
+        )
     session.add(run)
     await session.flush()
     # The runner consumes an eagerly-loaded tree (production loads it via
@@ -300,6 +306,65 @@ async def test_partial_scenario_when_one_turn_unscored(session: AsyncSession, re
     assert scenario.average_score == pytest.approx(0.7)
 
 
+async def test_only_selected_turns_are_scored(session: AsyncSession, registry) -> None:
+    # Turn 2 is not selected: it must be skipped for scoring (no MetricScore rows,
+    # turn_score stays None) while the selected turns are scored normally.
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(
+        session,
+        [("hola", "r1"), ("intermedio", "r2"), ("adiós", "r3")],
+        selected={1, 3},
+    )
+
+    await EvalRunner(session, RecordingJudge(score_value=0.7)).run_scenario(scenario)
+    await session.commit()
+
+    by_number = {t.turn_number: t for t in scenario.turns}
+    assert by_number[2].metric_scores == []
+    assert by_number[2].turn_score is None
+    assert by_number[1].turn_score == pytest.approx(0.7)
+    assert by_number[3].turn_score == pytest.approx(0.7)
+    # Only the two selected turns produced score rows.
+    total = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
+    assert total == 2
+    # The skipped turn is excluded from the roll-up.
+    assert scenario.average_score == pytest.approx(0.7)
+
+
+async def test_unselected_turn_still_feeds_history(session: AsyncSession, registry) -> None:
+    # Turn 2 is not scored, but turns 1 and 2 must still appear in turn 3's judge
+    # history so the conversation the judge sees is complete.
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(
+        session,
+        [("hola", "r1"), ("intermedio", "r2"), ("adiós", "r3")],
+        selected={1, 3},
+    )
+    judge = RecordingJudge()
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+
+    # Only the two selected turns were scored → two recorded views, in turn order.
+    first_view, third_view = judge.seen_turns
+    assert first_view.history == []
+    assert third_view.history == [("hola", "r1"), ("intermedio", "r2")]
+
+
+async def test_no_selected_turns_scores_nothing(session: AsyncSession, registry) -> None:
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(
+        session, [("hola", "r1"), ("adiós", "r2")], selected=set()
+    )
+
+    await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
+    await session.commit()
+
+    total = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
+    assert total == 0
+    assert all(t.turn_score is None for t in scenario.turns)
+    assert scenario.average_score is None
+
+
 async def test_history_is_fed_forward(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad"])
     _, _, scenario = await _seed_scenario(session, [("hola", "respuesta1"), ("otra", "respuesta2")])
@@ -321,7 +386,9 @@ async def test_run_platform_rolls_up_average(session: AsyncSession, registry) ->
         scenario = ScenarioResult(
             scenario_id=sid, use_case=USE_CASE, platform_execution=platform_exec
         )
-        scenario.turns.append(Turn(turn_number=1, prompt="p", response="r"))
+        scenario.turns.append(
+            Turn(turn_number=1, prompt="p", response="r", is_selected=True)
+        )
     session.add(run)
     await session.flush()
     await session.execute(

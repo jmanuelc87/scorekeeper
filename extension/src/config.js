@@ -29,6 +29,7 @@ export const TERMINAL_STATUSES = ["completado", "parcial", "fallido"];
 
 /** Spanish labels for the API's run statuses, shown across every surface. */
 export const STATUS_LABELS = {
+  ingerido: "ingerido",
   en_cola: "en cola",
   en_proceso: "en proceso",
   completado: "completado",

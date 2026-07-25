@@ -188,6 +188,13 @@ class Turn(Base):
     turn_number: Mapped[int] = mapped_column(Integer)
     prompt: Mapped[str] = mapped_column(Text)
     response: Mapped[str] = mapped_column(Text)
+    # Whether this turn is included in scoring. Opt-in: only turns flagged True are
+    # evaluated by the worker (retrieval + LLM judge). Set via the selection endpoint
+    # before starting a run. False = skipped for scoring but still part of the
+    # conversation history fed to later turns' judges.
+    is_selected: Mapped[bool] = mapped_column(
+        Boolean, default=False, server_default="0", nullable=False
+    )
     # Ground-truth answer for the turn, for reference-based metrics (e.g. contextual
     # precision). Free-form text; None = no reference available for this turn.
     expected_output: Mapped[str | None] = mapped_column(Text, default=None)

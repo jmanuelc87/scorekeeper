@@ -196,7 +196,8 @@ parses/fetches/extracts its raw `Turn.retrieved_context_source` (captured at ing
 `retrieved_documents` — committing **per scenario**, best-effort, so a hard phase exception
 marks the run `fallido` while per-document failures just shrink the context. Scoring then reads
 `retrieved_documents` as before. The run lifecycle is
-`en_cola → en_recuperacion → en_proceso → completado|parcial|fallido`.
+`ingerido → en_cola → en_recuperacion → en_proceso → completado|parcial|fallido`
+(ingestion persists at `ingerido`; `POST /evaluations/{run_id}/start` enqueues it).
 
 ### Cache cleanup
 

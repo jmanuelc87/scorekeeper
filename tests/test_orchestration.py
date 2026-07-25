@@ -71,7 +71,11 @@ async def _ingest_one_turn_with_context(session: AsyncSession, cell: str) -> str
         [[1, "user", "pregunta", cell], [1, "model", "respuesta", ""]],
     )
     files = [UploadedFile(filename="esc.xlsx", content=content, scenario_id="esc")]
-    return await ingest_evaluation("claude", files, session=session)
+    run_id = await ingest_evaluation("claude", files, session=session)
+    # Retrieval only runs for selected turns; select the turn so these tests exercise it.
+    turn_ids = [str(t.id) for t in (await session.execute(select(Turn))).scalars().all()]
+    await evaluation.set_turn_selection(run_id, turn_ids, True, session=session)
+    return run_id
 
 
 # -- retrieve_run --------------------------------------------------------------------------
@@ -96,6 +100,24 @@ async def test_retrieve_run_skips_turns_without_source(session: AsyncSession) ->
     content = _xlsx(["turn", "role", "content"], [[1, "user", "hola"], [1, "model", "hey"]])
     files = [UploadedFile(filename="esc.xlsx", content=content, scenario_id="esc")]
     run_id = await ingest_evaluation("claude", files, session=session)
+    pipeline = _FakePipeline()
+
+    await retrieve_run(run_id, session=session, pipeline=pipeline)
+
+    turn = (await session.execute(select(Turn))).scalars().one()
+    assert turn.retrieved_documents == []
+    assert pipeline.calls == []
+
+
+async def test_retrieve_run_skips_unselected_turns(session: AsyncSession) -> None:
+    # A turn with a source but not selected for scoring must be skipped by retrieval
+    # (no wasted pipeline call, no documents populated).
+    content = _xlsx(
+        ["turn", "role", "content", "retrieved_context"],
+        [[1, "user", "pregunta", "manual (https://h/x.html)"], [1, "model", "respuesta", ""]],
+    )
+    files = [UploadedFile(filename="esc.xlsx", content=content, scenario_id="esc")]
+    run_id = await ingest_evaluation("claude", files, session=session)  # left unselected
     pipeline = _FakePipeline()
 
     await retrieve_run(run_id, session=session, pipeline=pipeline)
@@ -142,6 +164,9 @@ async def test_retrieve_run_purges_cache_once_per_platform_execution(session: As
         for i in (1, 2)
     ]
     run_id = await ingest_evaluation("claude", files, session=session)
+    # Retrieval only runs for selected turns; select them so both scenarios retrieve.
+    turn_ids = [str(t.id) for t in (await session.execute(select(Turn))).scalars().all()]
+    await evaluation.set_turn_selection(run_id, turn_ids, True, session=session)
     pipeline = _FakePipeline()
 
     await retrieve_run(run_id, session=session, pipeline=pipeline)

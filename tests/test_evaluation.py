@@ -44,6 +44,8 @@ from scorekeeper.evaluation import (
     retrieve_turn_traces,
     run_evaluation,
     score_run,
+    set_turn_selection,
+    start_run,
 )
 from scorekeeper.metrics.base import (
     Metric,
@@ -361,14 +363,14 @@ async def test_run_evaluation_malformed_sheet_raises(session: AsyncSession, regi
 # --- ingest_evaluation / score_run (the async split) --------------------------
 
 
-async def test_ingest_sets_queued_status(session: AsyncSession, registry) -> None:
+async def test_ingest_sets_ingested_status(session: AsyncSession, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
 
     run_id = await ingest_evaluation("claude", files, session=session)
 
-    # The tree exists, is queued, and is not yet scored.
+    # The tree exists, is ingested but not started, and is not yet scored.
     run = await session.get(BenchmarkRun, uuid.UUID(run_id))
-    assert run.status == "en_cola"
+    assert run.status == "ingerido"
     turns = (await session.execute(select(Turn))).scalars().all()
     assert len(turns) == 2
     assert all(t.turn_score is None for t in turns)
@@ -399,9 +401,18 @@ async def test_progress_midway(session: AsyncSession, registry) -> None:
     assert summary["progress"] == {"done": 1, "total": 2, "ratio": 0.5}
 
 
+async def _all_turn_ids(session: AsyncSession, run_id: str) -> list[str]:
+    turns = (await session.execute(select(Turn))).scalars().all()
+    return [str(t.id) for t in turns]
+
+
 async def test_score_run_end_to_end(session: AsyncSession, registry) -> None:
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
     run_id = await ingest_evaluation("claude", files, session=session)
+    # Scoring is opt-in per turn — select both turns before scoring.
+    await set_turn_selection(
+        run_id, await _all_turn_ids(session, run_id), True, session=session
+    )
 
     summary = await score_run(run_id, session=session, judge=RecordingJudge(0.8))
 
@@ -414,6 +425,92 @@ async def test_score_run_end_to_end(session: AsyncSession, registry) -> None:
     assert scores == 2  # 2 turns × 1 metric
 
 
+async def test_score_run_only_scores_selected_turns(session: AsyncSession, registry) -> None:
+    # Select only the first of the two ingested turns; scoring must skip the other.
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+    first_turn = (
+        (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().first()
+    )
+    await set_turn_selection(run_id, [str(first_turn.id)], True, session=session)
+
+    await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+
+    # Only the selected turn produced a score row; the other stays unscored.
+    scores = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
+    assert scores == 1
+    by_number = {
+        t.turn_number: t.turn_score
+        for t in (await session.execute(select(Turn))).scalars().all()
+    }
+    assert by_number[1] == pytest.approx(0.8)
+    assert by_number[2] is None
+
+
+async def test_set_turn_selection_updates_matching_turns(
+    session: AsyncSession, registry
+) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+    turn_ids = await _all_turn_ids(session, run_id)
+
+    updated = await set_turn_selection(run_id, turn_ids, True, session=session)
+
+    assert updated == 2
+    assert all(t.is_selected for t in (await session.execute(select(Turn))).scalars().all())
+
+    # Deselect one turn; the count reflects only the turns actually touched.
+    updated = await set_turn_selection(run_id, [turn_ids[0]], False, session=session)
+    assert updated == 1
+    by_id = {
+        str(t.id): t.is_selected
+        for t in (await session.execute(select(Turn))).scalars().all()
+    }
+    assert by_id[turn_ids[0]] is False
+    assert by_id[turn_ids[1]] is True
+
+
+async def test_set_turn_selection_ignores_foreign_and_bad_ids(
+    session: AsyncSession, registry
+) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+
+    updated = await set_turn_selection(
+        run_id,
+        ["not-a-uuid", "00000000-0000-0000-0000-000000000000"],
+        True,
+        session=session,
+    )
+
+    assert updated == 0
+    assert not any(
+        t.is_selected for t in (await session.execute(select(Turn))).scalars().all()
+    )
+
+
+async def test_set_turn_selection_unknown_run_returns_none(session: AsyncSession) -> None:
+    assert await set_turn_selection("not-a-uuid", [], True, session=session) is None
+    assert (
+        await set_turn_selection(
+            "00000000-0000-0000-0000-000000000000", [], True, session=session
+        )
+        is None
+    )
+
+
+async def test_set_turn_selection_after_start_raises(session: AsyncSession, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+    await start_run(run_id, session=session)  # ingerido -> en_cola
+
+    # Selection is only allowed before a run leaves the 'ingerido' state.
+    with pytest.raises(ValueError):
+        await set_turn_selection(
+            run_id, await _all_turn_ids(session, run_id), True, session=session
+        )
+
+
 async def test_score_run_unknown_id_raises(session: AsyncSession) -> None:
     with pytest.raises(ValueError):
         await score_run("00000000-0000-0000-0000-000000000000", session=session)
@@ -422,6 +519,32 @@ async def test_score_run_unknown_id_raises(session: AsyncSession) -> None:
 async def test_get_run_summary_unknown_returns_none(session: AsyncSession) -> None:
     assert await get_run_summary("not-a-uuid", session=session) is None
     assert await get_run_summary("00000000-0000-0000-0000-000000000000", session=session) is None
+
+
+async def test_start_run_moves_ingested_to_queued(session: AsyncSession, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+
+    status = await start_run(run_id, session=session)
+
+    assert status == "en_cola"
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
+    assert run.status == "en_cola"
+
+
+async def test_start_run_unknown_returns_none(session: AsyncSession) -> None:
+    assert await start_run("not-a-uuid", session=session) is None
+    assert await start_run("00000000-0000-0000-0000-000000000000", session=session) is None
+
+
+async def test_start_run_already_started_raises(session: AsyncSession, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+    await start_run(run_id, session=session)  # ingerido -> en_cola
+
+    # A second start is rejected so a run is never enqueued twice.
+    with pytest.raises(ValueError):
+        await start_run(run_id, session=session)
 
 
 # --- POST /evaluations endpoint -----------------------------------------------
@@ -433,7 +556,7 @@ def _payload(**over) -> str:
     return json.dumps(body)
 
 
-async def test_endpoint_ingests_enqueues_and_returns_run_id(monkeypatch) -> None:
+async def test_endpoint_ingests_without_enqueue_and_returns_run_id(monkeypatch) -> None:
     captured: dict = {}
 
     async def fake_ingest(platform, files, *, session=None):
@@ -460,11 +583,11 @@ async def test_endpoint_ingests_enqueues_and_returns_run_id(monkeypatch) -> None
             },
         )
 
-    # 202 Accepted with the run id; scoring was enqueued, not run inline.
+    # 202 Accepted with the run id; ingestion is decoupled, so nothing is enqueued yet.
     assert response.status_code == 202
     body = response.json()
-    assert body == {"run_id": "run-123", "status": "en_cola"}
-    assert captured["enqueued"] == "run-123"
+    assert body == {"run_id": "run-123", "status": "ingerido"}
+    assert "enqueued" not in captured
     # Per-file overrides applied; defaults elsewhere.
     assert captured["platform"] == "claude"
     upload = captured["files"][0]
@@ -521,6 +644,112 @@ async def test_endpoint_defaults_scenario_id_to_stem(monkeypatch) -> None:
     upload = captured["files"][0]
     assert upload.scenario_id == "esc1"  # stem of esc1.xlsx
     assert upload.use_case == "default"
+
+
+# --- POST /evaluations/{run_id}/start endpoint --------------------------------
+
+
+async def test_start_endpoint_enqueues_and_returns_queued(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_start(run_id, **kw):
+        return "en_cola"
+
+    monkeypatch.setattr(evaluation, "start_run", fake_start)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/evaluations/run-123/start")
+
+    # 202 Accepted; the run flips to en_cola and the pipeline is enqueued now.
+    assert response.status_code == 202
+    assert response.json() == {"run_id": "run-123", "status": "en_cola"}
+    assert captured["enqueued"] == "run-123"
+
+
+async def test_start_endpoint_unknown_run_404(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_start(run_id, **kw):
+        return None
+
+    monkeypatch.setattr(evaluation, "start_run", fake_start)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/evaluations/does-not-exist/start")
+
+    assert response.status_code == 404
+    assert "enqueued" not in captured  # nothing enqueued for an unknown run
+
+
+async def test_start_endpoint_already_started_409(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_start(run_id, **kw):
+        raise ValueError("El run ya fue iniciado.")
+
+    monkeypatch.setattr(evaluation, "start_run", fake_start)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/evaluations/run-123/start")
+
+    assert response.status_code == 409
+    assert "enqueued" not in captured  # a re-start never enqueues a second job
+
+
+# --- PATCH /evaluations/{run_id}/turns/selection endpoint ---------------------
+
+
+async def test_selection_endpoint_returns_updated_count(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_select(run_id, turn_ids, is_selected, **kw):
+        captured.update(run_id=run_id, turn_ids=turn_ids, is_selected=is_selected)
+        return len(turn_ids)
+
+    monkeypatch.setattr(evaluation, "set_turn_selection", fake_select)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/evaluations/run-123/turns/selection",
+            json={"turn_ids": ["a", "b"], "is_selected": True},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"run_id": "run-123", "updated": 2}
+    assert captured == {"run_id": "run-123", "turn_ids": ["a", "b"], "is_selected": True}
+
+
+async def test_selection_endpoint_unknown_run_404(monkeypatch) -> None:
+    async def fake_select(*a, **kw):
+        return None
+
+    monkeypatch.setattr(evaluation, "set_turn_selection", fake_select)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/evaluations/does-not-exist/turns/selection",
+            json={"turn_ids": ["a"]},
+        )
+
+    assert response.status_code == 404
+
+
+async def test_selection_endpoint_already_started_409(monkeypatch) -> None:
+    async def fake_select(run_id, turn_ids, is_selected, **kw):
+        raise ValueError("El run ya fue iniciado.")
+
+    monkeypatch.setattr(evaluation, "set_turn_selection", fake_select)
+
+    with TestClient(app) as client:
+        response = client.patch(
+            "/evaluations/run-123/turns/selection",
+            json={"turn_ids": ["a"]},
+        )
+
+    assert response.status_code == 409
 
 
 async def test_endpoint_get_returns_summary(monkeypatch) -> None:
@@ -1082,7 +1311,7 @@ async def test_retrieve_invalid_date_raises(session: AsyncSession) -> None:
 # --- POST /captures -----------------------------------------------------------
 
 
-async def test_captures_endpoint_ingests_and_enqueues(monkeypatch) -> None:
+async def test_captures_endpoint_ingests_without_enqueue(monkeypatch) -> None:
     captured: dict = {}
 
     async def fake_ingest(platform, files, *, session=None):
@@ -1113,8 +1342,8 @@ async def test_captures_endpoint_ingests_and_enqueues(monkeypatch) -> None:
         )
 
     assert response.status_code == 202
-    assert response.json() == {"run_id": "run-cap", "status": "en_cola"}
-    assert captured["enqueued"] == "run-cap"
+    assert response.json() == {"run_id": "run-cap", "status": "ingerido"}
+    assert "enqueued" not in captured  # ingestion is decoupled from starting
     assert captured["platform"] == "gemini"
     upload = captured["files"][0]
     assert upload.scenario_id == "esc-navegador"
@@ -1219,7 +1448,7 @@ async def test_captured_messages_reach_turns_without_a_spreadsheet(session: Asyn
     ]
     assert scenario.raw_conversation["messages"][0]["turn"] == 1
     run = await session.get(BenchmarkRun, uuid.UUID(run_id))
-    assert str(run.status) == "en_cola"
+    assert str(run.status) == "ingerido"
 
 
 async def test_captured_citations_reach_turn_context(session: AsyncSession) -> None:
