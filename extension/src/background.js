@@ -101,7 +101,7 @@ async function captureTab(tabId) {
 }
 
 /**
- * Capture the tab and POST it to `/captures`, caching the queued run.
+ * Capture the tab and POST it to `/api/v1/captures`, caching the queued run.
  *
  * The page is re-read here rather than trusting the popup's preview, so what gets
  * scored is the conversation as it stands at send time (the user may have kept
@@ -115,7 +115,7 @@ async function submitCapture(tabId, meta) {
   }
 
   const settings = await getSettings();
-  const response = await fetch(`${settings.apiUrl}/captures`, {
+  const response = await fetch(`${settings.apiUrl}/api/v1/captures`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
@@ -168,7 +168,7 @@ async function pollRun(run) {
   // The API URL may have changed since submission; poll where the run was sent.
   const apiUrl = run.apiUrl ?? (await getSettings()).apiUrl;
   try {
-    const response = await fetch(`${apiUrl}/evaluations/${run.runId}`);
+    const response = await fetch(`${apiUrl}/api/v1/evaluations/${run.runId}`);
     if (!response.ok) throw new Error(await errorDetail(response));
     const summary = await response.json();
     const updated = {

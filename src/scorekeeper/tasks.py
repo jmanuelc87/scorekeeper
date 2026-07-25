@@ -1,9 +1,9 @@
 """Celery tasks and the enqueue seam the API calls.
 
 The pipeline orchestrator ``run_pipeline_task`` loads a persisted (already-ingested) run by id
-and runs the two phases in order — **retrieval** (``evaluation.retrieve_run``: fetch/extract
-each turn's source context into ``retrieved_documents``) then **evaluation**
-(``evaluation.score_run``: LLM-as-a-judge scoring). Each phase owns its own database session;
+and runs the two phases in order — **retrieval** (``services.retrieval.retrieve_run``:
+fetch/extract each turn's source context into ``retrieved_documents``) then **evaluation**
+(``services.scoring.score_run``: LLM-as-a-judge scoring). Each phase owns its own database session;
 the payload is just the ``run_id`` string — everything else is read from Postgres.
 ``score_run_task`` is kept for scoring a run on its own.
 
@@ -18,9 +18,9 @@ import logging
 
 from celery.signals import worker_process_init
 
-from scorekeeper import evaluation
+from scorekeeper.core.services import retrieval, scoring
 from scorekeeper.celery_app import celery_app
-from scorekeeper.database import engine
+from scorekeeper.db.connection import engine
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +47,8 @@ async def _run_phases(run_id: str, *, retrieve: bool) -> None:
     """
     try:
         if retrieve:
-            await evaluation.retrieve_run(run_id)  # phase 1: retrieval
-        await evaluation.score_run(run_id)  # phase 2: evaluation
+            await retrieval.retrieve_run(run_id)  # phase 1: retrieval
+        await scoring.score_run(run_id)  # phase 2: evaluation
     finally:
         await engine.dispose()
 

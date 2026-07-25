@@ -19,8 +19,8 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
-from scorekeeper.database import Base
-from scorekeeper.runner import EvalRunner
+from scorekeeper.db.models import Base
+from scorekeeper.core.runner import EvalRunner
 
 
 @pytest.fixture
@@ -57,7 +57,7 @@ def _isolate_session_local(monkeypatch, session_factory) -> None:
     time, so this single patch covers every consumer — and guarantees no test can reach
     the real DATABASE_URL by taking a code path that opens its own session.
     """
-    monkeypatch.setattr("scorekeeper.database.SessionLocal", session_factory)
+    monkeypatch.setattr("scorekeeper.db.connection.SessionLocal", session_factory)
 
 
 @pytest.fixture
@@ -80,7 +80,7 @@ _REAL_PACE_BETWEEN_TURNS = EvalRunner._pace_between_turns
 def _no_turn_delay(monkeypatch) -> None:
     """Skip the between-turns pacing so scoring tests stay fast and deterministic.
 
-    Patches the method rather than ``asyncio.sleep`` — ``scorekeeper.runner.asyncio`` is
+    Patches the method rather than ``asyncio.sleep`` — ``scorekeeper.core.runner.asyncio`` is
     the global asyncio module, so patching ``.sleep`` on it would also patch it for
     pytest-asyncio's own machinery.
     """

@@ -1,6 +1,6 @@
 # HTTP APIs
 
-The HTTP API (`scorekeeper.api`, run with `scorekeeper-api`) serves the results
+The HTTP API (`scorekeeper.main` / `scorekeeper.api.v1`, run with `scorekeeper-api`) serves the results
 dashboard, triggers evaluations, and manages the retrieval credential store. This page
 documents every endpoint; add new ones as their own `##` section below. For the models these
 endpoints read and write, see the [Data model](data-model.md); for how metrics are chosen and
@@ -10,40 +10,40 @@ scored, see [Evaluation metrics](evaluation-metrics.md); for the credential stor
 | Method & path                | Purpose |
 |------------------------------|---------|
 | `GET /health`                | Liveness probe. |
-| `POST /evaluations`          | Ingest conversation `.xlsx` files for scoring (per-file platform, defaulting to the payload platform). Persists at `ingerido`; does **not** start scoring. |
-| `POST /captures`             | Ingest conversations captured from a chat UI as JSON for scoring (the browser extension's entry point). Persists at `ingerido`; does **not** start scoring. |
-| `PATCH /evaluations/{run_id}/turns/selection` | Select (or deselect) which of an ingested run's turns are scored — scoring is **opt-in per turn**. Must be called before `/start`. |
-| `POST /evaluations/{run_id}/start` | Start scoring an ingested run: flip it from `ingerido` to `en_cola` and **enqueue** the pipeline. |
-| `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
-| `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity. |
-| `GET /scenarios/{scenario_id}/turns` | Retrieve one scenario's turns — conversation content plus per-metric scores. |
-| `GET /auth-providers`        | List the retrieval credential store's provider rows (optional filters). |
-| `POST /auth-providers`       | Create a credential provider row (write-only `private_key`, stored encrypted). |
-| `GET /auth-providers/{id}`   | Fetch one credential provider by UUID. |
-| `PATCH /auth-providers/{id}` | Partially update a credential provider (rotate/clear its key). |
-| `DELETE /auth-providers/{id}`| Delete a credential provider row. |
-| `GET /turns/{turn_id}/traces` | Retrieve the structured metric traces for a single turn. |
-| `GET /turns/{turn_id}/token-usage` | Retrieve one turn's raw LLM token usage (no aggregation). |
+| `POST /api/v1/evaluations`          | Ingest conversation `.xlsx` files for scoring (per-file platform, defaulting to the payload platform). Persists at `ingerido`; does **not** start scoring. |
+| `POST /api/v1/captures`             | Ingest conversations captured from a chat UI as JSON for scoring (the browser extension's entry point). Persists at `ingerido`; does **not** start scoring. |
+| `PATCH /api/v1/evaluations/{run_id}/turns/selection` | Select (or deselect) which of an ingested run's turns are scored — scoring is **opt-in per turn**. Must be called before `/api/v1/evaluations/{run_id}/start`. |
+| `POST /api/v1/evaluations/{run_id}/start` | Start scoring an ingested run: flip it from `ingerido` to `en_cola` and **enqueue** the pipeline. |
+| `GET /api/v1/evaluations/{run_id}`  | Poll a run's status and summary. |
+| `GET /api/v1/runs`                  | Retrieve full scored run details, filtered and at a chosen granularity. |
+| `GET /api/v1/scenarios/{scenario_id}/turns` | Retrieve one scenario's turns — conversation content plus per-metric scores. |
+| `GET /api/v1/auth-providers`        | List the retrieval credential store's provider rows (optional filters). |
+| `POST /api/v1/auth-providers`       | Create a credential provider row (write-only `private_key`, stored encrypted). |
+| `GET /api/v1/auth-providers/{id}`   | Fetch one credential provider by UUID. |
+| `PATCH /api/v1/auth-providers/{id}` | Partially update a credential provider (rotate/clear its key). |
+| `DELETE /api/v1/auth-providers/{id}`| Delete a credential provider row. |
+| `GET /api/v1/turns/{turn_id}/traces` | Retrieve the structured metric traces for a single turn. |
+| `GET /api/v1/turns/{turn_id}/token-usage` | Retrieve one turn's raw LLM token usage (no aggregation). |
 
 ## Architecture: ingestion is decoupled from scoring; the worker retrieves + scores
 
 Retrieval (fetching/extracting each turn's source documents) and scoring (the LLM judge, once
 per metric per turn) are both slow, so they run **off the request path**. Ingestion is also
-**decoupled from the start of scoring**: `POST /evaluations` (and `POST /captures`) parses the
+**decoupled from the start of scoring**: `POST /api/v1/evaluations` (and `POST /api/v1/captures`) parses the
 upload and persists the run tree synchronously at status `ingerido`, then returns `202` — it
 does **not** enqueue anything. Scoring is also **opt-in per turn**: an ingested turn's
 `Turn.is_selected` defaults to `false`, and both worker phases (retrieval and scoring) skip
 any turn that is not selected — so a run scored without selecting turns scores nothing. A
-client picks the subset with `PATCH /evaluations/{run_id}/turns/selection` before starting.
+client picks the subset with `PATCH /api/v1/evaluations/{run_id}/turns/selection` before starting.
 (An unselected turn is still fed to later selected turns' judge **history**, so the
 conversation the judge sees stays complete; it just isn't scored itself.) Scoring starts only
-when a client calls `POST /evaluations/{run_id}/start`, which flips the run to `en_cola` and
+when a client calls `POST /api/v1/evaluations/{run_id}/start`, which flips the run to `en_cola` and
 enqueues one Celery job. A separate **worker** process
 (`celery -A scorekeeper.celery_app:celery_app worker`)
 consumes the queue and runs the pipeline orchestrator `run_pipeline_task`: **retrieval first,
-then scoring** (`evaluation.retrieve_run` → `evaluation.score_run`). The broker is the app's own
+then scoring** (`services.retrieval.retrieve_run` → `services.scoring.score_run`). The broker is the app's own
 Postgres (kombu's SQLAlchemy transport — no extra service); there is no Celery result backend,
-so clients track progress by polling `GET /evaluations/{run_id}`, which reads
+so clients track progress by polling `GET /api/v1/evaluations/{run_id}`, which reads
 `BenchmarkRun.status`.
 
 Run status lifecycle: `ingerido` (persisted, not started) → `en_cola` (queued, after
@@ -55,15 +55,15 @@ Run status lifecycle: `ingerido` (persisted, not started) → `en_cola` (queued,
 
 Liveness probe. Returns `200` with `{"status": "ok"}`. Takes no parameters.
 
-## `POST /evaluations`
+## `POST /api/v1/evaluations`
 
 Ingest uploaded conversation `.xlsx` files and persist them for scoring. Each file
 is scored under its own platform (a per-file override, defaulting to the payload
 platform). Parsing and persistence happen synchronously (so a malformed sheet is
 rejected here). Ingestion is **decoupled** from scoring: this endpoint does not start
 anything — the run lands at status `ingerido` and stays there until
-`POST /evaluations/{run_id}/start` enqueues it. This is the glue between the parser
-(`scorekeeper.importer`) and the scoring runner (`scorekeeper.runner`).
+`POST /api/v1/evaluations/{run_id}/start` enqueues it. This is the glue between the parser
+(`scorekeeper.core.importer`) and the scoring runner (`scorekeeper.core.runner`).
 
 - **Content type:** `multipart/form-data`
 - **Parts:**
@@ -71,7 +71,7 @@ anything — the run lands at status `ingerido` and stays there until
     conversation). The sheet uses the columns the importer understands (`role` and
     `content` required; `turn`, `retrieved_context`, `expected_output` optional,
     English or Spanish headers). See [Evaluation metrics](evaluation-metrics.md) and
-    `scorekeeper.importer`.
+    `scorekeeper.core.importer`.
   - `payload` — a JSON string with the run metadata (below).
 
 ### `payload` fields
@@ -126,10 +126,10 @@ On the request (`ingest_evaluation`):
 3. Build and commit the `BenchmarkRun → PlatformExecution → ScenarioResult → Turn`
    tree — one `PlatformExecution` per distinct platform — with status `ingerido`. Every
    `Turn` lands with `is_selected = false`. Nothing is enqueued; the run waits for a client
-   to select turns (`PATCH /evaluations/{run_id}/turns/selection`) and call
-   `POST /evaluations/{run_id}/start`.
+   to select turns (`PATCH /api/v1/evaluations/{run_id}/turns/selection`) and call
+   `POST /api/v1/evaluations/{run_id}/start`.
 
-After `POST /evaluations/{run_id}/start` flips the run to `en_cola` and enqueues the
+After `POST /api/v1/evaluations/{run_id}/start` flips the run to `en_cola` and enqueues the
 pipeline job (carrying just the `run_id`), the worker (`run_pipeline_task`, off the
 request path) processes **only the selected turns**:
 
@@ -146,10 +146,10 @@ request path) processes **only the selected turns**:
 6. Roll the run status up to `completado` / `parcial` / `fallido` and commit.
 
 > **Prerequisites.** The database schema must already exist (`alembic upgrade head`)
-> and the configured judge must have a valid API key (see `scorekeeper.config`). The
+> and the configured judge must have a valid API key (see `scorekeeper.config.settings`). The
 > worker must be running to make progress past `en_cola`, a client must select the turns
-> to score (`PATCH /evaluations/{run_id}/turns/selection`) — nothing is scored otherwise —
-> and call `POST /evaluations/{run_id}/start` to move a run past `ingerido`.
+> to score (`PATCH /api/v1/evaluations/{run_id}/turns/selection`) — nothing is scored otherwise —
+> and call `POST /api/v1/evaluations/{run_id}/start` to move a run past `ingerido`.
 
 ### Response `202`
 
@@ -159,8 +159,8 @@ request path) processes **only the selected turns**:
 {"run_id": "b1f2…", "status": "ingerido"}
 ```
 
-Call `POST /evaluations/{run_id}/start` to begin scoring, then poll
-`GET /evaluations/{run_id}` for progress and results (both below).
+Call `POST /api/v1/evaluations/{run_id}/start` to begin scoring, then poll
+`GET /api/v1/evaluations/{run_id}` for progress and results (both below).
 
 ### Errors
 
@@ -169,17 +169,17 @@ Call `POST /evaluations/{run_id}/start` to begin scoring, then poll
 | `422`  | `payload` is not valid JSON or fails schema validation (e.g. empty `platform`). |
 | `400`  | An uploaded file is not `.xlsx`, is empty, has no `role`/`content` columns, or no file/platform was provided. Ingest rolls back — nothing is persisted. |
 
-## `POST /captures`
+## `POST /api/v1/captures`
 
 Ingest conversations **captured from a chat UI** and persist them for scoring. The
-JSON twin of `POST /evaluations` for clients that already hold the turns and have no
+JSON twin of `POST /api/v1/evaluations` for clients that already hold the turns and have no
 spreadsheet to upload — the [browser extension](../extension/README.md) scrapes them
-straight off Copilot, Gemini and Claude. Like `POST /evaluations`, ingestion is
+straight off Copilot, Gemini and Claude. Like `POST /api/v1/evaluations`, ingestion is
 decoupled from scoring: the run lands at `ingerido` and starts only via
-`POST /evaluations/{run_id}/start`.
+`POST /api/v1/evaluations/{run_id}/start`.
 
 Both endpoints converge immediately: the messages are normalized by
-`scorekeeper.importer.normalize_messages` (the same role aliasing and turn numbering
+`scorekeeper.core.importer.normalize_messages` (the same role aliasing and turn numbering
 the `.xlsx` parser uses) and persisted by the same `ingest_evaluation`, so a captured
 conversation is indistinguishable downstream from an uploaded one.
 
@@ -216,8 +216,8 @@ serialized capture itself.
 
 ### Response `202`
 
-Identical to `POST /evaluations` — the run is persisted at `ingerido`. Call
-`POST /evaluations/{run_id}/start` to begin scoring, then poll `GET /evaluations/{run_id}`.
+Identical to `POST /api/v1/evaluations` — the run is persisted at `ingerido`. Call
+`POST /api/v1/evaluations/{run_id}/start` to begin scoring, then poll `GET /api/v1/evaluations/{run_id}`.
 
 ```json
 {"run_id": "b1f2…", "status": "ingerido"}
@@ -230,17 +230,17 @@ Identical to `POST /evaluations` — the run is persisted at `ingerido`. Call
 | `422`  | The body fails schema validation (empty `platform`, empty `conversations`, a conversation with no `messages`). |
 | `400`  | A conversation's messages are all blank, or ingest rejected the run. Nothing is persisted. |
 
-## `PATCH /evaluations/{run_id}/turns/selection`
+## `PATCH /api/v1/evaluations/{run_id}/turns/selection`
 
 Select (or deselect) which of an ingested run's turns are scored. Scoring is **opt-in per
 turn**: a freshly ingested turn is not selected (`Turn.is_selected = false`), and the worker
 skips unselected turns in **both** retrieval and scoring — so a run started without selecting
 any turn scores nothing. Call this to pick the subset to evaluate **before**
-`POST /evaluations/{run_id}/start`.
+`POST /api/v1/evaluations/{run_id}/start`.
 
-The `run_id` is the one returned by `POST /evaluations` or `POST /captures`; the turn ids are
-the `turn_id`s discoverable from [`GET /scenarios/{scenario_id}/turns`](#get-scenariosscenario_idturns)
-(or `GET /runs?granularity=metric_scores`). The call is bulk and idempotent: it flags every
+The `run_id` is the one returned by `POST /api/v1/evaluations` or `POST /api/v1/captures`; the turn ids are
+the `turn_id`s discoverable from [`GET /api/v1/scenarios/{scenario_id}/turns`](#get-apiv1scenariosscenario_idturns)
+(or `GET /api/v1/runs?granularity=metric_scores`). The call is bulk and idempotent: it flags every
 listed turn that belongs to the run to `is_selected`, ignoring ids that don't belong to the
 run (or aren't valid UUIDs), and reports how many turns it actually changed. Selecting is
 allowed **only while the run is still `ingerido`** — once it has been started, the selection
@@ -268,16 +268,16 @@ is frozen.
 | `404`  | No run with that `run_id` exists (unknown or malformed id). |
 | `409`  | The run is no longer in the `ingerido` state (already started/queued/scored); the selection is frozen once scoring begins. |
 
-## `POST /evaluations/{run_id}/start`
+## `POST /api/v1/evaluations/{run_id}/start`
 
 Start scoring a previously-ingested run — the explicit trigger decoupled from
 ingestion. Flips the run from `ingerido` to `en_cola` and enqueues the Celery pipeline
 (retrieval + LLM scoring). This is the only way a run moves past `ingerido`. Only the
-turns selected via `PATCH /evaluations/{run_id}/turns/selection` are retrieved and scored;
+turns selected via `PATCH /api/v1/evaluations/{run_id}/turns/selection` are retrieved and scored;
 if none were selected, the run completes without producing any scores.
 
 - **Content type:** none (no body); the `run_id` is the one returned by
-  `POST /evaluations` or `POST /captures`.
+  `POST /api/v1/evaluations` or `POST /api/v1/captures`.
 
 ### Response `202`
 
@@ -285,7 +285,7 @@ if none were selected, the run completes without producing any scores.
 {"run_id": "b1f2…", "status": "en_cola"}
 ```
 
-Poll `GET /evaluations/{run_id}` for progress and results.
+Poll `GET /api/v1/evaluations/{run_id}` for progress and results.
 
 ### Errors
 
@@ -294,12 +294,12 @@ Poll `GET /evaluations/{run_id}` for progress and results.
 | `404`  | No run with that `run_id` exists (unknown or malformed id). |
 | `409`  | The run is not in the `ingerido` state (already started/queued/scored). A run is never enqueued twice. |
 
-## `GET /evaluations/{run_id}`
+## `GET /api/v1/evaluations/{run_id}`
 
 Poll a run's current status and summary. Read the `status` to know where the run
 is in its lifecycle (`ingerido → en_cola → en_recuperacion → en_proceso →
 completado|parcial|fallido`). A freshly ingested run stays at `ingerido` until
-`POST /evaluations/{run_id}/start` is called.
+`POST /api/v1/evaluations/{run_id}/start` is called.
 
 ### Response `200`
 
@@ -335,10 +335,10 @@ completado|parcial|fallido`). A freshly ingested run stays at `ingerido` until
 |--------|------|
 | `404`  | No run with that `run_id` exists. |
 
-## `GET /runs`
+## `GET /api/v1/runs`
 
 Retrieve full scored details for the runs matching a set of filters, as a **list**.
-Unlike `GET /evaluations/{run_id}` (a single run's shallow poll summary), `/runs`
+Unlike `GET /api/v1/evaluations/{run_id}` (a single run's shallow poll summary), `/api/v1/runs`
 returns the deep, granularity-configurable shape.
 
 ### Query parameters
@@ -363,7 +363,7 @@ rollups; `scenario_results` → adds each scenario (its `id`, `scenario_id`, `us
 is persisted on the `metric_traces` table but is not surfaced by this endpoint.
 
 Each scenario carries both an `id` (its `ScenarioResult` UUID — the unique handle
-[`GET /scenarios/{scenario_id}/turns`](#get-scenariosscenario_idturns) takes) and the
+[`GET /api/v1/scenarios/{scenario_id}/turns`](#get-apiv1scenariosscenario_idturns) takes) and the
 human-readable, **non-unique** `scenario_id` label (e.g. the file stem).
 
 ### Response `200`
@@ -396,17 +396,17 @@ human-readable, **non-unique** `scenario_id` label (e.g. the file stem).
 |--------|------|
 | `400`  | `granularity` is not one of the three accepted values, or `start_date`/`end_date` is not a valid ISO-8601 date. No-match filters are **not** errors — they return `[]`. |
 
-## `GET /scenarios/{scenario_id}/turns`
+## `GET /api/v1/scenarios/{scenario_id}/turns`
 
 Retrieve a single scenario's turns, in `turn_number` order — the conversation
 **content** (`prompt` / `response` / `expected_output` / `retrieved_context_source`)
-alongside each turn's rolled-up `turn_score` and per-metric scores. `GET /runs`
+alongside each turn's rolled-up `turn_score` and per-metric scores. `GET /api/v1/runs`
 (even at `metric_scores` granularity) omits the turn content; this endpoint surfaces it,
 so a caller can read what was actually scored without re-uploading the source.
 
 The `{scenario_id}` is a **`ScenarioResult` UUID** — the unique handle for one
 conversation scored under one platform in one run — discoverable as the `id` on each
-scenario in `GET /runs?granularity=scenario_results`. The human-readable, non-unique
+scenario in `GET /api/v1/runs?granularity=scenario_results`. The human-readable, non-unique
 `ScenarioResult.scenario_id` label is **not** accepted here (it can match many
 scenarios). Takes no query parameters.
 
@@ -430,7 +430,7 @@ Returns one entry per turn (a scenario with no turns yields `[]`):
 ```
 
 Like the other read paths, the per-metric structured `trace` is not surfaced here —
-read it via [`GET /turns/{turn_id}/traces`](#get-turnsturn_idtraces) using each entry's
+read it via [`GET /api/v1/turns/{turn_id}/traces`](#get-apiv1turnsturn_idtraces) using each entry's
 `turn_id`.
 
 ### Errors
@@ -452,11 +452,11 @@ enabled row per gated `host` configures how that host is authenticated.
 
 | Method & path | Purpose | Success |
 |---|---|---|
-| `GET /auth-providers` | List providers; optional `provider`, `host`, `enabled` query filters (AND-combined). | `200` — array of provider views |
-| `POST /auth-providers` | Create a provider row. | `201` — the created view |
-| `GET /auth-providers/{id}` | Fetch one provider by UUID. | `200` |
-| `PATCH /auth-providers/{id}` | Partial update; only the supplied fields change. Sending `private_key` rotates the stored key (a `null`/empty value clears it); omitting it leaves the key untouched. | `200` — the updated view |
-| `DELETE /auth-providers/{id}` | Delete a provider row. | `204` — no content |
+| `GET /api/v1/auth-providers` | List providers; optional `provider`, `host`, `enabled` query filters (AND-combined). | `200` — array of provider views |
+| `POST /api/v1/auth-providers` | Create a provider row. | `201` — the created view |
+| `GET /api/v1/auth-providers/{id}` | Fetch one provider by UUID. | `200` |
+| `PATCH /api/v1/auth-providers/{id}` | Partial update; only the supplied fields change. Sending `private_key` rotates the stored key (a `null`/empty value clears it); omitting it leaves the key untouched. | `200` — the updated view |
+| `DELETE /api/v1/auth-providers/{id}` | Delete a provider row. | `204` — no content |
 
 **Body (create / update).** `provider` (kind, e.g. `"sharepoint"` or `"oauth2"`) and `host`
 are required on create; `enabled` (default `true`), `tenant_id`, `client_id`, `thumbprint`,
@@ -476,11 +476,11 @@ for `sharepoint`, an OAuth2 client secret for `oauth2` — and kind-specific non
 | `409`  | Create / update would duplicate an existing `(provider, host)` pair. |
 | `422`  | Unknown `provider` kind; a `private_key` supplied while `AUTH_ENCRYPTION_KEY` is unset; an empty `PATCH` body; a malformed UUID or missing required field. |
 
-## `GET /turns/{turn_id}/traces`
+## `GET /api/v1/turns/{turn_id}/traces`
 
 Retrieve the structured metric traces for a single turn — the full per-metric
 reasoning that the run/scenario read paths omit. The `turn_id` is the turn's UUID,
-discoverable from `GET /runs?granularity=metric_scores` (each turn carries a
+discoverable from `GET /api/v1/runs?granularity=metric_scores` (each turn carries a
 `turn_id`).
 
 | Query param  | Type      | Default | Notes |
@@ -516,13 +516,13 @@ Returns one entry per metric scored on the turn (a turn with no scores yields `[
 |--------|------|
 | `404`  | The `turn_id` is unknown or not a valid UUID. |
 
-## `GET /turns/{turn_id}/token-usage`
+## `GET /api/v1/turns/{turn_id}/token-usage`
 
 Retrieve the LLM token usage for scoring a **single turn** — the turn's 1:1
 [`TurnTokenUsage`](data-model.md) entity, read raw with **no aggregation** across turns,
 scenarios, or platforms. Summed across every judge call every metric made while scoring the
 turn, with provider counts normalized to input/output. The `turn_id` is the turn's UUID,
-discoverable from `GET /runs?granularity=metric_scores` (each turn carries a `turn_id`). Takes
+discoverable from `GET /api/v1/runs?granularity=metric_scores` (each turn carries a `turn_id`). Takes
 no query parameters.
 
 `total_tokens` is **derived** (`input_tokens + output_tokens`) and never stored. A turn that
@@ -551,7 +551,7 @@ only an unknown or malformed `turn_id` is a `404`.
 Ingest (defaults, single file) → returns a `run_id` at status `ingerido`:
 
 ```bash
-curl -X POST http://localhost:8001/evaluations \
+curl -X POST http://localhost:8001/api/v1/evaluations \
   -F 'files=@esc1.xlsx' \
   -F 'payload={"platform":"claude","use_case":"default"}'
 # {"run_id":"b1f2…","status":"ingerido"}
@@ -560,7 +560,7 @@ curl -X POST http://localhost:8001/evaluations \
 Select which turns to score (opt-in; do this before starting) → returns how many were flagged:
 
 ```bash
-curl -X PATCH http://localhost:8001/evaluations/b1f2…/turns/selection \
+curl -X PATCH http://localhost:8001/api/v1/evaluations/b1f2…/turns/selection \
   -H 'Content-Type: application/json' \
   -d '{"turn_ids": ["7c9e…", "8d0f…"], "is_selected": true}'
 # {"run_id":"b1f2…","updated":2}
@@ -570,20 +570,20 @@ Start scoring (decoupled from ingestion) → run moves to `en_cola`. Only the se
 are scored:
 
 ```bash
-curl -X POST http://localhost:8001/evaluations/b1f2…/start
+curl -X POST http://localhost:8001/api/v1/evaluations/b1f2…/start
 # {"run_id":"b1f2…","status":"en_cola"}
 ```
 
 Poll until terminal:
 
 ```bash
-curl http://localhost:8001/evaluations/b1f2…
+curl http://localhost:8001/api/v1/evaluations/b1f2…
 ```
 
 Ingest a conversation captured from a chat UI (what the browser extension sends):
 
 ```bash
-curl -X POST http://localhost:8001/captures \
+curl -X POST http://localhost:8001/api/v1/captures \
   -H 'Content-Type: application/json' \
   -d '{
         "platform": "claude",
@@ -597,39 +597,39 @@ curl -X POST http://localhost:8001/captures \
           ]
         }]
       }'
-# {"run_id":"b1f2…","status":"ingerido"} — then POST /evaluations/{run_id}/start to score
+# {"run_id":"b1f2…","status":"ingerido"} — then POST /api/v1/evaluations/{run_id}/start to score
 ```
 
 Retrieve full details for all `claude` runs scored in July, down to metric scores:
 
 ```bash
-curl 'http://localhost:8001/runs?platform=claude&start_date=2026-07-01&end_date=2026-07-31&granularity=metric_scores'
+curl 'http://localhost:8001/api/v1/runs?platform=claude&start_date=2026-07-01&end_date=2026-07-31&granularity=metric_scores'
 ```
 
-Read a scenario's turns (its `id` comes from `/runs?granularity=scenario_results`):
+Read a scenario's turns (its `id` comes from `/api/v1/runs?granularity=scenario_results`):
 
 ```bash
-curl 'http://localhost:8001/scenarios/3f0a…/turns'
+curl 'http://localhost:8001/api/v1/scenarios/3f0a…/turns'
 ```
 
 Retrieve one turn's metric traces (full, then minimal):
 
 ```bash
-curl 'http://localhost:8001/turns/7c9e…/traces'
-curl 'http://localhost:8001/turns/7c9e…/traces?provenance=false'
+curl 'http://localhost:8001/api/v1/turns/7c9e…/traces'
+curl 'http://localhost:8001/api/v1/turns/7c9e…/traces?provenance=false'
 ```
 
 Read one turn's token usage:
 
 ```bash
-curl 'http://localhost:8001/turns/7c9e…/token-usage'
+curl 'http://localhost:8001/api/v1/turns/7c9e…/token-usage'
 ```
 
 Multiple files with per-file overrides — `esc1` keeps the payload `claude` default;
 `esc2` is scored under `gemini` (producing two platform executions in the one run):
 
 ```bash
-curl -X POST http://localhost:8001/evaluations \
+curl -X POST http://localhost:8001/api/v1/evaluations \
   -F 'files=@esc1.xlsx' \
   -F 'files=@esc2.xlsx' \
   -F 'payload={
@@ -645,7 +645,7 @@ curl -X POST http://localhost:8001/evaluations \
 Configure a SharePoint credential provider, then list it (note the key is not echoed back):
 
 ```bash
-curl -X POST http://localhost:8001/auth-providers \
+curl -X POST http://localhost:8001/api/v1/auth-providers \
   -H 'Content-Type: application/json' \
   -d '{
         "provider": "sharepoint",
@@ -658,7 +658,7 @@ curl -X POST http://localhost:8001/auth-providers \
       }'
 # {"id":"7d3e…","provider":"sharepoint","has_private_key":true, … }  (no private_key field)
 
-curl http://localhost:8001/auth-providers
+curl http://localhost:8001/api/v1/auth-providers
 ```
 
 ## Running the worker
@@ -673,18 +673,22 @@ dedicated broker (e.g. Redis) instead of Postgres.
 
 ## Related code
 
-- Endpoint & request/response models — `src/scorekeeper/api.py`
-- Ingest / retrieve / score split + polling — `src/scorekeeper/evaluation.py`
-  (`ingest_evaluation`, `set_turn_selection`, `retrieve_run`, `score_run`, `get_run_summary`,
-  `run_evaluation`)
-- Read paths — `src/scorekeeper/evaluation.py` (`retrieve_runs`, `retrieve_scenario_turns`,
-  `retrieve_turn_traces`, `retrieve_turn_token_usage`)
-- Retrieval orchestrator — `src/scorekeeper/retrieval/pipeline.py` (`RetrievalOrchestrator`)
-- Auth-provider CRUD service — `src/scorekeeper/retrieval/credentials/service.py`
+- App factory & router mounting — `src/scorekeeper/main.py`, `src/scorekeeper/api/router.py`
+- Endpoints — `src/scorekeeper/api/v1/` (one module per resource);
+  request/response models — `src/scorekeeper/api/v1/schemas.py`
+- Ingest / retrieve / score split + polling — `src/scorekeeper/core/services/`
+  (`ingestion.ingest_evaluation`, `runs.set_turn_selection`, `retrieval.retrieve_run`,
+  `scoring.score_run`, `runs.get_run_summary`, `scoring.run_evaluation`)
+- Read paths — `src/scorekeeper/core/services/read_models.py` (`retrieve_runs`,
+  `retrieve_scenario_turns`, `retrieve_turn_traces`, `retrieve_turn_token_usage`);
+  their projections — `src/scorekeeper/core/services/serializers.py`
+- Queries — `src/scorekeeper/db/repositories/`; models — `src/scorekeeper/db/models.py`
+- Retrieval orchestrator — `src/scorekeeper/core/retrieval/pipeline.py` (`RetrievalOrchestrator`)
+- Auth-provider CRUD service — `src/scorekeeper/core/retrieval/credentials/service.py`
 - Celery app & tasks — `src/scorekeeper/celery_app.py`, `src/scorekeeper/tasks.py`
   (`run_pipeline_task` = retrieval then scoring; `enqueue_run`)
-- Parsing & message normalization — `src/scorekeeper/importer.py`
+- Parsing & message normalization — `src/scorekeeper/core/importer.py`
   (`parse_conversation`, `normalize_messages`)
 - Browser capture client — `extension/` (see its [README](../extension/README.md))
-- Scoring — `src/scorekeeper/runner.py`
-- Metric selection — `src/scorekeeper/metrics/selection.py`
+- Scoring — `src/scorekeeper/core/runner.py`
+- Metric selection — `src/scorekeeper/core/metrics/selection.py`

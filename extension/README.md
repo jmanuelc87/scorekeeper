@@ -64,8 +64,8 @@ flowchart TD
     evals -- sendMessage --> worker
     worker -- executeScript --> capture
     capture -- "{messages, url}" --> worker
-    worker -- "POST {apiUrl}/captures → run_id" --> api
-    worker -- "GET {apiUrl}/evaluations/{id}<br/>(per open run, alarm 30s)" --> api
+    worker -- "POST {apiUrl}/api/v1/captures → run_id" --> api
+    worker -- "GET {apiUrl}/api/v1/evaluations/{id}<br/>(per open run, alarm 30s)" --> api
     worker -- writes run history --> store
     store -- storage.onChanged --> popup
     store -- storage.onChanged --> evals
@@ -95,7 +95,7 @@ and the popup comes up blank until you reload the page.
 The captured turns reach the same database rows as an `.xlsx` upload: the API
 normalizes them through `scorekeeper.importer.normalize_messages` and ingests
 them with `ingest_evaluation`, so one capture is one `ScenarioResult` with its
-`Turn` rows. See [`docs/apis.md`](../docs/apis.md) for `POST /captures`.
+`Turn` rows. See [`docs/apis.md`](../docs/apis.md) for `POST /api/v1/captures`.
 
 ## Run history & the two surfaces
 
@@ -175,7 +175,7 @@ feedback footer, because none of them are inside it.
 | Path | Role |
 |---|---|
 | `manifest.json` | MV3 manifest: permissions, popup, options, worker. |
-| `src/background.js` | Service worker — injection, `POST /captures`, polls every open run, badge. |
+| `src/background.js` | Service worker — injection, `POST /api/v1/captures`, polls every open run, badge. |
 | `src/config.js` | Shared defaults, run-history + `chrome.storage.local` helpers, chat-URL match, permission request. |
 | `src/content/capture.js` | Per-platform adapters; the only DOM-coupled file. |
 | `src/popup/` | Capture form and the open chat's evaluation panel. |

@@ -17,8 +17,8 @@ from __future__ import annotations
 from celery import Celery
 from celery.signals import after_setup_logger, after_setup_task_logger
 
-from scorekeeper.config import get_settings
-from scorekeeper.logging_config import configure_logging
+from scorekeeper.config.settings import get_settings
+from scorekeeper.utils.logging_config import configure_logging
 
 celery_app = Celery(
     "scorekeeper",

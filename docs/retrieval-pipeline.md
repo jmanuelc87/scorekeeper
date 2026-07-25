@@ -8,9 +8,9 @@ references into the stored `RetrievedContext` schema by fetching and extracting 
 referenced text.
 
 > **Status:** the full pipeline is implemented — the **taxonomy**
-> (`scorekeeper.retrieval.types`, `scorekeeper.retrieval.protocols`), every stage (**parse**,
+> (`scorekeeper.core.retrieval.types`, `scorekeeper.core.retrieval.protocols`), every stage (**parse**,
 > **locate**, **authorize**, **fetch**, **extract**, **assemble**), the **credential source**
-> (`scorekeeper.retrieval.credentials`), and the **orchestrator**
+> (`scorekeeper.core.retrieval.credentials`), and the **orchestrator**
 > (`RetrievalOrchestrator`) that a Celery worker runs before scoring (see
 > [Orchestration](#orchestration)). Remaining follow-ons are in [Deferred phases](#deferred-phases).
 
@@ -67,10 +67,10 @@ real cases map onto `AuthStatus`:
 
 `AuthProvider` is a pluggable protocol with two concrete implementations:
 
-- `HostRuleAuthProvider` (`scorekeeper.retrieval.auth`) marks a host `REQUIRED` when it falls
+- `HostRuleAuthProvider` (`scorekeeper.core.retrieval.auth`) marks a host `REQUIRED` when it falls
   under a gated domain (SharePoint by default) and resolves it against an injected credential
   store (host → bearer token). Useful for header/bearer auth; its `client()` is `None`.
-- `StoredAuthProvider` (`scorekeeper.retrieval.credentials`) is the **database-backed**
+- `StoredAuthProvider` (`scorekeeper.core.retrieval.credentials`) is the **database-backed**
   credential source. It reads the `auth_providers` table: a host with an enabled row is
   `REQUIRED` and resolves to `SATISFIED` when that provider holds usable credentials (its
   encrypted secret decrypts under `AUTH_ENCRYPTION_KEY`), else `MISSING_CREDENTIALS`.
@@ -78,7 +78,7 @@ real cases map onto `AuthStatus`:
 ### Credential taxonomy and the generic client
 
 Each `auth_providers` row carries a `provider` *kind* (e.g. `sharepoint`) that selects a
-`CredentialProvider` from the registry (`scorekeeper.retrieval.credentials`, mirroring the
+`CredentialProvider` from the registry (`scorekeeper.core.retrieval.credentials`, mirroring the
 metric catalog). A provider turns the row into a backend-agnostic **`AuthClient`** — the
 generic client the fetch stage retrieves through, so the pipeline never names SharePoint.
 The one concrete provider is **SharePoint** (`credentials/catalog/sharepoint.py`), which
@@ -95,7 +95,7 @@ provider kind — is documented in full in [Retrieval credentials](retrieval-cre
 
 ## Fetch
 
-`CachingDocumentFetcher` (`scorekeeper.retrieval.fetch`) implements the `DocumentFetcher`
+`CachingDocumentFetcher` (`scorekeeper.core.retrieval.fetch`) implements the `DocumentFetcher`
 stage: `fetch(locator, client) → FetchedDocument`. It consumes the authorize stage's generic
 `AuthClient` — so it never names a backend:
 
@@ -122,7 +122,7 @@ ranked source references feeding `assemble`.
 
 ## Extract
 
-`MarkdownContentExtractor` (`scorekeeper.retrieval.extract`) implements the `ContentExtractor`
+`MarkdownContentExtractor` (`scorekeeper.core.retrieval.extract`) implements the `ContentExtractor`
 stage: `supports(doc_type)` + `extract(document, locator) → ExtractedContent`, whose `text` is
 **markdown**. It also *is* the filter — page selection happens here, not in a separate stage.
 By document type:
@@ -146,7 +146,7 @@ and thus into the LLM-judge prompts, which treat it as structured plain text.
 The assemble stage turns each reference's extract result into the stored
 [`RetrievedContext`](data-model.md#retrieveddocument):
 
-- `ExtractedContent.to_document(source, locator)` (`scorekeeper.retrieval.types`) maps a
+- `ExtractedContent.to_document(source, locator)` (`scorekeeper.core.retrieval.types`) maps a
   reference to a `RetrievedDocument` — `name` from the reference label, `document` from the
   filename (falling back to the label, then the URL), `content` = the extracted markdown, and
   `url` = the original `source.url` (keeping any `#page=N` citation anchor).
@@ -173,7 +173,7 @@ and report how many documents were retrieved vs. blocked (e.g. by missing creden
 
 ## Orchestration
 
-`RetrievalOrchestrator` (`scorekeeper.retrieval.pipeline`) implements `RetrievalPipeline.run`:
+`RetrievalOrchestrator` (`scorekeeper.core.retrieval.pipeline`) implements `RetrievalPipeline.run`:
 it threads one cell parse → locate → authorize → fetch → extract → assemble into a
 `RetrievalReport`, building each `RetrievalOutcome` (via `RetrievalOutcome.assembled` on
 success) and catching each stage's typed error onto the matching `RetrievalStatus`
@@ -190,8 +190,8 @@ retrieves):
 | whole-cell parse failure (e.g. the LLM path) | one `PARSE_ERROR` outcome |
 
 **Run wiring.** The Celery worker runs retrieval *then* scoring for a run via one task,
-`run_pipeline_task(run_id)` (`scorekeeper.tasks`): `evaluation.retrieve_run` then
-`evaluation.score_run`. `retrieve_run` marks the run `en_recuperacion`, and for each turn
+`run_pipeline_task(run_id)` (`scorekeeper.tasks`): `services.retrieval.retrieve_run` then
+`services.scoring.score_run`. `retrieve_run` marks the run `en_recuperacion`, and for each turn
 parses/fetches/extracts its raw `Turn.retrieved_context_source` (captured at ingest) into
 `retrieved_documents` — committing **per scenario**, best-effort, so a hard phase exception
 marks the run `fallido` while per-document failures just shrink the context. Scoring then reads

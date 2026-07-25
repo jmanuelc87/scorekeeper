@@ -3,7 +3,7 @@
 The [retrieval pipeline](retrieval-pipeline.md)'s **authorize** stage needs credentials to
 fetch documents that a host gates behind authentication (SharePoint, an intranet, …). This
 page documents the credential subsystem that supplies them:
-`scorekeeper.retrieval.credentials` — a **database-backed `AuthProvider` taxonomy** whose
+`scorekeeper.core.retrieval.credentials` — a **database-backed `AuthProvider` taxonomy** whose
 settings live in the [`auth_providers`](data-model.md#authproviderconfig) table and whose
 concrete providers authenticate against a backend — SharePoint with a client **certificate**,
 or any OAuth2 resource with a **client-credentials** bearer token.
@@ -16,7 +16,7 @@ component view of this subsystem, see [Architecture § Level 3](architecture.md#
 
 ## The AuthProvider taxonomy
 
-`AuthProvider` (`scorekeeper.retrieval.protocols`) is the authorize-stage contract. It has two
+`AuthProvider` (`scorekeeper.core.retrieval.protocols`) is the authorize-stage contract. It has two
 concrete implementations, injected into the pipeline like every other stage:
 
 | Implementation | Module | Credential source | Carries credentials via |
@@ -144,8 +144,9 @@ lazily; injectable in tests), so no extra install is needed.
 3. Insert an enabled `auth_providers` row. `AuthProviderConfig.from_sharepoint` encrypts the
    PEM on the way in:
    ```python
-   from scorekeeper.database import AuthProviderConfig, SessionLocal
-   from scorekeeper.config import get_settings
+   from scorekeeper.db.connection import SessionLocal
+   from scorekeeper.db.models import AuthProviderConfig
+   from scorekeeper.config.settings import get_settings
 
    with SessionLocal() as db:
        db.add(AuthProviderConfig.from_sharepoint(
@@ -178,7 +179,7 @@ With the row in place, a locator whose host matches resolves to `SATISFIED` and
 `StoredAuthProvider.client(locator)` yields an authenticated `AuthClient`.
 
 Rows can also be managed over HTTP via the
-[auth-providers CRUD endpoints](apis.md#auth-providers-crud) (`scorekeeper.retrieval.credentials.service`).
+[auth-providers CRUD endpoints](apis.md#auth-providers-crud) (`scorekeeper.core.retrieval.credentials.service`).
 The `private_key` is write-only there: accepted on create/update, stored encrypted, and never
 returned (reads expose only `has_private_key`).
 

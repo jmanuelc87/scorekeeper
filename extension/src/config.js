@@ -88,7 +88,7 @@ export async function upsertRun(run) {
   return runs;
 }
 
-/** Drop a trailing slash so `${apiUrl}/captures` never doubles up. */
+/** Drop a trailing slash so `${apiUrl}/api/v1/captures` never doubles up. */
 export function trimSlash(url) {
   return String(url).trim().replace(/\/+$/, "");
 }
