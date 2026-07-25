@@ -6,9 +6,6 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     database_url: str = "sqlite:///./scorekeeper.db"
-    mcp_transport: str = "stdio"
-    mcp_host: str = "0.0.0.0"
-    mcp_port: int = 8000
     api_host: str = "0.0.0.0"
     api_port: int = 8001
     cors_origins: str = "http://localhost:5173,http://localhost:8080"

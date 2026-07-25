@@ -819,14 +819,6 @@ def test_turn_traces_endpoint_unknown_turn_404(monkeypatch) -> None:
     assert response.status_code == 404
 
 
-def test_mcp_retrieve_turn_traces_coalesces_none(monkeypatch) -> None:
-    from scorekeeper import server
-
-    monkeypatch.setattr(evaluation, "retrieve_turn_traces", lambda *a, **k: None)
-    # The MCP tool never 404s: an unknown turn becomes an empty list.
-    assert server.retrieve_turn_traces("nope") == []
-
-
 # --- retrieve_turn_token_usage + /turns/{turn_id}/token-usage -----------------
 
 
@@ -910,14 +902,6 @@ def test_turn_token_usage_endpoint_unknown_turn_404(monkeypatch) -> None:
         response = client.get("/turns/nope/token-usage")
 
     assert response.status_code == 404
-
-
-def test_mcp_retrieve_turn_token_usage_coalesces_none(monkeypatch) -> None:
-    from scorekeeper import server
-
-    monkeypatch.setattr(evaluation, "retrieve_turn_token_usage", lambda *a, **k: None)
-    # The MCP tool never 404s: an unknown turn becomes an empty object.
-    assert server.retrieve_turn_token_usage("nope") == {}
 
 
 # --- retrieve_scenario_turns + /scenarios/{scenario_id}/turns -----------------

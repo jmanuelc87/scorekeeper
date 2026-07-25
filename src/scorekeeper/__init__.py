@@ -1,2 +1,2 @@
-"""Scorekeeper MCP server and results API."""
+"""Scorekeeper results API."""
 

@@ -23,20 +23,9 @@ services:
     env_file: .env
     environment: &backend-environment
       DATABASE_URL: postgresql+psycopg://scorekeeper:scorekeeper@database:5432/scorekeeper
-      MCP_TRANSPORT: http
     depends_on:
       database:
         condition: service_healthy
-
-  mcp:
-    build: .
-    env_file: .env
-    environment: *backend-environment
-    depends_on:
-      migrate:
-        condition: service_completed_successfully
-    ports:
-      - "8000:8000"
 
   api:
     build: .
