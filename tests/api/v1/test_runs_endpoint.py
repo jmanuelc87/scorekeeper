@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from scorekeeper.api import app
+from scorekeeper.main import app
 from scorekeeper.core.services import read_models
 
 
@@ -21,7 +21,7 @@ async def test_runs_endpoint_forwards_filters_and_returns_list(monkeypatch) -> N
 
     with TestClient(app) as client:
         response = client.get(
-            "/runs",
+            "/api/v1/runs",
             params={
                 "run_id": "run-1",
                 "platform": "claude",
@@ -53,7 +53,7 @@ async def test_runs_endpoint_defaults_granularity_and_empty_result(monkeypatch) 
     monkeypatch.setattr(read_models, "retrieve_runs", fake_retrieve)
 
     with TestClient(app) as client:
-        response = client.get("/runs")
+        response = client.get("/api/v1/runs")
 
     assert response.status_code == 200
     assert response.json() == []
@@ -74,6 +74,6 @@ async def test_runs_endpoint_invalid_input_400(monkeypatch) -> None:
     monkeypatch.setattr(read_models, "retrieve_runs", fake_retrieve)
 
     with TestClient(app) as client:
-        response = client.get("/runs", params={"granularity": "nope"})
+        response = client.get("/api/v1/runs", params={"granularity": "nope"})
 
     assert response.status_code == 400

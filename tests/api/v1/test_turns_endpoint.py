@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from scorekeeper.api import app
+from scorekeeper.main import app
 from scorekeeper.core.services import read_models
 
 
@@ -26,7 +26,7 @@ async def test_turn_traces_endpoint_forwards_and_returns(monkeypatch) -> None:
     monkeypatch.setattr(read_models, "retrieve_turn_traces", fake)
 
     with TestClient(app) as client:
-        response = client.get("/turns/abc/traces", params={"provenance": "false"})
+        response = client.get("/api/v1/turns/abc/traces", params={"provenance": "false"})
 
     assert response.status_code == 200
     assert response.json() == payload
@@ -37,7 +37,7 @@ async def test_turn_traces_endpoint_unknown_turn_404(monkeypatch) -> None:
     monkeypatch.setattr(read_models, "retrieve_turn_traces", _async_none)
 
     with TestClient(app) as client:
-        response = client.get("/turns/nope/traces")
+        response = client.get("/api/v1/turns/nope/traces")
 
     assert response.status_code == 404
 
@@ -58,7 +58,7 @@ async def test_turn_token_usage_endpoint_forwards_and_returns(monkeypatch) -> No
     monkeypatch.setattr(read_models, "retrieve_turn_token_usage", fake)
 
     with TestClient(app) as client:
-        response = client.get("/turns/abc/token-usage")
+        response = client.get("/api/v1/turns/abc/token-usage")
 
     assert response.status_code == 200
     assert response.json() == payload
@@ -69,6 +69,6 @@ async def test_turn_token_usage_endpoint_unknown_turn_404(monkeypatch) -> None:
     monkeypatch.setattr(read_models, "retrieve_turn_token_usage", _async_none)
 
     with TestClient(app) as client:
-        response = client.get("/turns/nope/token-usage")
+        response = client.get("/api/v1/turns/nope/token-usage")
 
     assert response.status_code == 404

@@ -60,7 +60,7 @@ retrieval = [
 ]
 
 [project.scripts]
-scorekeeper-api = "scorekeeper.api:main"
+scorekeeper-api = "scorekeeper.main:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/scorekeeper"]

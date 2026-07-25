@@ -7,7 +7,7 @@ import json
 from fastapi.testclient import TestClient
 
 from scorekeeper import tasks
-from scorekeeper.api import app
+from scorekeeper.main import app
 from scorekeeper.core.services import ingestion
 
 
@@ -24,7 +24,7 @@ async def test_captures_endpoint_ingests_without_enqueue(monkeypatch) -> None:
 
     with TestClient(app) as client:
         response = client.post(
-            "/captures",
+            "/api/v1/captures",
             json={
                 "platform": "gemini",
                 "use_case": "web_search",
@@ -68,7 +68,7 @@ async def test_captures_endpoint_per_conversation_overrides(monkeypatch) -> None
 
     with TestClient(app) as client:
         response = client.post(
-            "/captures",
+            "/api/v1/captures",
             json={
                 "platform": "claude",
                 "conversations": [
@@ -93,7 +93,7 @@ async def test_captures_endpoint_per_conversation_overrides(monkeypatch) -> None
 async def test_captures_endpoint_rejects_contentless_conversation() -> None:
     with TestClient(app) as client:
         response = client.post(
-            "/captures",
+            "/api/v1/captures",
             json={
                 "platform": "claude",
                 "conversations": [
@@ -108,6 +108,6 @@ async def test_captures_endpoint_rejects_contentless_conversation() -> None:
 
 async def test_captures_endpoint_requires_conversations() -> None:
     with TestClient(app) as client:
-        response = client.post("/captures", json={"platform": "claude", "conversations": []})
+        response = client.post("/api/v1/captures", json={"platform": "claude", "conversations": []})
 
     assert response.status_code == 422

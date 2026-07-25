@@ -9,15 +9,14 @@ Scorekeeper is a service that benchmarks AI assistant platforms (Copilot, Gemini
 
 Permitted Commits Types:
 
-Tipos Permitidos
-feat: Nueva funcionalidad
-fix: Corrección de bugs
-docs: Cambios en documentación
-style: Cambios de formato (espacios, puntos y comas, etc.)
-refactor: Refactorización de código
-test: Agregar o modificar tests
-chore: Tareas de mantenimiento (dependencias, configuración, etc.)
-perf: Mejoras de performance
+feat: New Features
+fix: Bug Corrections
+docs: Changes in documentation
+style: Changes in style
+refactor: Code refactor
+test: Add or modify tests
+chore: Maintenance tasks
+perf: Performance Tasks
 
 ### 1. Think Before Coding
 

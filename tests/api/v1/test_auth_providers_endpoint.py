@@ -18,7 +18,7 @@ import httpx
 import pytest
 from httpx import ASGITransport
 
-from scorekeeper.api import app
+from scorekeeper.main import app
 from scorekeeper.core.retrieval.credentials import service
 
 
@@ -47,7 +47,7 @@ def _body(**overrides: object) -> dict[str, object]:
 
 
 async def test_create_returns_201_without_secret(client: httpx.AsyncClient) -> None:
-    resp = await client.post("/auth-providers", json=_body())
+    resp = await client.post("/api/v1/auth-providers", json=_body())
     assert resp.status_code == 201
     data = resp.json()
     assert data["provider"] == "sharepoint"
@@ -58,67 +58,67 @@ async def test_create_returns_201_without_secret(client: httpx.AsyncClient) -> N
 
 
 async def test_full_lifecycle(client: httpx.AsyncClient) -> None:
-    created = (await client.post("/auth-providers", json=_body())).json()
+    created = (await client.post("/api/v1/auth-providers", json=_body())).json()
     provider_id = created["id"]
 
     # read
-    got = await client.get(f"/auth-providers/{provider_id}")
+    got = await client.get(f"/api/v1/auth-providers/{provider_id}")
     assert got.status_code == 200
     assert got.json()["host"] == "cognitactix-my.sharepoint.com"
 
     # list
-    listed = await client.get("/auth-providers")
+    listed = await client.get("/api/v1/auth-providers")
     assert listed.status_code == 200
     assert len(listed.json()) == 1
 
     # update (partial)
-    patched = await client.patch(f"/auth-providers/{provider_id}", json={"enabled": False})
+    patched = await client.patch(f"/api/v1/auth-providers/{provider_id}", json={"enabled": False})
     assert patched.status_code == 200
     assert patched.json()["enabled"] is False
     assert patched.json()["tenant_id"] == "t"  # untouched
 
     # delete
-    assert (await client.delete(f"/auth-providers/{provider_id}")).status_code == 204
-    assert (await client.get(f"/auth-providers/{provider_id}")).status_code == 404
+    assert (await client.delete(f"/api/v1/auth-providers/{provider_id}")).status_code == 204
+    assert (await client.get(f"/api/v1/auth-providers/{provider_id}")).status_code == 404
 
 
 async def test_duplicate_conflicts_409(client: httpx.AsyncClient) -> None:
-    assert (await client.post("/auth-providers", json=_body())).status_code == 201
-    assert (await client.post("/auth-providers", json=_body())).status_code == 409
+    assert (await client.post("/api/v1/auth-providers", json=_body())).status_code == 201
+    assert (await client.post("/api/v1/auth-providers", json=_body())).status_code == 409
 
 
 async def test_unknown_kind_422(client: httpx.AsyncClient) -> None:
-    resp = await client.post("/auth-providers", json=_body(provider="no-existe"))
+    resp = await client.post("/api/v1/auth-providers", json=_body(provider="no-existe"))
     assert resp.status_code == 422
 
 
 async def test_missing_required_field_422(client: httpx.AsyncClient) -> None:
     # `host` is required by the request schema.
-    resp = await client.post("/auth-providers", json=_body(host=None))
+    resp = await client.post("/api/v1/auth-providers", json=_body(host=None))
     assert resp.status_code == 422
 
 
 async def test_get_unknown_404(client: httpx.AsyncClient) -> None:
-    assert (await client.get("/auth-providers/00000000-0000-0000-0000-000000000000")).status_code == 404
+    assert (await client.get("/api/v1/auth-providers/00000000-0000-0000-0000-000000000000")).status_code == 404
 
 
 async def test_patch_unknown_404(client: httpx.AsyncClient) -> None:
     resp = await client.patch(
-        "/auth-providers/00000000-0000-0000-0000-000000000000", json={"enabled": True}
+        "/api/v1/auth-providers/00000000-0000-0000-0000-000000000000", json={"enabled": True}
     )
     assert resp.status_code == 404
 
 
 async def test_patch_empty_body_422(client: httpx.AsyncClient) -> None:
-    created = (await client.post("/auth-providers", json=_body())).json()
-    resp = await client.patch(f"/auth-providers/{created['id']}", json={})
+    created = (await client.post("/api/v1/auth-providers", json=_body())).json()
+    resp = await client.patch(f"/api/v1/auth-providers/{created['id']}", json={})
     assert resp.status_code == 422
 
 
 async def test_delete_unknown_404(client: httpx.AsyncClient) -> None:
-    assert (await client.delete("/auth-providers/00000000-0000-0000-0000-000000000000")).status_code == 404
+    assert (await client.delete("/api/v1/auth-providers/00000000-0000-0000-0000-000000000000")).status_code == 404
 
 
 async def test_bad_uuid_422(client: httpx.AsyncClient) -> None:
     # A non-UUID path segment fails FastAPI's path validation.
-    assert (await client.get("/auth-providers/not-a-uuid")).status_code == 422
+    assert (await client.get("/api/v1/auth-providers/not-a-uuid")).status_code == 422

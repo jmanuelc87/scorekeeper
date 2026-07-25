@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from fastapi.testclient import TestClient
 
-from scorekeeper.api import app
+from scorekeeper.main import app
 from scorekeeper.core.services import read_models
 
 
@@ -43,7 +43,7 @@ async def test_scenario_turns_endpoint_forwards_and_returns(monkeypatch) -> None
     monkeypatch.setattr(read_models, "retrieve_scenario_turns", fake)
 
     with TestClient(app) as client:
-        response = client.get("/scenarios/abc/turns")
+        response = client.get("/api/v1/scenarios/abc/turns")
 
     assert response.status_code == 200
     assert response.json() == payload
@@ -54,6 +54,6 @@ async def test_scenario_turns_endpoint_unknown_404(monkeypatch) -> None:
     monkeypatch.setattr(read_models, "retrieve_scenario_turns", _async_none)
 
     with TestClient(app) as client:
-        response = client.get("/scenarios/nope/turns")
+        response = client.get("/api/v1/scenarios/nope/turns")
 
     assert response.status_code == 404

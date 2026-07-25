@@ -9,7 +9,7 @@ from fastapi.testclient import TestClient
 from openpyxl import Workbook
 
 from scorekeeper import tasks
-from scorekeeper.api import app
+from scorekeeper.main import app
 from scorekeeper.core.services import ingestion
 from scorekeeper.core.services import runs as run_service
 
@@ -61,7 +61,7 @@ async def test_endpoint_ingests_without_enqueue_and_returns_run_id(monkeypatch) 
 
     with TestClient(app) as client:
         response = client.post(
-            "/evaluations",
+            "/api/v1/evaluations",
             files=[("files", ("esc1.xlsx", _conversation_bytes(), "application/octet-stream"))],
             data={
                 "payload": _payload(
@@ -101,7 +101,7 @@ async def test_endpoint_per_file_platform_override(monkeypatch) -> None:
 
     with TestClient(app) as client:
         response = client.post(
-            "/evaluations",
+            "/api/v1/evaluations",
             files=[
                 ("files", ("esc1.xlsx", _conversation_bytes(), "application/octet-stream")),
                 ("files", ("esc2.xlsx", _conversation_bytes(), "application/octet-stream")),
@@ -127,7 +127,7 @@ async def test_endpoint_defaults_scenario_id_to_stem(monkeypatch) -> None:
 
     with TestClient(app) as client:
         response = client.post(
-            "/evaluations",
+            "/api/v1/evaluations",
             files=[("files", ("esc1.xlsx", _conversation_bytes(), "application/octet-stream"))],
             data={"payload": _payload()},
         )
@@ -148,7 +148,7 @@ async def test_start_endpoint_enqueues_and_returns_queued(monkeypatch) -> None:
     monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
 
     with TestClient(app) as client:
-        response = client.post("/evaluations/run-123/start")
+        response = client.post("/api/v1/evaluations/run-123/start")
 
     # 202 Accepted; the run flips to en_cola and the pipeline is enqueued now.
     assert response.status_code == 202
@@ -166,7 +166,7 @@ async def test_start_endpoint_unknown_run_404(monkeypatch) -> None:
     monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
 
     with TestClient(app) as client:
-        response = client.post("/evaluations/does-not-exist/start")
+        response = client.post("/api/v1/evaluations/does-not-exist/start")
 
     assert response.status_code == 404
     assert "enqueued" not in captured  # nothing enqueued for an unknown run
@@ -182,7 +182,7 @@ async def test_start_endpoint_already_started_409(monkeypatch) -> None:
     monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
 
     with TestClient(app) as client:
-        response = client.post("/evaluations/run-123/start")
+        response = client.post("/api/v1/evaluations/run-123/start")
 
     assert response.status_code == 409
     assert "enqueued" not in captured  # a re-start never enqueues a second job
@@ -199,7 +199,7 @@ async def test_selection_endpoint_returns_updated_count(monkeypatch) -> None:
 
     with TestClient(app) as client:
         response = client.patch(
-            "/evaluations/run-123/turns/selection",
+            "/api/v1/evaluations/run-123/turns/selection",
             json={"turn_ids": ["a", "b"], "is_selected": True},
         )
 
@@ -216,7 +216,7 @@ async def test_selection_endpoint_unknown_run_404(monkeypatch) -> None:
 
     with TestClient(app) as client:
         response = client.patch(
-            "/evaluations/does-not-exist/turns/selection",
+            "/api/v1/evaluations/does-not-exist/turns/selection",
             json={"turn_ids": ["a"]},
         )
 
@@ -231,7 +231,7 @@ async def test_selection_endpoint_already_started_409(monkeypatch) -> None:
 
     with TestClient(app) as client:
         response = client.patch(
-            "/evaluations/run-123/turns/selection",
+            "/api/v1/evaluations/run-123/turns/selection",
             json={"turn_ids": ["a"]},
         )
 
@@ -257,7 +257,7 @@ async def test_endpoint_get_returns_summary(monkeypatch) -> None:
     monkeypatch.setattr(run_service, "get_run_summary", fake_summary)
 
     with TestClient(app) as client:
-        response = client.get("/evaluations/run-123")
+        response = client.get("/api/v1/evaluations/run-123")
 
     assert response.status_code == 200
     body = response.json()
@@ -271,7 +271,7 @@ async def test_endpoint_get_unknown_run_404(monkeypatch) -> None:
     monkeypatch.setattr(run_service, "get_run_summary", _async_none)
 
     with TestClient(app) as client:
-        response = client.get("/evaluations/does-not-exist")
+        response = client.get("/api/v1/evaluations/does-not-exist")
 
     assert response.status_code == 404
 
@@ -279,7 +279,7 @@ async def test_endpoint_get_unknown_run_404(monkeypatch) -> None:
 async def test_endpoint_rejects_invalid_payload() -> None:
     with TestClient(app) as client:
         response = client.post(
-            "/evaluations",
+            "/api/v1/evaluations",
             files=[("files", ("esc1.xlsx", _conversation_bytes(), "application/octet-stream"))],
             data={"payload": "no-es-json"},
         )
@@ -289,7 +289,7 @@ async def test_endpoint_rejects_invalid_payload() -> None:
 async def test_endpoint_rejects_non_xlsx() -> None:
     with TestClient(app) as client:
         response = client.post(
-            "/evaluations",
+            "/api/v1/evaluations",
             files=[("files", ("esc1.csv", b"data", "text/csv"))],
             data={"payload": _payload()},
         )
@@ -299,7 +299,7 @@ async def test_endpoint_rejects_non_xlsx() -> None:
 async def test_endpoint_rejects_empty_file() -> None:
     with TestClient(app) as client:
         response = client.post(
-            "/evaluations",
+            "/api/v1/evaluations",
             files=[("files", ("esc1.xlsx", b"", "application/octet-stream"))],
             data={"payload": _payload()},
         )
@@ -314,7 +314,7 @@ async def test_endpoint_maps_value_error_to_400(monkeypatch) -> None:
 
     with TestClient(app) as client:
         response = client.post(
-            "/evaluations",
+            "/api/v1/evaluations",
             files=[("files", ("esc1.xlsx", _conversation_bytes(), "application/octet-stream"))],
             data={"payload": _payload()},
         )
