@@ -14,7 +14,7 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.evaluation import _run_tree
+from scorekeeper.db.repositories.runs import run_tree_options
 from scorekeeper.db.models import (
     BenchmarkRun,
     MetricScore,
@@ -201,12 +201,12 @@ async def _seed_scenario(
     session.add(run)
     await session.flush()
     # The runner consumes an eagerly-loaded tree (production loads it via
-    # evaluation._run_tree); load it here too, or the first lazy relationship access
+    # repositories.runs.run_tree_options); load it here too, or the first lazy relationship access
     # inside run_turn raises MissingGreenlet.
     await session.execute(
         select(BenchmarkRun)
         .where(BenchmarkRun.id == run.id)
-        .options(_run_tree())
+        .options(run_tree_options())
         .execution_options(populate_existing=True)
     )
     return run, platform_exec, scenario
@@ -394,7 +394,7 @@ async def test_run_platform_rolls_up_average(session: AsyncSession, registry) ->
     await session.execute(
         select(BenchmarkRun)
         .where(BenchmarkRun.id == run.id)
-        .options(_run_tree())
+        .options(run_tree_options())
         .execution_options(populate_existing=True)
     )
 

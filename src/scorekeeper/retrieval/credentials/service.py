@@ -19,13 +19,13 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.config.settings import get_settings
 from scorekeeper.db.connection import session_scope
 from scorekeeper.db.models import AuthProviderConfig
+from scorekeeper.db.repositories import auth_providers as repo
 from scorekeeper.retrieval.credentials.registry import CredentialProviderRegistry
 from scorekeeper.retrieval.credentials.secrets import encrypt_secret
 
@@ -107,15 +107,8 @@ async def list_providers(
 ) -> list[dict[str, Any]]:
     """List provider rows, optionally filtered, ordered by ``(provider, host)``."""
     async with session_scope(session) as db:
-        stmt = select(AuthProviderConfig)
-        if provider is not None:
-            stmt = stmt.where(AuthProviderConfig.provider == provider)
-        if host is not None:
-            stmt = stmt.where(AuthProviderConfig.host == host)
-        if enabled is not None:
-            stmt = stmt.where(AuthProviderConfig.enabled.is_(enabled))
-        stmt = stmt.order_by(AuthProviderConfig.provider, AuthProviderConfig.host)
-        return [_serialize(row) for row in await db.scalars(stmt)]
+        rows = await repo.list_providers(db, provider=provider, host=host, enabled=enabled)
+        return [_serialize(row) for row in rows]
 
 
 async def get_provider(
@@ -123,7 +116,7 @@ async def get_provider(
 ) -> dict[str, Any] | None:
     """Return one provider's safe view, or ``None`` when the id is unknown."""
     async with session_scope(session) as db:
-        row = await db.get(AuthProviderConfig, provider_id)
+        row = await repo.get(db, provider_id)
         return _serialize(row) if row is not None else None
 
 
@@ -180,7 +173,7 @@ async def update_provider(
         _validate_kind(changes["provider"])
 
     async with session_scope(session) as db:
-        row = await db.get(AuthProviderConfig, provider_id)
+        row = await repo.get(db, provider_id)
         if row is None:
             return None
         for field, value in changes.items():
@@ -206,7 +199,7 @@ async def update_provider(
 async def delete_provider(provider_id: UUID, *, session: AsyncSession | None = None) -> bool:
     """Delete a provider row. Returns ``True`` when a row was removed, ``False`` if unknown."""
     async with session_scope(session) as db:
-        row = await db.get(AuthProviderConfig, provider_id)
+        row = await repo.get(db, provider_id)
         if row is None:
             return False
         await db.delete(row)

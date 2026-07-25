@@ -51,7 +51,8 @@ class Base(AsyncAttrs, DeclarativeBase):
 
     ``AsyncAttrs`` is a safety net, not the mechanism: it allows
     ``await obj.awaitable_attrs.turns`` for a relationship that was not eager-loaded.
-    The design is explicit ``selectinload`` at the query (see ``evaluation._run_tree``);
+    The design is explicit ``selectinload`` at the query (see
+    ``db.repositories.runs.run_tree_options``);
     an ``awaitable_attrs`` in a loop is an N+1 that wants a loader option instead.
     """
 

@@ -41,9 +41,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from scorekeeper.config.settings import get_settings
 from scorekeeper.db.connection import session_scope
@@ -57,6 +55,9 @@ from scorekeeper.db.models import (
     Turn,
     TurnTokenUsage,
 )
+from scorekeeper.db.repositories import runs as run_repo
+from scorekeeper.db.repositories import scenarios as scenario_repo
+from scorekeeper.db.repositories import turns as turn_repo
 from scorekeeper.importer import normalize_messages, parse_conversation
 from scorekeeper.metrics.judge import Judge
 from scorekeeper.metrics.selection import sync_selection
@@ -278,7 +279,7 @@ async def score_run(
     is marked ``fallido`` (a terminal state for pollers) and the error re-raised.
     """
     async with session_scope(session) as db:
-        run = await _load_run(db, run_id, _run_tree())
+        run = await run_repo.get_run_tree(db, run_id)
         if run is None:
             raise ValueError(f"El run {run_id} no existe.")
 
@@ -294,7 +295,7 @@ async def score_run(
         except Exception:
             # rollback expires every instance, so the reload carries the loaders again.
             await db.rollback()
-            run = await _load_run(db, run_id, _run_tree())
+            run = await run_repo.get_run_tree(db, run_id)
             if run is not None:
                 run.status = STATUS_FALLIDO
                 await db.commit()
@@ -329,7 +330,7 @@ async def retrieve_run(
     scoring. Returns the run summary.
     """
     async with session_scope(session) as db:
-        run = await _load_run(db, run_id, _run_tree(metric_scores=False))
+        run = await run_repo.get_run_tree(db, run_id, metric_scores=False)
         if run is None:
             raise ValueError(f"El run {run_id} no existe.")
 
@@ -353,7 +354,7 @@ async def retrieve_run(
         except Exception:
             # rollback expires every instance, so the reload carries the loaders again.
             await db.rollback()
-            run = await _load_run(db, run_id, _run_tree(metric_scores=False))
+            run = await run_repo.get_run_tree(db, run_id, metric_scores=False)
             if run is not None:
                 run.status = STATUS_FALLIDO
                 await db.commit()
@@ -430,7 +431,7 @@ async def run_evaluation(
 
 async def _select_all_turns(db: AsyncSession, run_id: str) -> None:
     """Mark every turn of a run selected for scoring (the "evaluate everything" default)."""
-    run = await _load_run(db, run_id, _run_tree(metric_scores=False, retrieval=False))
+    run = await run_repo.get_run_tree(db, run_id, metric_scores=False, retrieval=False)
     if run is None:
         return
     for platform_exec in run.platform_executions:
@@ -445,7 +446,7 @@ async def get_run_summary(
 ) -> dict[str, Any] | None:
     """Return a run's current status/summary for polling, or ``None`` if unknown."""
     async with session_scope(session) as db:
-        run = await _load_run(db, run_id, _run_tree(metric_scores=False, retrieval=False))
+        run = await run_repo.get_run_tree(db, run_id, metric_scores=False, retrieval=False)
         return _summarize(run) if run is not None else None
 
 
@@ -461,7 +462,7 @@ async def start_run(run_id: str, *, session: AsyncSession | None = None) -> str 
     (already started), so a run is never enqueued twice.
     """
     async with session_scope(session) as db:
-        run = await _load_run(db, run_id)
+        run = await run_repo.get_run(db, run_id)
         if run is None:
             return None
         if run.status != STATUS_INGERIDO:
@@ -492,7 +493,7 @@ async def set_turn_selection(
     (or are malformed) are ignored.
     """
     async with session_scope(session) as db:
-        run = await _load_run(db, run_id, _run_tree(metric_scores=False, retrieval=False))
+        run = await run_repo.get_run_tree(db, run_id, metric_scores=False, retrieval=False)
         if run is None:
             return None
         if run.status != STATUS_INGERIDO:
@@ -535,9 +536,7 @@ async def retrieve_turn_traces(
     layer maps that to ``404``); a turn with no scores yields ``[]``.
     """
     async with session_scope(session) as db:
-        turn = await _load_turn(
-            db, turn_id, selectinload(Turn.metric_scores).selectinload(MetricScore.trace)
-        )
+        turn = await turn_repo.get_turn_with_traces(db, turn_id)
         if turn is None:
             return None
         return [
@@ -561,7 +560,7 @@ async def retrieve_turn_token_usage(
     HTTP layer maps that to ``404``).
     """
     async with session_scope(session) as db:
-        turn = await _load_turn(db, turn_id, selectinload(Turn.token_usage))
+        turn = await turn_repo.get_turn_with_token_usage(db, turn_id)
         if turn is None:
             return None
         return _serialize_turn_token_usage(turn)
@@ -586,7 +585,7 @@ async def retrieve_scenario_turns(
     ``404``); a scenario with no turns yields ``[]``.
     """
     async with session_scope(session) as db:
-        scenario = await _load_scenario(db, scenario_id)
+        scenario = await scenario_repo.get_scenario_with_turns(db, scenario_id)
         if scenario is None:
             return None
         return [_serialize_scenario_turn(turn) for turn in scenario.turns]
@@ -635,21 +634,14 @@ async def retrieve_runs(
             return []
 
     async with session_scope(session) as db:
-        stmt = (
-            select(BenchmarkRun)
-            .join(BenchmarkRun.platform_executions)
-            .order_by(BenchmarkRun.created_at)
-            .options(_load_options(granularity))
+        runs = await run_repo.list_runs(
+            db,
+            run_key=key,
+            platform=platform,
+            start=start,
+            end=end,
+            with_metric_scores=granularity == GRANULARITY_METRIC,
         )
-        if key is not None:
-            stmt = stmt.where(BenchmarkRun.id == key)
-        if platform is not None:
-            stmt = stmt.where(PlatformExecution.platform == platform)
-        if start is not None:
-            stmt = stmt.where(PlatformExecution.started_at >= start)
-        if end is not None:
-            stmt = stmt.where(PlatformExecution.finished_at <= end)
-        runs = (await db.execute(stmt)).scalars().unique().all()
         return [_serialize_run(run, granularity) for run in runs]
 
 
@@ -663,92 +655,6 @@ def _parse_date(value: str | None, field: str) -> datetime | None:
         raise ValueError(
             f"{field} {value!r} inválido; use un formato ISO-8601 (YYYY-MM-DD)."
         ) from exc
-
-
-def _run_tree(*, metric_scores: bool = True, retrieval: bool = True):
-    """Eager-load the whole run tree — the loader every write path uses.
-
-    ``score_run``/``retrieve_run`` walk BenchmarkRun → PlatformExecution →
-    ScenarioResult → Turn → {metric_scores(+trace), retrieved_documents, token_usage}.
-    Under an ``AsyncSession`` an unloaded relationship is not a slow query but a
-    ``MissingGreenlet``, so the tree is loaded up front rather than lazily.
-
-    ``MetricScore.trace`` is required, not an optimization: clearing
-    ``turn.metric_scores`` cascades delete-orphan into it, which the unit of work
-    resolves *at flush time* — the least obvious place to take a lazy load.
-    """
-    turn_opts = [selectinload(Turn.token_usage)]
-    if metric_scores:
-        turn_opts.append(selectinload(Turn.metric_scores).selectinload(MetricScore.trace))
-    if retrieval:
-        turn_opts.append(selectinload(Turn.retrieved_documents))
-    return (
-        selectinload(BenchmarkRun.platform_executions)
-        .selectinload(PlatformExecution.scenario_results)
-        .selectinload(ScenarioResult.turns)
-        .options(*turn_opts)
-    )
-
-
-def _load_options(granularity: str):
-    """Eager-load the run tree down to the depth ``granularity`` requires (no N+1).
-
-    Turns are loaded at *every* granularity, not just ``metric_scores``:
-    ``_serialize_run`` always calls ``_run_progress``, which counts a scenario's turns.
-    """
-    turns = selectinload(ScenarioResult.turns)
-    if granularity == GRANULARITY_METRIC:
-        turns = turns.selectinload(Turn.metric_scores)
-    return (
-        selectinload(BenchmarkRun.platform_executions)
-        .selectinload(PlatformExecution.scenario_results)
-        .options(turns)
-    )
-
-
-async def _load_run(db: AsyncSession, run_id: str, *options) -> BenchmarkRun | None:
-    """Load a ``BenchmarkRun`` by its string id, or ``None`` for an unknown/invalid id.
-
-    A ``select()`` rather than ``session.get()``: get() returns an identity-map hit
-    without applying loader options, so a run already in the session (``run_evaluation``
-    threads one session through ingest → retrieve → score) would come back with its
-    relationships unloaded and fail on first access.
-    """
-    try:
-        key = uuid.UUID(run_id)
-    except ValueError:
-        return None
-    stmt = select(BenchmarkRun).where(BenchmarkRun.id == key).options(*options)
-    return (await db.execute(stmt)).scalars().one_or_none()
-
-
-async def _load_turn(db: AsyncSession, turn_id: str, *options) -> Turn | None:
-    """Load a ``Turn`` by its string id, or ``None`` for an unknown/invalid id."""
-    try:
-        key = uuid.UUID(turn_id)
-    except ValueError:
-        return None
-    stmt = select(Turn).where(Turn.id == key).options(*options)
-    return (await db.execute(stmt)).scalars().one_or_none()
-
-
-async def _load_scenario(db: AsyncSession, scenario_id: str) -> ScenarioResult | None:
-    """Load a ``ScenarioResult`` by its string id, eager-loading turns + metric scores.
-
-    Returns ``None`` for an unknown/invalid id. Eager-loads the turn tree (turns
-    ordered by ``turn_number``, each with its metric scores) so serialization does
-    not N+1.
-    """
-    try:
-        key = uuid.UUID(scenario_id)
-    except ValueError:
-        return None
-    stmt = (
-        select(ScenarioResult)
-        .where(ScenarioResult.id == key)
-        .options(selectinload(ScenarioResult.turns).selectinload(Turn.metric_scores))
-    )
-    return (await db.execute(stmt)).scalars().one_or_none()
 
 
 async def _parse_upload(upload: UploadedFile) -> list[dict[str, Any]]:

@@ -19,11 +19,11 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.db.connection import session_scope
 from scorekeeper.db.models import DocumentCacheEntry
+from scorekeeper.db.repositories import document_cache as repo
 from scorekeeper.retrieval.types import DocType
 
 # Blob filename extension per document type (cosmetic; the SHA is the real key).
@@ -62,9 +62,7 @@ class DocumentStore:
         as a miss so the caller re-downloads.
         """
         async with session_scope(self._session) as db:
-            entry = await db.scalar(
-                select(DocumentCacheEntry).where(DocumentCacheEntry.url == url)
-            )
+            entry = await repo.get_by_url(db, url)
             if entry is None:
                 return None
             path = self._root / entry.cache_path
@@ -94,9 +92,7 @@ class DocumentStore:
         path.write_bytes(body)
 
         async with session_scope(self._session) as db:
-            entry = await db.scalar(
-                select(DocumentCacheEntry).where(DocumentCacheEntry.url == url)
-            )
+            entry = await repo.get_by_url(db, url)
             if entry is None:
                 entry = DocumentCacheEntry(url=url)
                 db.add(entry)
@@ -126,9 +122,7 @@ class DocumentStore:
         removed = 0
         async with session_scope(self._session) as db:
             for url in set(urls):
-                entry = await db.scalar(
-                    select(DocumentCacheEntry).where(DocumentCacheEntry.url == url)
-                )
+                entry = await repo.get_by_url(db, url)
                 if entry is None:
                     continue
                 self._unlink(self._root / entry.cache_path)

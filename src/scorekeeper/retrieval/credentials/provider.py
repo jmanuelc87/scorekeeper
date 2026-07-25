@@ -20,6 +20,7 @@ from collections.abc import Mapping
 from scorekeeper.config.settings import get_settings
 from scorekeeper.db.connection import session_scope
 from scorekeeper.db.models import AuthProviderConfig
+from scorekeeper.db.repositories import auth_providers as repo
 from scorekeeper.retrieval.credentials import catalog as _catalog  # noqa: F401  (populate registry)
 from scorekeeper.retrieval.credentials.base import AuthClient, CredentialError
 from scorekeeper.retrieval.credentials.registry import CredentialProviderRegistry
@@ -30,7 +31,6 @@ from scorekeeper.retrieval.types import (
     AuthStatus,
     DocumentLocator,
 )
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 
@@ -109,11 +109,7 @@ class StoredAuthProvider:
         """Load and cache the enabled ``auth_providers`` rows."""
         if self._configs is None:
             async with session_scope(self._session) as db:
-                self._configs = list(
-                    await db.scalars(
-                        select(AuthProviderConfig).where(AuthProviderConfig.enabled.is_(True))
-                    )
-                )
+                self._configs = await repo.list_enabled(db)
         return self._configs
 
     async def _match(self, host: str) -> AuthProviderConfig | None:
