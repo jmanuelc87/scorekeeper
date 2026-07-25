@@ -44,7 +44,7 @@ function App() {
       {error && <p className="notice error">{error}</p>}
       {loading && <p className="notice">Loading scores…</p>}
       {!loading && !error && scores.length === 0 && (
-        <p className="notice">No scores yet. Record one through the MCP server.</p>
+        <p className="notice">No scores yet. Record one through the API.</p>
       )}
       {scores.length > 0 && (
         <div className="table-wrap">

@@ -15,17 +15,12 @@ keys render as ``key=value`` pairs on the line.
 Call :func:`configure_logging` once per process at startup (the API does it on
 import; the Celery worker does it from its logging-setup signal with ``force``).
 It is idempotent: it resets the root handlers each time it actually runs.
-
-The one caller that overrides the target ``stream`` is the MCP server under the
-``stdio`` transport: stdout there carries the JSON-RPC protocol, so its logs go to
-stderr instead to avoid corrupting the wire (see :mod:`scorekeeper.server`).
 """
 
 from __future__ import annotations
 
 import logging
 import sys
-from typing import IO
 
 import structlog
 
@@ -48,27 +43,18 @@ def _shared_processors() -> list:
     ]
 
 
-def configure_logging(
-    level: int | str = logging.INFO,
-    *,
-    force: bool = False,
-    stream: IO[str] | None = None,
-) -> None:
-    """Configure structlog + stdlib to emit plain-text logs to a single stream.
+def configure_logging(level: int | str = logging.INFO, *, force: bool = False) -> None:
+    """Configure structlog + stdlib to emit plain-text logs to stdout.
 
     ``level`` sets the root log level. ``force`` re-applies the configuration even
     if it already ran in this process — used by the Celery worker, which must
     reconfigure *after* Celery has set up (and possibly hijacked) logging on boot.
-
-    ``stream`` is the target for the output; ``None`` (default) means stdout. The
-    MCP server passes ``sys.stderr`` under the stdio transport, whose stdout is the
-    JSON-RPC channel.
     """
     global _configured
     if _configured and not force:
         return
 
-    target = stream if stream is not None else sys.stdout
+    target = sys.stdout
     shared = _shared_processors()
 
     # Route structlog through stdlib logging so its records reach the same handler

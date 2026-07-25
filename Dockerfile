@@ -13,4 +13,4 @@ RUN pip install --no-cache-dir ".[judges,retrieval]"
 COPY alembic.ini ./
 COPY migrations ./migrations
 
-CMD ["scorekeeper-mcp", "--transport", "http"]
+CMD ["scorekeeper-api"]

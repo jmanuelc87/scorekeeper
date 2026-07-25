@@ -5,8 +5,7 @@ dashboard, triggers evaluations, and manages the retrieval credential store. Thi
 documents every endpoint; add new ones as their own `##` section below. For the models these
 endpoints read and write, see the [Data model](data-model.md); for how metrics are chosen and
 scored, see [Evaluation metrics](evaluation-metrics.md); for the credential store, see
-[Retrieval credentials](retrieval-credentials.md). The same results are also exposed over the
-Model Context Protocol — see [MCP tools](mcp.md).
+[Retrieval credentials](retrieval-credentials.md).
 
 | Method & path                | Purpose |
 |------------------------------|---------|
@@ -14,7 +13,7 @@ Model Context Protocol — see [MCP tools](mcp.md).
 | `POST /evaluations`          | Ingest conversation `.xlsx` files and **enqueue** them for scoring (per-file platform, defaulting to the payload platform). |
 | `POST /captures`             | Ingest conversations captured from a chat UI as JSON and **enqueue** them for scoring (the browser extension's entry point). |
 | `GET /evaluations/{run_id}`  | Poll a run's status and summary. |
-| `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity (HTTP twin of the MCP `retrieve` tool). |
+| `GET /runs`                  | Retrieve full scored run details, filtered and at a chosen granularity. |
 | `GET /scenarios/{scenario_id}/turns` | Retrieve one scenario's turns — conversation content plus per-metric scores. |
 | `GET /auth-providers`        | List the retrieval credential store's provider rows (optional filters). |
 | `POST /auth-providers`       | Create a credential provider row (write-only `private_key`, stored encrypted). |
@@ -245,9 +244,8 @@ is in its lifecycle (`en_cola → en_recuperacion → en_proceso → completado|
 ## `GET /runs`
 
 Retrieve full scored details for the runs matching a set of filters, as a **list**.
-This is the HTTP twin of the MCP [`retrieve` tool](mcp.md#retrieve) — same filters,
-granularity, and semantics. Unlike `GET /evaluations/{run_id}` (a single run's shallow
-poll summary), `/runs` returns the deep, granularity-configurable shape.
+Unlike `GET /evaluations/{run_id}` (a single run's shallow poll summary), `/runs`
+returns the deep, granularity-configurable shape.
 
 ### Query parameters
 
@@ -268,8 +266,7 @@ controls depth (each level adds to the one above): `platform_executions` → per
 rollups; `scenario_results` → adds each scenario (its `id`, `scenario_id`, `use_case`,
 `status`, `average_score`); `metric_scores` → adds each turn and its per-metric scores
 (`metric_name`, `score`, `judge_model`, `rubric_version`). Each score's structured `trace`
-is persisted on the `metric_traces` table but is not surfaced by either read path (this
-endpoint or the MCP [`retrieve` tool](mcp.md#retrieve)).
+is persisted on the `metric_traces` table but is not surfaced by this endpoint.
 
 Each scenario carries both an `id` (its `ScenarioResult` UUID — the unique handle
 [`GET /scenarios/{scenario_id}/turns`](#get-scenariosscenario_idturns) takes) and the
