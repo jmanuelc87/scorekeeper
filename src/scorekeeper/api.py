@@ -377,9 +377,9 @@ async def list_runs(
 ) -> list[dict]:
     """Retrieve full scored details for the runs matching the filters.
 
-    The HTTP twin of the MCP ``retrieve`` tool. All filters are optional and
-    AND-combined; ``granularity`` controls depth (``platform_executions`` →
-    ``scenario_results`` → ``metric_scores``). Returns a list ordered by creation date;
+    All filters are optional and AND-combined; ``granularity`` controls depth
+    (``platform_executions`` → ``scenario_results`` → ``metric_scores``).
+    Returns a list ordered by creation date;
     an unknown ``run_id`` yields ``[]``. ``400`` for an unknown ``granularity`` or an
     unparseable date.
 

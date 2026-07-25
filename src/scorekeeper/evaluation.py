@@ -886,8 +886,8 @@ def _serialize_scenario_turn(turn: Turn) -> dict[str, Any]:
 
 def _serialize_turn(turn: Turn) -> dict[str, Any]:
     # The structured ``trace`` is intentionally not surfaced here: it is persisted
-    # on the ``metric_traces`` table for direct inspection, but neither read surface
-    # (HTTP ``/runs`` nor the MCP ``retrieve`` tool) exposes it.
+    # on the ``metric_traces`` table for direct inspection, but the read surface
+    # (HTTP ``/runs``) does not expose it.
     return {
         "turn_id": str(turn.id),
         "turn_number": turn.turn_number,

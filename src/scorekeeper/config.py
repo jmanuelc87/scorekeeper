@@ -18,9 +18,6 @@ class Settings(BaseSettings):
     # ignored (TLS goes through connect_args={"ssl": ...}), and a bare "postgres://"
     # scheme is rejected.
     database_url: str = "sqlite+aiosqlite:///./scorekeeper.db"
-    mcp_transport: str = "stdio"
-    mcp_host: str = "0.0.0.0"
-    mcp_port: int = 8000
     api_host: str = "0.0.0.0"
     api_port: int = 8001
     cors_origins: str = "http://localhost:5173,http://localhost:8080"

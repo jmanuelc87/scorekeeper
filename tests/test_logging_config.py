@@ -3,8 +3,7 @@
 ``configure_logging`` must install exactly one root handler that emits
 human-readable plain text to stdout (no JSON stream, no separate stderr stream),
 routing both native structlog events and third-party ``logging`` records through
-it. A caller may redirect the output to another stream (the MCP server does this
-for stdio). We drive real streams and assert on what each one emits.
+it. We drive real streams and assert on what each one emits.
 """
 
 from __future__ import annotations
@@ -76,20 +75,6 @@ def test_stdlib_record_is_routed_through_structlog(
 
     assert err.getvalue() == ""
     assert "plain message" in out.getvalue()
-
-
-def test_stream_override_redirects_output(monkeypatch: pytest.MonkeyPatch) -> None:
-    # The MCP server's stdio path redirects logs off stdout (the JSON-RPC channel).
-    import sys
-
-    err, out = io.StringIO(), io.StringIO()
-    monkeypatch.setattr(sys, "stdout", out)
-    logging_config.configure_logging(force=True, stream=err)
-
-    structlog.get_logger("scorekeeper.test").info("mcp_server_starting")
-
-    assert out.getvalue() == ""
-    assert "mcp_server_starting" in err.getvalue()
 
 
 def test_idempotent_without_force(monkeypatch: pytest.MonkeyPatch) -> None:
