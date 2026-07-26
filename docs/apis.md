@@ -199,6 +199,7 @@ Conversation object:
 | `messages`    | `array`           | yes      | —                  | The conversation, in order. Must be non-empty and at least one message must have content. |
 | `use_case`    | `string`          | no       | the payload `use_case` | Metric-selection use case for this conversation. |
 | `platform`    | `string`          | no       | the payload `platform` | Platform to score this conversation under. |
+| `model_name`  | `string`          | no       | `null`             | The model that produced the responses (`"Claude Opus 4.5"`), stored on the `ScenarioResult`. The browser extension detects it from the chat's model picker and lets the user correct it; omitted, `null` or blank all store `NULL`. |
 | `source_ref`  | `string`          | no       | the `scenario_id`  | Where the capture came from (the chat URL); stored as the scenario's `source_ref`. |
 
 Message object:
@@ -358,7 +359,7 @@ The date range filters the **scoring window** (`PlatformExecution.started_at` /
 still-queued/in-progress runs. Results are ordered by run creation date. Granularity
 controls depth (each level adds to the one above): `platform_executions` → per-platform
 rollups; `scenario_results` → adds each scenario (its `id`, `scenario_id`, `use_case`,
-`status`, `average_score`); `metric_scores` → adds each turn and its per-metric scores
+`model_name`, `status`, `average_score`); `metric_scores` → adds each turn and its per-metric scores
 (`metric_name`, `score`, `judge_model`, `rubric_version`). Each score's structured `trace`
 is persisted on the `metric_traces` table but is not surfaced by this endpoint.
 
@@ -590,6 +591,7 @@ curl -X POST http://localhost:8001/api/v1/captures \
         "use_case": "default",
         "conversations": [{
           "scenario_id": "reseña-hotel-2026-07-22-11-30",
+          "model_name": "Claude Opus 4.5",
           "source_ref": "https://claude.ai/chat/abc123",
           "messages": [
             {"role": "user",  "content": "¿Cuántos habitantes tiene Madrid?"},

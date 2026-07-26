@@ -124,6 +124,9 @@ async function submitCapture(tabId, meta) {
       conversations: [
         {
           scenario_id: meta.scenarioId,
+          // Null rather than "" when the field was left empty: both mean "unknown"
+          // to the API, and null is what it stores.
+          model_name: meta.model || null,
           source_ref: capture.url,
           messages: capture.messages,
         },
@@ -141,6 +144,7 @@ async function submitCapture(tabId, meta) {
     status,
     apiUrl: settings.apiUrl,
     platform: meta.platform,
+    model: meta.model,
     scenarioId: meta.scenarioId,
     useCase: meta.useCase,
     turns: capture.messages.length,

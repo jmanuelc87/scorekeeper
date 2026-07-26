@@ -58,6 +58,9 @@ async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
                 use_case=conversation.use_case or payload.use_case,
                 platform=conversation.platform,
                 messages=messages,
+                # A cleared field in the extension's popup arrives as "", which means
+                # "unknown" exactly like an omitted key — store one value for both.
+                model_name=(conversation.model_name or "").strip() or None,
             )
         )
 

@@ -22,6 +22,7 @@ const ui = {
   detection: document.getElementById("detection"),
   form: document.getElementById("form"),
   platform: document.getElementById("platform"),
+  model: document.getElementById("model"),
   scenario: document.getElementById("scenario"),
   useCase: document.getElementById("useCase"),
   submit: document.getElementById("submit"),
@@ -29,6 +30,7 @@ const ui = {
   run: document.getElementById("run"),
   runStatus: document.getElementById("runStatus"),
   runScenario: document.getElementById("runScenario"),
+  runModel: document.getElementById("runModel"),
   runProgress: document.getElementById("runProgress"),
   runAverage: document.getElementById("runAverage"),
   runError: document.getElementById("runError"),
@@ -73,15 +75,12 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 // Nothing watches this popup's console, so an unexpected failure has to land in the
 // notice rather than leaving an empty panel with no explanation.
-init().catch((error) => {
-  ui.detection.className = "notice error";
-  ui.detection.textContent = String(error?.message ?? error);
-});
+init().catch((error) => block(String(error?.message ?? error)));
 
 async function init() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab) {
-    ui.detection.textContent = "No hay ninguna pestaña activa.";
+    block("No hay ninguna pestaña activa.");
     return;
   }
   activeTabId = tab.id;
@@ -93,33 +92,38 @@ async function init() {
   try {
     capture = await send({ type: "preview", tabId: tab.id });
   } catch (error) {
-    ui.detection.textContent = error.message;
+    block(error.message);
     return;
   }
 
   if (!capture.ok) {
-    ui.detection.textContent = capture.error;
+    block(capture.error);
     return;
   }
   if (!capture.messages.length) {
-    ui.detection.textContent =
+    block(
       `Se detectó ${capture.adapter.label}, pero no se encontraron mensajes. ` +
-      "Abre una conversación y vuelve a intentarlo.";
+        "Abre una conversación y vuelve a intentarlo.",
+    );
     return;
   }
 
   const settings = await getSettings();
   // Built and swapped in one call: clearing the notice first and appending after
-  // would leave it blank — no message, no form — if anything in between threw.
+  // would leave it blank — no message, and a button still blocked — if anything in
+  // between threw.
   ui.detection.replaceChildren(
     `${capture.messages.length} mensajes en `,
     Object.assign(document.createElement("strong"), { textContent: capture.adapter.label }),
   );
   ui.detection.className = "notice detected";
   ui.platform.value = capture.adapter.platform;
+  // Blank when the chat does not name its model (or the adapter declares none) —
+  // the field stays editable so it can be supplied by hand.
+  ui.model.value = capture.model ?? "";
   ui.scenario.value = defaultScenarioId(capture);
   ui.useCase.value = settings.useCase;
-  ui.form.hidden = false;
+  ui.submit.disabled = false;
   ui.scenario.focus();
   ui.scenario.select();
 }
@@ -141,6 +145,7 @@ async function submit() {
       tabId: activeTabId,
       meta: {
         platform: ui.platform.value.trim(),
+        model: ui.model.value.trim(),
         scenarioId: ui.scenario.value.trim(),
         useCase: ui.useCase.value.trim(),
       },
@@ -174,6 +179,7 @@ function render(runs) {
   ui.runStatus.textContent = STATUS_LABELS[run.status] ?? run.status;
   ui.runStatus.dataset.status = run.status;
   ui.runScenario.textContent = `${run.scenarioId} · ${run.platform}`;
+  ui.runModel.textContent = run.model || "—";
   ui.runId.textContent = run.runId;
   ui.runProgress.textContent = formatProgress(run);
   ui.runAverage.textContent = formatAverages(run);
@@ -193,6 +199,18 @@ function formatAverages(run) {
     .filter((entry) => entry.average_score !== null)
     .map((entry) => `${entry.platform}: ${entry.average_score.toFixed(2)}`);
   return averages.length ? averages.join(" · ") : "—";
+}
+
+/**
+ * Report why this page cannot be captured and keep the send button blocked.
+ *
+ * The button ships `disabled`, so this only restates that default — but stating it
+ * here keeps "blocked" a property of this helper rather than of the markup alone.
+ */
+function block(message) {
+  ui.detection.className = "notice error";
+  ui.detection.textContent = message;
+  ui.submit.disabled = true;
 }
 
 function showError(error) {
