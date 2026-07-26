@@ -16,7 +16,7 @@
 
     <p id="detection" class="notice">Leyendo la conversación…</p>
 
-    <form id="form" hidden>
+    <form id="form">
       <label>
         Plataforma
         <input id="platform" name="platform" required autocomplete="off" />
@@ -35,7 +35,9 @@
         <input id="useCase" name="useCase" required autocomplete="off" />
         <small>Separa varios con comas para unir sus métricas.</small>
       </label>
-      <button id="submit" type="submit">Enviar a Scorekeeper</button>
+      <!-- Blocked until a compatible chat with messages is confirmed; only the
+           success path in `init()` enables it. -->
+      <button id="submit" type="submit" disabled>Enviar a Scorekeeper</button>
     </form>
 
     <p id="error" class="notice error" hidden></p>

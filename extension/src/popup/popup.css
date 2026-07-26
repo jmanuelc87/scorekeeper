@@ -130,9 +130,11 @@ button {
   cursor: pointer;
 }
 
+/* Disabled mostly means "this page is not a capturable chat", the state that
+   persists; the brief in-flight disable says so through its "Enviando…" label. */
 button:disabled {
   opacity: 0.55;
-  cursor: progress;
+  cursor: not-allowed;
 }
 
 button.link {
