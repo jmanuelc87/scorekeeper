@@ -3,7 +3,7 @@ FROM python:3.13-slim
 WORKDIR /app
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-COPY pyproject.toml README.md ./
+COPY pyproject.toml ./
 COPY src ./src
 # Include the `judges` extra so the LLM-as-a-judge SDKs (anthropic/openai) are
 # available at runtime — the scoring runner imports them to build a judge.

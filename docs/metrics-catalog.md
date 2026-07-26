@@ -1,7 +1,7 @@
 # Metrics catalog
 
 The concrete evaluation metrics that ship in
-`src/scorekeeper/core/metrics/catalog/`. Each entry documents *what* the metric
+`scorekeeper-engine/src/scorekeeper/core/metrics/catalog/`. Each entry documents *what* the metric
 measures and *how* it is scored; for the taxonomy those metrics are built on
 (the `Metric` base classes, scales, the `Judge` seam, registration and
 per-scenario selection) see [Evaluation metrics](evaluation-metrics.md), and for
@@ -38,7 +38,7 @@ selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
 
 **How directly the answer addresses the original question.**
 
-`AnswerRelevance` — `src/scorekeeper/core/metrics/catalog/answer_relevance.py`
+`AnswerRelevance` — `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/answer_relevance.py`
 
 Follows the **reverse-question generation** method (RAGAS): if an answer is on
 topic, questions generated *from the answer alone* should look like the question
@@ -108,7 +108,7 @@ generated questions and a text→vector embedding table.
 
 **Does the retriever rank relevant nodes ahead of irrelevant ones?**
 
-`ContextualPrecision` — `src/scorekeeper/core/metrics/catalog/contextual_precision.py`
+`ContextualPrecision` — `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/contextual_precision.py`
 
 A *ranking* metric for the retrieval stage of a RAG turn. Given the ordered list
 of retrieved nodes (rank 1 = the node the retriever/re-ranker placed first), it
@@ -197,7 +197,7 @@ values through `structured()`.
 
 **Fraction of the answer's statements that the context supports.**
 
-`FaithfulnessRagas` — `src/scorekeeper/core/metrics/catalog/faithfulness.py`
+`FaithfulnessRagas` — `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/faithfulness.py`
 
 The **RAGAS** groundedness algorithm: extract the discrete statements the answer
 makes, then verify each *against the context* by positive entailment. The score
@@ -258,7 +258,7 @@ extractions/verdicts and records call order.
 
 **Fraction of the answer's claims the context does not contradict.**
 
-`FaithfulnessDeepeval` — `src/scorekeeper/core/metrics/catalog/faithfulness.py`
+`FaithfulnessDeepeval` — `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/faithfulness.py`
 
 The **DeepEval** groundedness algorithm. It differs from RAGAS in polarity: it
 extracts *truths from the context* and *claims from the answer*, then per claim
@@ -323,7 +323,7 @@ contradiction, not-mentioned-passes, and no-claims cases with the scripted
 
 **How far a RAG answer departs from its retrieved context.**
 
-`Hallucination` — `src/scorekeeper/core/metrics/catalog/hallucination.py`
+`Hallucination` — `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/hallucination.py`
 
 An answer *hallucinates* when it contradicts the context it was supposed to be
 grounded on. The metric scores this the way a natural-language-inference (NLI)

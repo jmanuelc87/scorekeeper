@@ -6,7 +6,7 @@ it. The score is the fraction of claims **not** contradicted — an unverifiable
 claim *passes*; only a direct contradiction fails.
 
 - Metric name: `faithfulness_deepeval`
-- Class: `FaithfulnessDeepeval` — `src/scorekeeper/core/metrics/catalog/faithfulness.py`
+- Class: `FaithfulnessDeepeval` — `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/faithfulness.py`
 - Category: `RAG` · Scale: `Unit()` 0–1 · Weight: 1.0 · **higher is better**
 - Prose reference: [Metrics catalog → `faithfulness_deepeval`](../metrics-catalog.md#faithfulness_deepeval)
 
