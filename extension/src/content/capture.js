@@ -26,7 +26,7 @@
  * candidate still matches. When a platform stops capturing, open its chat, find
  * the element wrapping a single message bubble, and add its selector here.
  *
- * Three optional per-adapter fields go beyond the message bubbles:
+ * Four optional per-adapter fields go beyond the message bubbles:
  *
  * - `content` — selectors for the text container *inside* a matched bubble, for
  *   apps whose role selector lands on a wrapper rather than on the text itself
@@ -42,6 +42,15 @@
  *   while the message text is read and their lines dropped from it; see `readText`
  *   and `hideChrome`. Listing an element here that also appears under `citations`
  *   is the normal way to keep a chip's URL while dropping its label from the prose.
+ * - `model` — where the app names the model answering, so the capture can report it
+ *   ("Claude Opus 4.5", "2.5 Pro"). Alone among these it is resolved against
+ *   `document` rather than inside a bubble: the model picker is page furniture next
+ *   to the composer, outside the transcript entirely. An adapter may leave it out —
+ *   the popup's field is editable and blank is a valid answer, which beats guessing
+ *   at a label that means something else (see `readModel`). Paired with
+ *   `modelAttribute`, the name is read off an attribute instead of the element's
+ *   text, for an app that records the model in its markup but never prints it
+ *   (see the ChatGPT adapter).
  *
  * Every selector is matched across the *composed* tree: `deepQueryAll` descends
  * into open shadow roots, so an app that renders entirely inside web components
@@ -79,6 +88,10 @@
           ".font-claude-message",
         ],
       },
+      // The picker below the composer, whose label is the model in force for the
+      // thread ("Opus 4.5"). It reads the *current* selection, not what answered an
+      // older turn — switching models mid-conversation reports the one now selected.
+      model: ['[data-testid="model-selector-dropdown"]', 'button[data-testid*="model-selector"]'],
       // A web-grounded answer cites inline: every source is its own chip anchored at
       // the end of the sentence it supports, so there is no chip *group* to open —
       // the link is the citation. `.standard-markdown` is the answer body, which is
@@ -112,6 +125,14 @@
         user: ["user-query .query-text", "user-query"],
         model: ["model-response message-content", "model-response"],
       },
+      // The mode pill in the header, whose label is the model ("2.5 Pro", "2.5 Flash").
+      // Beware `roles.model` above — same word, unrelated: that one matches answer
+      // bubbles, this one the picker naming the model behind them.
+      model: [
+        "bard-mode-switcher .logo-pill-label-container",
+        "bard-mode-switcher button",
+        ".gds-mode-switch-button",
+      ],
       // Angular CDK hides these from sight but not from `innerText`. The first sits
       // inside `.query-text`, so it leaks on the primary selector; the rest only
       // surface if a reskin drops us to the fallback candidates.
@@ -158,6 +179,17 @@
       // collect. Declared for the day a reskin makes `content` miss and a whole
       // bubble gets read instead.
       chrome: [".sr-only", ".citation-slot"],
+      // The `md-text-button` model picker. Its label is *light* DOM slotted into the
+      // button's shadow root, so `deepQueryAll` reaches it by walking children —
+      // no `content` indirection needed here.
+      //
+      // Both candidates land on `.model-selector-label`, the innermost div wrapping
+      // just "2.5 Pro", rather than on the button or the label *container*: those two
+      // also enclose the trailing `md-icon`, whose ligature text ("keyboard_arrow_down")
+      // renders as a chevron but reads back as those literal words. The scoped
+      // candidate is first so a dropdown listing every model cannot win over the
+      // button showing the current one.
+      model: [".action-model-selector .model-selector-label", ".model-selector-label"],
     },
     {
       id: "copilot",
@@ -186,6 +218,63 @@
         ".fai-CopilotMessage__actions", // copy / feedback / sources bar below it
         '[data-testid="foot-note-div"]',
       ],
+      // The model switcher by the composer, whose text is the model ("Opus"). Not to
+      // be confused with `.fai-CopilotMessage__name` above an answer: that badge is
+      // the *agent* persona, which is why it stays in `chrome` and not here.
+      //
+      // The id first because it is the only part of that button that is neither
+      // hashed nor translated — Fluent generates every class on it (`f1c21dwh`, …)
+      // and those change on any restyle, while `aria-label` is user-visible text that
+      // a Spanish UI renders as "Selector de modelo". The label is still worth keeping
+      // below it for the day the id changes.
+      model: ["#gptModeSwitcher", '[aria-label="Model Selector"]'],
+    },
+    {
+      id: "chatgpt",
+      label: "ChatGPT",
+      platform: "chatgpt",
+      // `chat.openai.com` still resolves and redirects here, so a thread bookmarked
+      // before the rename lands on the old host; matching both costs nothing.
+      host: /(^|\.)chatgpt\.com$|(^|\.)chat\.openai\.com$/,
+      roles: {
+        // One attribute carries the role for both sides, and it is the most stable
+        // handle this page offers: everything around it is either a Tailwind utility
+        // (`whitespace-pre-wrap` on a question, `markdown prose` on an answer) or a
+        // hashed class, both of which change on any restyle.
+        //
+        // The node it lands on holds the message and nothing else — the accessible
+        // heading and the copy/feedback bar are siblings of it, not children, so
+        // neither reaches the text. The `.markdown` body one level in is deliberately
+        // not the target anyway: matching the outer node is what keeps an answer
+        // rendered as several blocks in one message. Neither role ever contains the
+        // other, so DOM order is turn order.
+        user: ['[data-message-author-role="user"]'],
+        model: ['[data-message-author-role="assistant"]'],
+      },
+      // Read off the answer itself, not off a picker — the one adapter here that can.
+      // ChatGPT stamps every assistant message with the slug of the model that
+      // produced it (`gpt-5-6-thinking`), while its switcher is an unlabelled icon
+      // button whose only text is the product name in the header. So the usual target
+      // does not exist, and this one is *better* than the usual target: the other four
+      // adapters report whatever the picker shows at capture time, whereas this is the
+      // model that actually answered.
+      //
+      // A slug, not a display name ("gpt-5-6-thinking", not "ChatGPT 5.1 Thinking"),
+      // which is the more precise of the two and survives a marketing rename. The
+      // popup's field is editable if you would rather store the label.
+      //
+      // Only assistant messages carry the attribute, so the selector cannot land on a
+      // question. `readModel` takes the first match, i.e. the model behind the *first*
+      // answer in the thread; a conversation whose model was switched halfway reports
+      // the one it started with.
+      model: ["[data-message-model-slug]"],
+      modelAttribute: "data-message-model-slug",
+      // The turn's accessible heading ("Tú dijiste:", "ChatGPT dijo:"), and with it
+      // the copy/feedback bar's labels. Both render *beside* the message node rather
+      // than inside it, so neither reaches `innerText` from there today; declared for
+      // the day a reskin moves them in, where it costs nothing — an element that
+      // contributes no text removes no lines.
+      chrome: [".sr-only"],
     },
   ];
 
@@ -228,7 +317,7 @@
       if (!adapter) {
         return {
           ok: false,
-          error: "Esta página no es un chat compatible (Copilot, Gemini o Claude).",
+          error: "Esta página no es un chat compatible (Copilot, Gemini, Claude o ChatGPT).",
           url: location.href,
           title: document.title,
         };
@@ -240,6 +329,9 @@
         adapter: { id: adapter.id, label: adapter.label, platform: adapter.platform },
         url: location.href,
         title: document.title,
+        // "" when this adapter declares no `model` or nothing matched; the popup
+        // treats that as "unknown" and lets the user fill it in.
+        model: readModel(adapter),
         messages,
       };
     } catch (error) {
@@ -250,6 +342,39 @@
   /** The adapter whose host matches `location`. */
   function findAdapter(location) {
     return ADAPTERS.find((adapter) => adapter.host.test(location.hostname)) ?? null;
+  }
+
+  /**
+   * The model named by this adapter's `model` selectors, or `""`.
+   *
+   * Searched across the whole `document`, unlike every other selector here: the model
+   * picker sits by the composer, outside the transcript. Candidates are tried in
+   * order and the first *non-empty* match wins, so a stale candidate that still
+   * matches an empty placeholder does not shadow a working one below it.
+   *
+   * With `modelAttribute` the name is taken from that attribute rather than from the
+   * element's text — the only way to read an app that knows which model answered but
+   * never prints it (ChatGPT tags the answer `data-message-model-slug` and leaves its
+   * switcher an unlabelled icon). Everything below applies the same either way.
+   *
+   * Only the first line is kept and its whitespace collapsed — these pickers stack a
+   * chevron glyph and often a subtitle ("Modelo más capaz") under the name, none of
+   * which belongs in a model label. Truncated to the column width the API stores.
+   */
+  function readModel(adapter) {
+    for (const selector of adapter.model ?? []) {
+      for (const element of deepQueryAll(selector, document)) {
+        const source = adapter.modelAttribute
+          ? element.getAttribute(adapter.modelAttribute)
+          : element.innerText ?? element.textContent;
+        const text = (source ?? "")
+          .split("\n")[0]
+          .replace(/\s+/g, " ")
+          .trim();
+        if (text) return text.slice(0, 128);
+      }
+    }
+    return "";
   }
 
   /**

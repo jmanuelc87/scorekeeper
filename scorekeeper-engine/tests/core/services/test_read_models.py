@@ -168,8 +168,34 @@ async def test_retrieve_scenario_granularity_adds_scenarios(session: AsyncSessio
     assert scenario["scenario_id"] == "esc1"
     assert scenario["use_case"] == "default"
     assert scenario["status"] == "completado"
+    # A spreadsheet never names the model that answered.
+    assert scenario["model_name"] is None
     # Scenario granularity does not descend into turns.
     assert "turns" not in scenario
+
+
+async def test_scenario_serialization_exposes_the_captured_model(
+    session: AsyncSession, registry
+) -> None:
+    """A capture that reported a model surfaces it in the scenario projection."""
+    await ingest_evaluation(
+        "claude",
+        [
+            UploadedFile(
+                filename="https://claude.ai/chat/abc",
+                content=b"{}",
+                scenario_id="esc-modelo",
+                messages=[{"role": "user", "content": "hola"}],
+                model_name="Claude Opus 4.5",
+            )
+        ],
+        session=session,
+    )
+
+    runs = await retrieve_runs(granularity="scenario_results", session=session)
+
+    scenario = runs[0]["platforms"][0]["scenario_results"][0]
+    assert scenario["model_name"] == "Claude Opus 4.5"
 
 
 async def test_retrieve_metric_granularity_adds_turns_and_scores(session: AsyncSession, registry) -> None:
