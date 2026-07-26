@@ -7,10 +7,10 @@
  */
 
 import {
-  RUNS_KEY,
-  STATUS_LABELS,
   getSettings,
   normalizeChatUrl,
+  RUNS_KEY,
+  STATUS_LABELS,
   slugify,
   timestamp,
 } from "../config.js";
@@ -86,7 +86,9 @@ async function init() {
   activeTabId = tab.id;
   activeTabUrl = tab.url ?? null;
   // Render once the tab URL is known, so the open chat's detail panel appears.
-  void send({ type: "state" }).then(render).catch(() => {});
+  void send({ type: "state" })
+    .then(render)
+    .catch(() => {});
 
   let capture;
   try {
@@ -168,9 +170,7 @@ function render(runs) {
   if (!Array.isArray(runs)) return;
 
   const current = normalizeChatUrl(activeTabUrl);
-  const run = current
-    ? runs.find((entry) => normalizeChatUrl(entry.sourceUrl) === current)
-    : null;
+  const run = current ? runs.find((entry) => normalizeChatUrl(entry.sourceUrl) === current) : null;
 
   detailRunId = run?.runId ?? null;
   ui.run.hidden = !run;

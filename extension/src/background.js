@@ -12,13 +12,7 @@
  * extra allowed origin. The same request from a content script would not be.
  */
 
-import {
-  TERMINAL_STATUSES,
-  getRun,
-  getRuns,
-  getSettings,
-  upsertRun,
-} from "./config.js";
+import { getRun, getRuns, getSettings, TERMINAL_STATUSES, upsertRun } from "./config.js";
 
 /** Injected on demand; deliberately not a declared content script. */
 const CAPTURE_FILE = "src/content/capture.js";

@@ -35,7 +35,9 @@ chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes[RUNS_KEY]) render(changes[RUNS_KEY].newValue);
 });
 
-void send({ type: "state" }).then(render).catch(() => {});
+void send({ type: "state" })
+  .then(render)
+  .catch(() => {});
 
 /** Render the run history, or the empty notice when there is none. */
 function render(runs) {
