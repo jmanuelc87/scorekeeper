@@ -66,6 +66,9 @@ class CaptureConversation(BaseModel):
     # Overrides the payload-level defaults for just this conversation.
     use_case: str | None = None
     platform: str | None = None
+    # The model that produced the responses, when the client detected it. Stored on
+    # the scenario; None (or blank) means the client could not tell.
+    model_name: str | None = None
     # Where the capture came from (e.g. the chat URL); stored as the source ref.
     source_ref: str | None = None
 

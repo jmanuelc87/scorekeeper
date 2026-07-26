@@ -26,7 +26,7 @@
  * candidate still matches. When a platform stops capturing, open its chat, find
  * the element wrapping a single message bubble, and add its selector here.
  *
- * Three optional per-adapter fields go beyond the message bubbles:
+ * Four optional per-adapter fields go beyond the message bubbles:
  *
  * - `content` — selectors for the text container *inside* a matched bubble, for
  *   apps whose role selector lands on a wrapper rather than on the text itself
@@ -42,6 +42,12 @@
  *   while the message text is read and their lines dropped from it; see `readText`
  *   and `hideChrome`. Listing an element here that also appears under `citations`
  *   is the normal way to keep a chip's URL while dropping its label from the prose.
+ * - `model` — where the app names the model answering, so the capture can report it
+ *   ("Claude Opus 4.5", "2.5 Pro"). Alone among these it is resolved against
+ *   `document` rather than inside a bubble: the model picker is page furniture next
+ *   to the composer, outside the transcript entirely. An adapter may leave it out —
+ *   the popup's field is editable and blank is a valid answer, which beats guessing
+ *   at a label that means something else (see `readModel`).
  *
  * Every selector is matched across the *composed* tree: `deepQueryAll` descends
  * into open shadow roots, so an app that renders entirely inside web components
@@ -79,6 +85,10 @@
           ".font-claude-message",
         ],
       },
+      // The picker below the composer, whose label is the model in force for the
+      // thread ("Opus 4.5"). It reads the *current* selection, not what answered an
+      // older turn — switching models mid-conversation reports the one now selected.
+      model: ['[data-testid="model-selector-dropdown"]', 'button[data-testid*="model-selector"]'],
       // A web-grounded answer cites inline: every source is its own chip anchored at
       // the end of the sentence it supports, so there is no chip *group* to open —
       // the link is the citation. `.standard-markdown` is the answer body, which is
@@ -112,6 +122,14 @@
         user: ["user-query .query-text", "user-query"],
         model: ["model-response message-content", "model-response"],
       },
+      // The mode pill in the header, whose label is the model ("2.5 Pro", "2.5 Flash").
+      // Beware `roles.model` above — same word, unrelated: that one matches answer
+      // bubbles, this one the picker naming the model behind them.
+      model: [
+        "bard-mode-switcher .logo-pill-label-container",
+        "bard-mode-switcher button",
+        ".gds-mode-switch-button",
+      ],
       // Angular CDK hides these from sight but not from `innerText`. The first sits
       // inside `.query-text`, so it leaks on the primary selector; the rest only
       // surface if a reskin drops us to the fallback candidates.
@@ -158,6 +176,17 @@
       // collect. Declared for the day a reskin makes `content` miss and a whole
       // bubble gets read instead.
       chrome: [".sr-only", ".citation-slot"],
+      // The `md-text-button` model picker. Its label is *light* DOM slotted into the
+      // button's shadow root, so `deepQueryAll` reaches it by walking children —
+      // no `content` indirection needed here.
+      //
+      // Both candidates land on `.model-selector-label`, the innermost div wrapping
+      // just "2.5 Pro", rather than on the button or the label *container*: those two
+      // also enclose the trailing `md-icon`, whose ligature text ("keyboard_arrow_down")
+      // renders as a chevron but reads back as those literal words. The scoped
+      // candidate is first so a dropdown listing every model cannot win over the
+      // button showing the current one.
+      model: [".action-model-selector .model-selector-label", ".model-selector-label"],
     },
     {
       id: "copilot",
@@ -186,6 +215,16 @@
         ".fai-CopilotMessage__actions", // copy / feedback / sources bar below it
         '[data-testid="foot-note-div"]',
       ],
+      // The model switcher by the composer, whose text is the model ("Opus"). Not to
+      // be confused with `.fai-CopilotMessage__name` above an answer: that badge is
+      // the *agent* persona, which is why it stays in `chrome` and not here.
+      //
+      // The id first because it is the only part of that button that is neither
+      // hashed nor translated — Fluent generates every class on it (`f1c21dwh`, …)
+      // and those change on any restyle, while `aria-label` is user-visible text that
+      // a Spanish UI renders as "Selector de modelo". The label is still worth keeping
+      // below it for the day the id changes.
+      model: ["#gptModeSwitcher", '[aria-label="Model Selector"]'],
     },
   ];
 
@@ -240,6 +279,9 @@
         adapter: { id: adapter.id, label: adapter.label, platform: adapter.platform },
         url: location.href,
         title: document.title,
+        // "" when this adapter declares no `model` or nothing matched; the popup
+        // treats that as "unknown" and lets the user fill it in.
+        model: readModel(adapter),
         messages,
       };
     } catch (error) {
@@ -250,6 +292,31 @@
   /** The adapter whose host matches `location`. */
   function findAdapter(location) {
     return ADAPTERS.find((adapter) => adapter.host.test(location.hostname)) ?? null;
+  }
+
+  /**
+   * The model named by this adapter's `model` selectors, or `""`.
+   *
+   * Searched across the whole `document`, unlike every other selector here: the model
+   * picker sits by the composer, outside the transcript. Candidates are tried in
+   * order and the first *non-empty* match wins, so a stale candidate that still
+   * matches an empty placeholder does not shadow a working one below it.
+   *
+   * Only the first line is kept and its whitespace collapsed — these pickers stack a
+   * chevron glyph and often a subtitle ("Modelo más capaz") under the name, none of
+   * which belongs in a model label. Truncated to the column width the API stores.
+   */
+  function readModel(adapter) {
+    for (const selector of adapter.model ?? []) {
+      for (const element of deepQueryAll(selector, document)) {
+        const text = (element.innerText ?? element.textContent ?? "")
+          .split("\n")[0]
+          .replace(/\s+/g, " ")
+          .trim();
+        if (text) return text.slice(0, 128);
+      }
+    }
+    return "";
   }
 
   /**

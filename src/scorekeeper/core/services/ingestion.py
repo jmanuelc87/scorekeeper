@@ -50,6 +50,9 @@ class UploadedFile:
     scrapes turns straight off a chat UI, so there is no spreadsheet to parse). When
     set, ``content`` is not parsed and only feeds the ``SourceFile`` hash — pass the
     serialized capture so the provenance hash still identifies the input.
+
+    ``model_name`` is the model that produced the responses, when the client knows it;
+    only a browser capture ever does, so the spreadsheet path leaves it ``None``.
     """
 
     filename: str
@@ -58,6 +61,7 @@ class UploadedFile:
     use_case: str = DEFAULT_USE_CASE
     platform: str | None = None
     messages: list[dict[str, Any]] | None = None
+    model_name: str | None = None
 
 
 def project_turns(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -175,6 +179,7 @@ async def ingest_evaluation(
                 scenario = ScenarioResult(
                     scenario_id=upload.scenario_id,
                     use_case=upload.use_case,
+                    model_name=upload.model_name,
                     source_ref=upload.filename,
                     raw_conversation={"messages": messages},
                     platform_execution=platform_exec,

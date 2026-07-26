@@ -22,6 +22,11 @@
         <input id="platform" name="platform" required autocomplete="off" />
       </label>
       <label>
+        Modelo
+        <input id="model" name="model" autocomplete="off" />
+        <small>Se detecta cuando el chat lo muestra; déjalo vacío si no lo sabes.</small>
+      </label>
+      <label>
         Escenario
         <input id="scenario" name="scenario" required autocomplete="off" />
       </label>
@@ -42,6 +47,8 @@
         <dd><span id="runStatus" class="badge"></span></dd>
         <dt>Escenario</dt>
         <dd id="runScenario"></dd>
+        <dt>Modelo</dt>
+        <dd id="runModel">—</dd>
         <dt>Avance</dt>
         <dd id="runProgress">—</dd>
         <dt>Promedio</dt>

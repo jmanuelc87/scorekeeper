@@ -90,6 +90,50 @@ async def test_captures_endpoint_per_conversation_overrides(monkeypatch) -> None
     assert upload.filename == "esc1"
 
 
+async def test_captures_endpoint_carries_the_detected_model(monkeypatch) -> None:
+    """``model_name`` reaches the upload; a blank or absent one means unknown."""
+    captured: dict = {}
+
+    async def fake_ingest(platform, files, **kw):
+        captured.update(files=files)
+        return "run-cap"
+
+    monkeypatch.setattr(ingestion, "ingest_evaluation", fake_ingest)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/captures",
+            json={
+                "platform": "claude",
+                "conversations": [
+                    {
+                        "scenario_id": "esc-detectado",
+                        "model_name": "Claude Opus 4.5",
+                        "messages": [{"role": "user", "content": "Hola"}],
+                    },
+                    # The popup's field cleared by hand.
+                    {
+                        "scenario_id": "esc-vacio",
+                        "model_name": "   ",
+                        "messages": [{"role": "user", "content": "Hola"}],
+                    },
+                    # Nothing detected and nothing typed: the key never arrives.
+                    {
+                        "scenario_id": "esc-omitido",
+                        "messages": [{"role": "user", "content": "Hola"}],
+                    },
+                ],
+            },
+        )
+
+    assert response.status_code == 202
+    assert [upload.model_name for upload in captured["files"]] == [
+        "Claude Opus 4.5",
+        None,
+        None,
+    ]
+
+
 async def test_captures_endpoint_rejects_contentless_conversation() -> None:
     with TestClient(app) as client:
         response = client.post(

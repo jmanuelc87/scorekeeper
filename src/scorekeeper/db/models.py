@@ -131,6 +131,11 @@ class ScenarioResult(Base):
     use_case: Mapped[str] = mapped_column(
         String(128), default="default", server_default="default"
     )
+    # The model that generated the responses in this conversation ("Claude Opus 4.5",
+    # "2.5 Pro"), as reported by the capturing client. None when the client did not
+    # know it: an .xlsx upload never does, and neither does a chat UI that stopped
+    # exposing its model picker.
+    model_name: Mapped[str | None] = mapped_column(String(128), default=None)
     # Provenance of the conversation: a sheet name, conversation key or row range
     # for a file import, or the full chat URL for a live browser capture. Unbounded
     # because a captured URL (Copilot threads carry request ids and origin params)

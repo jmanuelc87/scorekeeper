@@ -70,6 +70,7 @@ erDiagram
         UUID platform_execution_id FK
         String scenario_id
         String use_case
+        String model_name
         String source_ref
         String status
         String screenshot_path
@@ -219,6 +220,7 @@ One conversation loaded from the source file for a use case.
 | `platform_execution_id` | UUID | FK → `platform_executions.id`, `ON DELETE CASCADE`. |
 | `scenario_id` | String(128) | Identifier of the scenario / use case tested. |
 | `use_case` | String(128) | Human-readable use case label. |
+| `model_name` | String(128) | The model that generated the responses (`"Claude Opus 4.5"`, `"2.5 Pro"`), as reported by the capturing client. `NULL` when unknown — an `.xlsx` import never carries one, and the browser extension leaves it empty when the chat does not name its model. |
 | `source_ref` | String(256) | Reference into the source file: sheet name, conversation key, or row range. |
 | `status` | String(32) | Scenario lifecycle status. |
 | `screenshot_path` | String(512) | Path to a stored screenshot (binary kept on disk, not in the DB). |

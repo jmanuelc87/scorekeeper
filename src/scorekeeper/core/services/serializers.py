@@ -142,6 +142,9 @@ def _serialize_scenario(
         "id": str(scenario.id),
         "scenario_id": scenario.scenario_id,
         "use_case": scenario.use_case,
+        # The model that answered, when the capturing client reported one; null for
+        # every .xlsx import.
+        "model_name": scenario.model_name,
         "status": scenario.status,
         "average_score": scenario.average_score,
     }

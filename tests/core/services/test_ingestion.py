@@ -396,6 +396,37 @@ async def test_captured_messages_reach_turns_without_a_spreadsheet(session: Asyn
     assert str(run.status) == "ingerido"
 
 
+async def test_captured_model_lands_on_the_scenario(session: AsyncSession) -> None:
+    """The capturing client's model is stored per scenario; an upload without one is NULL."""
+    await ingest_evaluation(
+        "claude",
+        [
+            UploadedFile(
+                filename="https://claude.ai/chat/abc",
+                content=b"{}",
+                scenario_id="esc-con-modelo",
+                messages=[{"role": "user", "content": "Hola"}],
+                model_name="Claude Opus 4.5",
+            ),
+            UploadedFile(
+                filename="https://claude.ai/chat/def",
+                content=b"{}",
+                scenario_id="esc-sin-modelo",
+                messages=[{"role": "user", "content": "Hola"}],
+            ),
+        ],
+        session=session,
+    )
+
+    scenarios = (
+        await session.scalars(select(ScenarioResult).order_by(ScenarioResult.scenario_id))
+    ).all()
+    assert [(s.scenario_id, s.model_name) for s in scenarios] == [
+        ("esc-con-modelo", "Claude Opus 4.5"),
+        ("esc-sin-modelo", None),
+    ]
+
+
 async def test_captured_citations_reach_turn_context(session: AsyncSession) -> None:
     """Sources scraped off a chat UI land on the turn as ``retrieved_context_source``.
 
