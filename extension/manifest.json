@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Scorekeeper Capture",
   "version": "0.1.0",
-  "description": "Captura conversaciones de Copilot, Gemini y Claude y las envía a Scorekeeper para evaluarlas.",
+  "description": "Captura conversaciones de Copilot, Gemini, Claude y ChatGPT y las envía a Scorekeeper para evaluarlas.",
   "icons": {
     "16": "icons/icon16.png",
     "32": "icons/icon32.png",

@@ -1,7 +1,7 @@
 # Scorekeeper Capture (extensión de Chrome)
 
-Captures the conversation open in Copilot, Gemini (consumer or Enterprise) or
-Claude and sends it to the Scorekeeper API for scoring — the live-session counterpart to uploading a
+Captures the conversation open in Copilot, Gemini (consumer or Enterprise), Claude
+or ChatGPT and sends it to the Scorekeeper API for scoring — the live-session counterpart to uploading a
 conversation `.xlsx`. It is a Manifest V3 extension with no build step and no
 dependencies: the folder is loaded as-is.
 
@@ -27,6 +27,9 @@ so the options page asks for it when you save.
    id (page title + timestamp) and the default use case.
 3. Adjust the metadata and press **Enviar a Scorekeeper**.
 
+On a page that is not a supported chat — or a supported chat with no conversation
+open — the popup states why instead, and **Enviar a Scorekeeper** stays disabled.
+
 The popup keeps a local history of the runs submitted from this browser. Its
 **Última evaluación** panel shows the run for the open chat only — matched on the
 chat URL (ignoring `?query` and `#hash`) — and its **Evaluaciones** link opens a
@@ -45,6 +48,7 @@ scores, comparisons — is in the API (`GET /runs`) and the dashboard.
 | `gemini` | `gemini.google.com` | `gemini` | yes — the mode pill in the header |
 | `gemini-business` | `business.gemini.google` (Gemini Enterprise) | `gemini` | yes — the `md-text-button` picker |
 | `copilot` | `copilot.microsoft.com`, `m365.cloud.microsoft` | `copilot` | yes — the model switcher by the composer |
+| `chatgpt` | `chatgpt.com`, `chat.openai.com` | `chatgpt` | yes — the slug on the answer itself |
 
 The platform is only a default — edit it in the popup before sending if you are
 benchmarking under another name. The same goes for the model: see
@@ -165,7 +169,19 @@ than inside a message bubble: the picker is page furniture next to the composer,
 part of the transcript. That also means it reads the model **currently selected**, so
 a thread whose model was switched halfway reports the one in force at capture time.
 
-All four adapters declare one today, but the field stays optional: an adapter whose
+An adapter may pair `model` with **`modelAttribute`**, and then the name is read from
+that attribute rather than from the element's text. Only ChatGPT needs it, because
+only ChatGPT records the model without ever printing it: its switcher is an
+unlabelled icon button (`aria-label="Switch model"`, no text at all) whose menu is
+closed, while every assistant message carries
+`data-message-model-slug="gpt-5-6-thinking"`. That inverts the usual trade-off — the
+attribute names the model that **actually answered**, not whatever the picker happens
+to show now — at the cost of reporting a slug rather than a display name
+(`gpt-5-6-thinking`, not "ChatGPT 5.1 Thinking"), which is the more precise of the
+two anyway. Since `readModel` takes the first match, a thread whose model changed
+halfway reports the one behind its *first* answer.
+
+All five adapters declare one today, but the field stays optional: an adapter whose
 picker cannot be read reports `""`, the popup's **Modelo** field comes up empty, and
 the API stores `NULL` unless you type one. A blank field is a valid answer — better
 than a label that names the wrong thing. Copilot's `.fai-CopilotMessage__name` badge
@@ -258,6 +274,13 @@ platform stores its URLs, and there are two shapes:
 For Microsoft Copilot the URLs sit on the inline citation chips as a JSON
 `data-grouped-citations` attribute. The visible "Sources" flyout is a dead end —
 it stays collapsed until clicked and contains only the word "Sources".
+
+ChatGPT declares no `citations` block, because its chip markup has not been read yet
+— the page the adapter was built against holds no web-search answer. Adding one needs
+a marker that separates a source chip from a link the model wrote itself: without
+that, capture would ground an answer against its own output and score every turn as
+perfectly faithful. Until someone inspects a grounded ChatGPT answer and finds such
+an attribute, ChatGPT captures carry no `retrieved_context` (see [Limits](#limits)).
 
 Gemini Enterprise instead keeps them in the popover each chip opens, inside the
 chip's own shadow root: `a.single-popover-link` when the chip cites one source,

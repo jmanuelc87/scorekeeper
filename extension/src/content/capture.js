@@ -47,7 +47,10 @@
  *   `document` rather than inside a bubble: the model picker is page furniture next
  *   to the composer, outside the transcript entirely. An adapter may leave it out —
  *   the popup's field is editable and blank is a valid answer, which beats guessing
- *   at a label that means something else (see `readModel`).
+ *   at a label that means something else (see `readModel`). Paired with
+ *   `modelAttribute`, the name is read off an attribute instead of the element's
+ *   text, for an app that records the model in its markup but never prints it
+ *   (see the ChatGPT adapter).
  *
  * Every selector is matched across the *composed* tree: `deepQueryAll` descends
  * into open shadow roots, so an app that renders entirely inside web components
@@ -226,6 +229,53 @@
       // below it for the day the id changes.
       model: ["#gptModeSwitcher", '[aria-label="Model Selector"]'],
     },
+    {
+      id: "chatgpt",
+      label: "ChatGPT",
+      platform: "chatgpt",
+      // `chat.openai.com` still resolves and redirects here, so a thread bookmarked
+      // before the rename lands on the old host; matching both costs nothing.
+      host: /(^|\.)chatgpt\.com$|(^|\.)chat\.openai\.com$/,
+      roles: {
+        // One attribute carries the role for both sides, and it is the most stable
+        // handle this page offers: everything around it is either a Tailwind utility
+        // (`whitespace-pre-wrap` on a question, `markdown prose` on an answer) or a
+        // hashed class, both of which change on any restyle.
+        //
+        // The node it lands on holds the message and nothing else — the accessible
+        // heading and the copy/feedback bar are siblings of it, not children, so
+        // neither reaches the text. The `.markdown` body one level in is deliberately
+        // not the target anyway: matching the outer node is what keeps an answer
+        // rendered as several blocks in one message. Neither role ever contains the
+        // other, so DOM order is turn order.
+        user: ['[data-message-author-role="user"]'],
+        model: ['[data-message-author-role="assistant"]'],
+      },
+      // Read off the answer itself, not off a picker — the one adapter here that can.
+      // ChatGPT stamps every assistant message with the slug of the model that
+      // produced it (`gpt-5-6-thinking`), while its switcher is an unlabelled icon
+      // button whose only text is the product name in the header. So the usual target
+      // does not exist, and this one is *better* than the usual target: the other four
+      // adapters report whatever the picker shows at capture time, whereas this is the
+      // model that actually answered.
+      //
+      // A slug, not a display name ("gpt-5-6-thinking", not "ChatGPT 5.1 Thinking"),
+      // which is the more precise of the two and survives a marketing rename. The
+      // popup's field is editable if you would rather store the label.
+      //
+      // Only assistant messages carry the attribute, so the selector cannot land on a
+      // question. `readModel` takes the first match, i.e. the model behind the *first*
+      // answer in the thread; a conversation whose model was switched halfway reports
+      // the one it started with.
+      model: ["[data-message-model-slug]"],
+      modelAttribute: "data-message-model-slug",
+      // The turn's accessible heading ("Tú dijiste:", "ChatGPT dijo:"), and with it
+      // the copy/feedback bar's labels. Both render *beside* the message node rather
+      // than inside it, so neither reaches `innerText` from there today; declared for
+      // the day a reskin moves them in, where it costs nothing — an element that
+      // contributes no text removes no lines.
+      chrome: [".sr-only"],
+    },
   ];
 
   /**
@@ -267,7 +317,7 @@
       if (!adapter) {
         return {
           ok: false,
-          error: "Esta página no es un chat compatible (Copilot, Gemini o Claude).",
+          error: "Esta página no es un chat compatible (Copilot, Gemini, Claude o ChatGPT).",
           url: location.href,
           title: document.title,
         };
@@ -302,6 +352,11 @@
    * order and the first *non-empty* match wins, so a stale candidate that still
    * matches an empty placeholder does not shadow a working one below it.
    *
+   * With `modelAttribute` the name is taken from that attribute rather than from the
+   * element's text — the only way to read an app that knows which model answered but
+   * never prints it (ChatGPT tags the answer `data-message-model-slug` and leaves its
+   * switcher an unlabelled icon). Everything below applies the same either way.
+   *
    * Only the first line is kept and its whitespace collapsed — these pickers stack a
    * chevron glyph and often a subtitle ("Modelo más capaz") under the name, none of
    * which belongs in a model label. Truncated to the column width the API stores.
@@ -309,7 +364,10 @@
   function readModel(adapter) {
     for (const selector of adapter.model ?? []) {
       for (const element of deepQueryAll(selector, document)) {
-        const text = (element.innerText ?? element.textContent ?? "")
+        const source = adapter.modelAttribute
+          ? element.getAttribute(adapter.modelAttribute)
+          : element.innerText ?? element.textContent;
+        const text = (source ?? "")
           .split("\n")[0]
           .replace(/\s+/g, " ")
           .trim();
