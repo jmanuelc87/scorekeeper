@@ -1,0 +1,22 @@
+{
+  "name": "scorekeeper-capture",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Dev tooling for the Scorekeeper Capture extension. Nothing here is needed to run it — the folder is still loaded unpacked as-is.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "lint": "biome check src tests",
+    "lint:fix": "biome check --write src tests",
+    "format": "biome format --write src tests",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "package": "mkdir -p dist && rm -f dist/scorekeeper-capture.zip && zip -r dist/scorekeeper-capture.zip manifest.json icons src"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.5",
+    "vitest": "^4.1.10"
+  }
+}

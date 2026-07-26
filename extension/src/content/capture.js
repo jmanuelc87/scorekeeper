@@ -201,7 +201,11 @@
         // `copilot-message-div` around `copilot-message-reply-div`. Selecting either
         // outer node would swallow the other role's bubble, so match the inner ones:
         // these two never contain each other, which keeps DOM order == turn order.
-        user: ['[data-testid="chatQuestion"]', '[data-content="user-message"]', '[data-testid="user-message"]'],
+        user: [
+          '[data-testid="chatQuestion"]',
+          '[data-content="user-message"]',
+          '[data-testid="user-message"]',
+        ],
         model: [
           '[data-testid="copilot-message-reply-div"]',
           '[data-content="ai-message"]',
@@ -366,11 +370,8 @@
       for (const element of deepQueryAll(selector, document)) {
         const source = adapter.modelAttribute
           ? element.getAttribute(adapter.modelAttribute)
-          : element.innerText ?? element.textContent;
-        const text = (source ?? "")
-          .split("\n")[0]
-          .replace(/\s+/g, " ")
-          .trim();
+          : (element.innerText ?? element.textContent);
+        const text = (source ?? "").split("\n")[0].replace(/\s+/g, " ").trim();
         if (text) return text.slice(0, 128);
       }
     }
@@ -393,7 +394,9 @@
     const nodes = deepQueryAll(combined, document);
     // A bubble can contain another matching node (e.g. a quoted message); keep only
     // the outermost ones so nothing is captured twice.
-    const outermost = nodes.filter((node) => !nodes.some((other) => other !== node && deepContains(other, node)));
+    const outermost = nodes.filter(
+      (node) => !nodes.some((other) => other !== node && deepContains(other, node)),
+    );
 
     return outermost
       .map((node) => {
@@ -610,7 +613,12 @@
         // Whether the element had a `style` attribute at all, not just what was in
         // it: writing to `.style` creates an empty one, and leaving that behind on
         // an element styled purely by class would be a change we could not undo.
-        hidden.push([element, element.getAttribute("style"), style.getPropertyValue("display"), style.getPropertyPriority("display")]);
+        hidden.push([
+          element,
+          element.getAttribute("style"),
+          style.getPropertyValue("display"),
+          style.getPropertyPriority("display"),
+        ]);
         style.setProperty("display", "none", "important");
       }
     }

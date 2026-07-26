@@ -2,8 +2,9 @@
 
 Captures the conversation open in Copilot, Gemini (consumer or Enterprise), Claude
 or ChatGPT and sends it to the Scorekeeper API for scoring — the live-session counterpart to uploading a
-conversation `.xlsx`. It is a Manifest V3 extension with no build step and no
-dependencies: the folder is loaded as-is.
+conversation `.xlsx`. It is a Manifest V3 extension with no build step and no runtime
+dependencies: the folder is loaded as-is, and the files Chrome runs are the files in git.
+The `package.json` here is dev-only tooling — lint and tests — never needed to run it.
 
 ## Install
 
@@ -16,6 +17,27 @@ dependencies: the folder is loaded as-is.
 Point it at a different API from the extension's **Ajustes** (options) page. Any
 host other than the default needs a permission Chrome only grants from a click,
 so the options page asks for it when you save.
+
+## Development
+
+Skip this section to just *use* the extension — none of it is required to load it.
+
+```
+npm install         # Biome + Vitest, dev-only
+npm run lint        # Biome: lint + format check over src/ and tests/
+npm run lint:fix    # ...and apply what it can
+npm test            # Vitest over the helpers in src/config.js
+npm run package     # dist/scorekeeper-capture.zip — manifest, icons, src, nothing else
+```
+
+There is no bundler and there must not be one: `src/content/capture.js` has to reach
+Chrome as the classic-script IIFE it is (see below), and every other file is an ES
+module the browser loads directly. `npm run package` zips only what ships, so the
+tooling never ends up in the Web Store upload.
+
+Tests cover `src/config.js` — the module every surface imports — against an in-memory
+`chrome.storage.local` stub. The adapters in `capture.js` are not unit-testable: they
+match somebody else's live markup, so the check for those is still opening a real chat.
 
 ## Use
 
@@ -235,6 +257,9 @@ feedback footer, because none of them are inside it.
 | `src/evaluations/` | Full-page tab: the table of every run, with per-row refresh. |
 | `src/options/` | API URL, default use case, connection test; persisted per browser. |
 | `icons/` | Toolbar and Web Store icons. |
+| `package.json` | Dev-only tooling and scripts; ships nothing. |
+| `biome.json` | Lint + format config (2 spaces, 100 cols, `chrome` as a global). |
+| `tests/` | Vitest over `src/config.js`. |
 
 ## Limits
 
