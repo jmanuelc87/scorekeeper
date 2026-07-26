@@ -8,3 +8,5 @@ __pycache__/
 frontend/node_modules/
 frontend/dist/
 frontend/*.tsbuildinfo
+extension/node_modules/
+extension/dist/
