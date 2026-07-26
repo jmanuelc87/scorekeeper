@@ -6,7 +6,7 @@ is the **Average Precision** of the relevance labels over the ranking — the sa
 set of nodes scores higher when the relevant ones come first.
 
 - Metric name: `contextual_precision`
-- Class: `ContextualPrecision` — `src/scorekeeper/core/metrics/catalog/contextual_precision.py`
+- Class: `ContextualPrecision` — `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/contextual_precision.py`
 - Category: `RAG` · Scale: `Unit()` 0–1 · Weight: 1.0 · **higher is better**
 - Prose reference: [Metrics catalog → `contextual_precision`](../metrics-catalog.md#contextual_precision)
 

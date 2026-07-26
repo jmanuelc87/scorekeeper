@@ -675,22 +675,22 @@ dedicated broker (e.g. Redis) instead of Postgres.
 
 ## Related code
 
-- App factory & router mounting — `src/scorekeeper/main.py`, `src/scorekeeper/api/router.py`
-- Endpoints — `src/scorekeeper/api/v1/` (one module per resource);
-  request/response models — `src/scorekeeper/api/v1/schemas.py`
-- Ingest / retrieve / score split + polling — `src/scorekeeper/core/services/`
+- App factory & router mounting — `scorekeeper-engine/src/scorekeeper/main.py`, `scorekeeper-engine/src/scorekeeper/api/router.py`
+- Endpoints — `scorekeeper-engine/src/scorekeeper/api/v1/` (one module per resource);
+  request/response models — `scorekeeper-engine/src/scorekeeper/api/v1/schemas.py`
+- Ingest / retrieve / score split + polling — `scorekeeper-engine/src/scorekeeper/core/services/`
   (`ingestion.ingest_evaluation`, `runs.set_turn_selection`, `retrieval.retrieve_run`,
   `scoring.score_run`, `runs.get_run_summary`, `scoring.run_evaluation`)
-- Read paths — `src/scorekeeper/core/services/read_models.py` (`retrieve_runs`,
+- Read paths — `scorekeeper-engine/src/scorekeeper/core/services/read_models.py` (`retrieve_runs`,
   `retrieve_scenario_turns`, `retrieve_turn_traces`, `retrieve_turn_token_usage`);
-  their projections — `src/scorekeeper/core/services/serializers.py`
-- Queries — `src/scorekeeper/db/repositories/`; models — `src/scorekeeper/db/models.py`
-- Retrieval orchestrator — `src/scorekeeper/core/retrieval/pipeline.py` (`RetrievalOrchestrator`)
-- Auth-provider CRUD service — `src/scorekeeper/core/retrieval/credentials/service.py`
-- Celery app & tasks — `src/scorekeeper/celery_app.py`, `src/scorekeeper/tasks.py`
+  their projections — `scorekeeper-engine/src/scorekeeper/core/services/serializers.py`
+- Queries — `scorekeeper-engine/src/scorekeeper/db/repositories/`; models — `scorekeeper-engine/src/scorekeeper/db/models.py`
+- Retrieval orchestrator — `scorekeeper-engine/src/scorekeeper/core/retrieval/pipeline.py` (`RetrievalOrchestrator`)
+- Auth-provider CRUD service — `scorekeeper-engine/src/scorekeeper/core/retrieval/credentials/service.py`
+- Celery app & tasks — `scorekeeper-engine/src/scorekeeper/celery_app.py`, `scorekeeper-engine/src/scorekeeper/tasks.py`
   (`run_pipeline_task` = retrieval then scoring; `enqueue_run`)
-- Parsing & message normalization — `src/scorekeeper/core/importer.py`
+- Parsing & message normalization — `scorekeeper-engine/src/scorekeeper/core/importer.py`
   (`parse_conversation`, `normalize_messages`)
 - Browser capture client — `extension/` (see its [README](../extension/README.md))
-- Scoring — `src/scorekeeper/core/runner.py`
-- Metric selection — `src/scorekeeper/core/metrics/selection.py`
+- Scoring — `scorekeeper-engine/src/scorekeeper/core/runner.py`
+- Metric selection — `scorekeeper-engine/src/scorekeeper/core/metrics/selection.py`
