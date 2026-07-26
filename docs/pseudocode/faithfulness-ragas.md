@@ -5,7 +5,7 @@ statements, then verify each one *against the retrieved context*. The score is
 the fraction of statements that can be inferred from the context.
 
 - Metric name: `faithfulness_ragas`
-- Class: `FaithfulnessRagas` — `src/scorekeeper/core/metrics/catalog/faithfulness.py`
+- Class: `FaithfulnessRagas` — `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/faithfulness.py`
 - Category: `RAG` · Scale: `Unit()` 0–1 · Weight: 1.0 · **higher is better**
 - Prose reference: [Metrics catalog → `faithfulness_ragas`](../metrics-catalog.md#faithfulness_ragas)
 

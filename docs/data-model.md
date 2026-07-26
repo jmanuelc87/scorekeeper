@@ -1,7 +1,7 @@
 # Data model
 
 Scorekeeper stores benchmark results as a hierarchy. The SQLAlchemy models live
-in `src/scorekeeper/db/models.py`, and the schema is managed with Alembic (see the
+in `scorekeeper-engine/src/scorekeeper/db/models.py`, and the schema is managed with Alembic (see the
 "Database migrations" section in the [README](../README.md)). For how metrics are
 defined and scored, see [Evaluation metrics](evaluation-metrics.md).
 

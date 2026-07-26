@@ -6,7 +6,6 @@ build-backend = "hatchling.build"
 name = "scorekeeper"
 version = "0.1.0"
 description = "A scorekeeper for AI assistant platform benchmarks with a web results dashboard"
-readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
   "alembic>=1.13,<2",

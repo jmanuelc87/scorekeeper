@@ -6,7 +6,7 @@ document (the **premise**), classify the model's answer (the **hypothesis**) as
 answer contradicts. The score is the **hallucination rate**.
 
 - Metric name: `hallucination`
-- Class: `Hallucination` — `src/scorekeeper/core/metrics/catalog/hallucination.py`
+- Class: `Hallucination` — `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/hallucination.py`
 - Category: `seguridad` · Scale: `Inverted(Unit())` 0–1 · Weight: 1.0 · **higher raw is worse**
 - Prose reference: [Metrics catalog → `hallucination`](../metrics-catalog.md#hallucination)
 

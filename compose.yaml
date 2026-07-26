@@ -16,11 +16,11 @@ services:
       - postgres_data:/var/lib/postgresql/data
 
   migrate:
-    build: .
+    build: scorekeeper-engine
     command: ["alembic", "upgrade", "head"]
     # Base settings (judge keys, etc.) come from .env; the values below override
     # the ones that must differ inside the Docker network (env wins over env_file).
-    env_file: .env
+    env_file: scorekeeper-engine/.env
     environment: &backend-environment
       DATABASE_URL: postgresql+asyncpg://scorekeeper:scorekeeper@database:5432/scorekeeper
     depends_on:
@@ -28,9 +28,9 @@ services:
         condition: service_healthy
 
   api:
-    build: .
+    build: scorekeeper-engine
     command: ["scorekeeper-api"]
-    env_file: .env
+    env_file: scorekeeper-engine/.env
     environment: *backend-environment
     depends_on:
       migrate:
@@ -39,12 +39,12 @@ services:
       - "8001:8001"
 
   worker:
-    build: .
+    build: scorekeeper-engine
     # Consumes the evaluation queue and runs the LLM scoring off the API's request
     # path. Broker is Postgres (kombu SQLAlchemy transport); no ports to expose.
     command:
       ["celery", "-A", "scorekeeper.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=2"]
-    env_file: .env
+    env_file: scorekeeper-engine/.env
     environment: *backend-environment
     depends_on:
       database:
