@@ -35,6 +35,10 @@ from scorekeeper.core.retrieved_context import RetrievedContext, RetrievedDocume
 # some documents failed and ``recuperacion_fallida`` when the phase itself failed.
 STATUS_EN_RECUPERACION = "en_recuperacion"
 
+# URL schemes the pipeline retrieves. Anything else (``mailto:``, ``javascript:``,
+# ``file:``, a bare relative path) is rejected at the orchestrator before authorize/fetch.
+WEB_SCHEMES = frozenset({"http", "https"})
+
 
 class SourceFormat(StrEnum):
     """How the ``retrieved_context`` cell was encoded in the spreadsheet."""
@@ -82,6 +86,7 @@ class RetrievalStatus(StrEnum):
     AUTH_MISSING = "auth_missing"  # auth required, no credentials
     FETCH_FAILED = "fetch_failed"  # network / HTTP error
     UNSUPPORTED_TYPE = "unsupported_type"  # no extractor for the doc type
+    UNSUPPORTED_SCHEME = "unsupported_scheme"  # the URL is not http(s)
     LOCATOR_NOT_FOUND = "locator_not_found"  # requested page/section absent
     EMPTY_CONTENT = "empty_content"  # extracted, but no usable text
     PARSE_ERROR = "parse_error"  # the source reference could not be parsed
@@ -101,7 +106,8 @@ class DocumentLocator(BaseModel):
 
     document_url: str  # URL without the fragment — the fetch / cache key.
     filename: str  # Filename derived from the URL path (e.g. "ReporteFinanciero.pdf").
-    doc_type: DocType
+    doc_type: DocType  # Provisional for an extensionless URL; fetch confirms it.
+    scheme: str = ""  # Lowercased URL scheme; "" when the reference carries none.
     host: str  # URL netloc, used to classify the auth requirement.
     page: int | None = None  # Page from a ``#page=N`` fragment, if any.
     section: str | None = None  # Section/anchor within the document, if any.
@@ -228,7 +234,7 @@ class RetrievalSummary(BaseModel):
     auth_missing: int = 0
     fetch_failed: int = 0
     unsupported: int = 0
-    other: int = 0  # PENDING / LOCATOR_NOT_FOUND / EMPTY_CONTENT / PARSE_ERROR
+    other: int = 0  # PENDING / UNSUPPORTED_SCHEME / LOCATOR_NOT_FOUND / EMPTY_CONTENT / PARSE_ERROR
 
     @classmethod
     def from_outcomes(cls, outcomes: Iterable[RetrievalOutcome]) -> "RetrievalSummary":

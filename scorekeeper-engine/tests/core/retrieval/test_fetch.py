@@ -11,14 +11,34 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.db.models import DocumentCacheEntry
 from scorekeeper.core.retrieval import CachingDocumentFetcher, DocumentFetcher, FetchError
+from scorekeeper.core.retrieval import fetch
 from scorekeeper.core.retrieval.types import DocType, DocumentLocator
 
 
+@pytest.fixture(autouse=True)
+def _public_dns(monkeypatch) -> None:
+    """Resolve every host to a public address, so the target guard allows the fake URLs.
+
+    Tests that exercise the guard itself patch this again with what they need.
+    """
+    monkeypatch.setattr(fetch, "_resolve_addresses", lambda host: ["93.184.216.34"])
+
+
 class _Resp:
-    def __init__(self, *, content: bytes = b"", headers: dict | None = None, status: int = 200):
+    def __init__(
+        self,
+        *,
+        content: bytes = b"",
+        headers: dict | None = None,
+        status: int = 200,
+        location: str | None = None,
+    ):
         self.content = content
-        self.headers = headers or {}
+        self.headers = dict(headers or {})
         self._status = status
+        self.is_redirect = location is not None
+        if location is not None:
+            self.headers["location"] = location
 
     def raise_for_status(self) -> None:
         if self._status >= 400:
@@ -32,10 +52,13 @@ class _FakeHttp:
         self._content = content
         self._content_type = content_type
         self.calls = 0
+        self.urls: list[str] = []
 
     def get(self, url: str) -> _Resp:
         self.calls += 1
-        return _Resp(content=self._content, headers={"content-type": self._content_type})
+        self.urls.append(url)
+        headers = {"content-type": self._content_type} if self._content_type else {}
+        return _Resp(content=self._content, headers=headers)
 
 
 class _FakeClient:
@@ -122,6 +145,124 @@ async def test_fetch_failure_raises_fetch_error(tmp_path: Path, session: AsyncSe
         await fetcher.fetch(_loc("https://pub/fail.pdf"), None)
     # Nothing cached on failure.
     assert await session.scalar(select(func.count()).select_from(DocumentCacheEntry)) == 0
+
+
+# -- document type confirmation ------------------------------------------------
+
+
+async def test_content_type_confirms_the_provisional_type(tmp_path: Path, session: AsyncSession) -> None:
+    # An extensionless page URL arrives as a provisional HTML; the response says PDF, and
+    # the response wins — for the returned document and for what the cache replays.
+    http = _FakeHttp(content_type="application/pdf; charset=binary")
+    fetcher = _fetcher(tmp_path, session, http)
+    locator = _loc("https://pub/descarga", DocType.HTML)
+
+    fetched = await fetcher.fetch(locator, None)
+    assert fetched.doc_type is DocType.PDF
+
+    assert (await fetcher.fetch(locator, None)).doc_type is DocType.PDF  # from the cache
+
+
+async def test_unknown_or_absent_content_type_keeps_the_locator_type(tmp_path: Path, session: AsyncSession) -> None:
+    absent = await _fetcher(tmp_path, session, _FakeHttp(content_type="")).fetch(
+        _loc("https://pub/sin-cabecera", DocType.HTML), None
+    )
+    assert absent.doc_type is DocType.HTML
+
+    unmapped = await _fetcher(tmp_path, session, _FakeHttp(content_type="image/png")).fetch(
+        _loc("https://pub/otra", DocType.HTML), None
+    )
+    assert unmapped.doc_type is DocType.HTML
+
+
+async def test_html_response_overrides_a_pdf_url(tmp_path: Path, session: AsyncSession) -> None:
+    # A .pdf URL that actually serves an HTML error/login page converts as HTML.
+    http = _FakeHttp(content=b"<html>error</html>", content_type="text/html; charset=utf-8")
+    fetched = await _fetcher(tmp_path, session, http).fetch(_loc("https://pub/x.pdf"), None)
+    assert fetched.doc_type is DocType.HTML
+
+
+async def test_authenticated_download_keeps_the_locator_type(tmp_path: Path, session: AsyncSession) -> None:
+    fetched = await _fetcher(tmp_path, session).fetch(_loc("https://sp/y.pdf"), _FakeClient())
+    assert fetched.doc_type is DocType.PDF  # no Content-Type to confirm with
+
+
+# -- redirects and target restriction -------------------------------------------
+
+
+async def test_redirects_are_followed_hop_by_hop(tmp_path: Path, session: AsyncSession) -> None:
+    class _RedirectingHttp(_FakeHttp):
+        def get(self, url: str) -> _Resp:
+            self.calls += 1
+            self.urls.append(url)
+            if url.endswith("/inicio"):
+                return _Resp(location="/final.pdf")  # relative, resolved against the hop
+            return _Resp(content=b"PDF-BYTES", headers={"content-type": "application/pdf"})
+
+    http = _RedirectingHttp()
+    fetched = await _fetcher(tmp_path, session, http).fetch(_loc("https://pub/inicio"), None)
+
+    assert fetched.body == b"PDF-BYTES"
+    assert http.urls == ["https://pub/inicio", "https://pub/final.pdf"]
+
+
+async def test_redirect_loop_gives_up(tmp_path: Path, session: AsyncSession) -> None:
+    class _LoopingHttp(_FakeHttp):
+        def get(self, url: str) -> _Resp:
+            self.calls += 1
+            return _Resp(location="https://pub/siguiente")
+
+    with pytest.raises(FetchError, match="redirecciones"):
+        await _fetcher(tmp_path, session, _LoopingHttp()).fetch(_loc("https://pub/bucle"), None)
+
+
+async def test_private_target_is_refused(tmp_path: Path, session: AsyncSession, monkeypatch) -> None:
+    monkeypatch.setattr(fetch, "_resolve_addresses", lambda host: ["127.0.0.1"])
+    http = _FakeHttp()
+
+    with pytest.raises(FetchError, match="red interna"):
+        await _fetcher(tmp_path, session, http).fetch(_loc("http://localhost/x.pdf"), None)
+
+    assert http.calls == 0  # refused before the request went out
+
+
+async def test_redirect_to_a_private_target_is_refused(tmp_path: Path, session: AsyncSession, monkeypatch) -> None:
+    # The hop that matters is the one the guard would miss if the client followed redirects.
+    monkeypatch.setattr(
+        fetch,
+        "_resolve_addresses",
+        lambda host: ["169.254.169.254"] if host == "metadata" else ["93.184.216.34"],
+    )
+
+    class _RedirectingHttp(_FakeHttp):
+        def get(self, url: str) -> _Resp:
+            self.calls += 1
+            return _Resp(location="http://metadata/latest/meta-data/")
+
+    http = _RedirectingHttp()
+    with pytest.raises(FetchError, match="red interna"):
+        await _fetcher(tmp_path, session, http).fetch(_loc("https://pub/redirige"), None)
+
+    assert http.calls == 1  # the first hop happened, the internal one did not
+
+
+async def test_redirect_to_a_non_web_scheme_is_refused(tmp_path: Path, session: AsyncSession) -> None:
+    class _RedirectingHttp(_FakeHttp):
+        def get(self, url: str) -> _Resp:
+            self.calls += 1
+            return _Resp(location="file:///etc/passwd")
+
+    with pytest.raises(FetchError, match="esquema no soportado"):
+        await _fetcher(tmp_path, session, _RedirectingHttp()).fetch(_loc("https://pub/r"), None)
+
+
+async def test_unresolvable_host_is_a_fetch_error(tmp_path: Path, session: AsyncSession, monkeypatch) -> None:
+    def _boom(host: str) -> list[str]:
+        raise OSError("Name or service not known")
+
+    monkeypatch.setattr(fetch, "_resolve_addresses", _boom)
+    with pytest.raises(FetchError):
+        await _fetcher(tmp_path, session).fetch(_loc("https://no-existe/x.pdf"), None)
 
 
 async def test_distinct_urls_download_separately(tmp_path: Path, session: AsyncSession) -> None:

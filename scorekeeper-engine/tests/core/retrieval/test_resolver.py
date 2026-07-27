@@ -24,6 +24,7 @@ def test_resolve_pdf_with_page_fragment() -> None:
     )
     assert locator.filename == "ReporteFinanciero.pdf"
     assert locator.doc_type is DocType.PDF
+    assert locator.scheme == "https"
     assert locator.host == "cognitactix-my.sharepoint.com"  # lowercased
     assert locator.page == 3
     assert locator.section is None
@@ -64,13 +65,33 @@ def test_resolve_non_page_fragment_becomes_section() -> None:
     assert locator.section == "seccion-2"
 
 
-def test_resolve_extensionless_trailing_slash() -> None:
+def test_resolve_extensionless_http_url_is_provisionally_html() -> None:
+    # An ordinary web page: the URL says nothing, so it is provisionally HTML and the fetch
+    # stage confirms the real type from the response Content-Type.
     resolver = UrlDocumentLocatorResolver()
     locator = resolver.resolve(_ref("https://eleconomista.com.mx/noticias/"))
     assert locator.filename == ""
-    assert locator.doc_type is DocType.UNKNOWN
+    assert locator.doc_type is DocType.HTML
     assert locator.page is None
     assert locator.section is None
+
+    assert resolver.resolve(_ref("https://x/articulo?id=5")).doc_type is DocType.HTML
+    assert resolver.resolve(_ref("http://x/articulo")).doc_type is DocType.HTML
+
+
+def test_resolve_extensionless_non_web_url_stays_unknown() -> None:
+    # Only http(s) gets the provisional HTML; nothing else is a web page.
+    resolver = UrlDocumentLocatorResolver()
+    assert resolver.resolve(_ref("mailto:alguien@ejemplo.com")).doc_type is DocType.UNKNOWN
+    assert resolver.resolve(_ref("/relativo/documento")).doc_type is DocType.UNKNOWN
+
+
+def test_resolve_records_the_scheme() -> None:
+    resolver = UrlDocumentLocatorResolver()
+    assert resolver.resolve(_ref("HTTPS://x/a.pdf")).scheme == "https"  # lowercased
+    assert resolver.resolve(_ref("file:///tmp/a.pdf")).scheme == "file"
+    assert resolver.resolve(_ref("mailto:alguien@ejemplo.com")).scheme == "mailto"
+    assert resolver.resolve(_ref("/relativo/a.pdf")).scheme == ""  # no scheme at all
 
 
 def test_resolve_extension_is_case_insensitive() -> None:

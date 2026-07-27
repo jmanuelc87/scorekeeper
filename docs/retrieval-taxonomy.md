@@ -29,6 +29,7 @@ classDiagram
         +str document_url
         +str filename
         +DocType doc_type
+        +str scheme
         +str host
         +int|None page
         +str|None section
@@ -82,7 +83,7 @@ Which stage produces each value object:
 | Value object | Produced by stage | Protocol | Notes |
 | --- | --- | --- | --- |
 | `SourceRef` | parse | `SourceRefParser` | Ranked reference (label + URL, optional provider `index`). |
-| `DocumentLocator` | locate | `DocumentLocatorResolver` | Fetch target: URL minus fragment, filename, `DocType`, host, page/section. |
+| `DocumentLocator` | locate | `DocumentLocatorResolver` | Fetch target: URL minus fragment, filename, `DocType`, scheme, host, page/section. |
 | `AuthDecision` | authorize | `AuthProvider` | Requirement + resolution against available credentials. |
 | `FetchedDocument` | fetch | `DocumentFetcher` | Raw bytes (never persisted); `cached` flags a local-cache hit. |
 | `ExtractedContent` | filter + extract | `ContentExtractor` | Markdown for the requested PDF page / whole document (titles, lists, tables; images dropped). |
@@ -127,6 +128,7 @@ classDiagram
         AUTH_MISSING
         FETCH_FAILED
         UNSUPPORTED_TYPE
+        UNSUPPORTED_SCHEME
         LOCATOR_NOT_FOUND
         EMPTY_CONTENT
         PARSE_ERROR
@@ -137,8 +139,11 @@ classDiagram
   dispatch (see [Cell formats](retrieval-pipeline.md#cell-formats)). JSON and pipe-labelled
   cells parse deterministically; only `PLAINTEXT` reaches the model.
 - **`DocType`** — the kind of document a source URL points at, derived from the filename
-  extension (`.pdf`→`PDF`, `.docx`→`DOCX` Word, `.htm`/`.html`→`HTML`); `UNKNOWN` when
-  unrecognized (an extensionless page URL, or legacy binary `.doc`).
+  extension (`.pdf`→`PDF`, `.docx`→`DOCX` Word, `.htm`/`.html`→`HTML`); `UNKNOWN` when the
+  extension is unrecognized (legacy binary `.doc`). A URL with **no** extension is a
+  different case: over http(s) it is an ordinary web page, so it gets a *provisional*
+  `HTML` that the fetch stage confirms from the response `Content-Type` (see
+  [Fetch](retrieval-pipeline.md#fetch)); over any other scheme it stays `UNKNOWN`.
 - **`AuthRequirement` / `AuthStatus`** — see [Authorization](#authorization).
 - **`RetrievalStatus`** — the terminal outcome of one reference; see
   [Per-document outcome](#per-document-outcome).
@@ -182,6 +187,7 @@ stateDiagram-v2
     PENDING --> AUTH_MISSING: REQUIRED, no credentials
     PENDING --> FETCH_FAILED: network / HTTP error
     PENDING --> UNSUPPORTED_TYPE: no extractor for DocType
+    PENDING --> UNSUPPORTED_SCHEME: the URL is not http(s)
     PENDING --> LOCATOR_NOT_FOUND: requested page/section absent
     PENDING --> EMPTY_CONTENT: extracted, but no usable text
     PENDING --> RETRIEVED: content extracted
@@ -191,6 +197,7 @@ stateDiagram-v2
     AUTH_MISSING --> [*]
     FETCH_FAILED --> [*]
     UNSUPPORTED_TYPE --> [*]
+    UNSUPPORTED_SCHEME --> [*]
     LOCATOR_NOT_FOUND --> [*]
     EMPTY_CONTENT --> [*]
 ```
@@ -198,7 +205,8 @@ stateDiagram-v2
 `RETRIEVED` is the only success — its outcome carries a populated `document` and is the only
 status `RetrievalReport.to_context` assembles into the stored context. The failure statuses
 carry a short `error` diagnostic. `RetrievalSummary.from_outcomes` tallies these into counts
-(`retrieved`, `auth_missing`, `fetch_failed`, `unsupported`, and `other` for the rest).
+(`retrieved`, `auth_missing`, `fetch_failed`, `unsupported` — `UNSUPPORTED_TYPE` only — and
+`other` for the rest, `UNSUPPORTED_SCHEME` included).
 
 ## Run-level status
 

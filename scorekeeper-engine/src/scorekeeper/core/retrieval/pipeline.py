@@ -30,6 +30,7 @@ from scorekeeper.core.retrieval.fetch import CachingDocumentFetcher, FetchError
 from scorekeeper.core.retrieval.parser import LlmSourceRefParser
 from scorekeeper.core.retrieval.resolver import UrlDocumentLocatorResolver
 from scorekeeper.core.retrieval.types import (
+    WEB_SCHEMES,
     AuthStatus,
     RetrievalOutcome,
     RetrievalReport,
@@ -108,6 +109,15 @@ class RetrievalOrchestrator:
     async def _run_ref(self, source: SourceRef) -> RetrievalOutcome:
         """Thread one reference locate → authorize → fetch → extract → assemble."""
         locator = self._resolver.resolve(source)
+        if locator.scheme not in WEB_SCHEMES:
+            # Not something to fetch (``mailto:``, ``javascript:``, a bare relative path…):
+            # stop here so it reads as a bad reference rather than a network failure.
+            return RetrievalOutcome(
+                source=source,
+                status=RetrievalStatus.UNSUPPORTED_SCHEME,
+                locator=locator,
+                error=f"esquema no soportado: {locator.scheme or 'sin esquema'}",
+            )
         decision = await self._auth.classify(locator)
 
         if decision.status is AuthStatus.MISSING_CREDENTIALS:
