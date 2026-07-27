@@ -131,7 +131,7 @@ def split_context_docs(context: str) -> list[str]:
     return context_documents(context)
 
 
-@register(scenarios=["hallucination"])
+@register
 class Hallucination(MultiStepMetric):
     """Fraction of retrieved documents the answer contradicts."""
 

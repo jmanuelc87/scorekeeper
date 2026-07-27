@@ -155,3 +155,32 @@ async def test_captures_endpoint_requires_conversations() -> None:
         response = client.post("/api/v1/captures", json={"platform": "claude", "conversations": []})
 
     assert response.status_code == 422
+
+
+async def test_captures_endpoint_unknown_use_case_422(monkeypatch) -> None:
+    async def fake_ingest(platform, files, *, session=None):
+        raise ingestion.UnknownUseCaseError(
+            "Caso(s) de uso desconocido(s): inexistente. Créalo con POST /use-cases."
+        )
+
+    monkeypatch.setattr(ingestion, "ingest_evaluation", fake_ingest)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/captures",
+            json={
+                "platform": "gemini",
+                "use_case": "inexistente",
+                "conversations": [
+                    {
+                        "scenario_id": "esc-1",
+                        "messages": [{"role": "user", "content": "hola"}],
+                    }
+                ],
+            },
+        )
+
+    # 422, not the 400 a malformed capture gets: UnknownUseCaseError subclasses
+    # ValueError, so this asserts the handler's except-arm ordering.
+    assert response.status_code == 422
+    assert "Caso(s) de uso desconocido(s): inexistente" in response.json()["detail"]

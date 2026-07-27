@@ -319,3 +319,24 @@ async def test_endpoint_maps_value_error_to_400(monkeypatch) -> None:
             data={"payload": _payload()},
         )
     assert response.status_code == 400
+
+
+async def test_endpoint_unknown_use_case_422(monkeypatch) -> None:
+    async def fake_ingest(platform, files, *, session=None):
+        raise ingestion.UnknownUseCaseError(
+            "Caso(s) de uso desconocido(s): inexistente. Créalo con POST /use-cases."
+        )
+
+    monkeypatch.setattr(ingestion, "ingest_evaluation", fake_ingest)
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/evaluations",
+            files=[("files", ("esc1.xlsx", _conversation_bytes(), "application/octet-stream"))],
+            data={"payload": _payload(use_case="inexistente")},
+        )
+
+    # 422, not the 400 a malformed sheet gets: UnknownUseCaseError subclasses ValueError,
+    # so this asserts the handler's except-arm ordering.
+    assert response.status_code == 422
+    assert "Caso(s) de uso desconocido(s): inexistente" in response.json()["detail"]

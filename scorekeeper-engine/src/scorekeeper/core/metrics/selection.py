@@ -1,104 +1,83 @@
-"""Per-scenario metric selection, stored in the database.
+"""The seam between the code-side metric registry and the stored use-case sets.
 
-The taxonomy lives in code: each metric declares the scenarios it applies to via
-the ``@register`` decorator. ``sync_selection`` *queries those registered classes
-at runtime* and materializes the ``use_case → metric`` mapping into the
-``scenario_metrics`` table, which the scoring runner then reads. Keeping the
-mapping in the DB makes selection queryable and editable alongside results, while
-the decorator on each class stays the authoring source of truth.
+Two halves, with opposite owners. The *catalog* lives in code: each metric class
+registers itself with ``@register``, and :func:`sync_metrics` mirrors those names
+into the ``metrics`` table so a use-case set has a key to point at. The *sets*
+are user data: ``use_cases`` and ``use_case_metrics`` are written through
+``POST /use-cases`` (see :mod:`scorekeeper.core.services.use_cases`), never
+derived from code. The scoring runner then reads a scenario's set back through
+:func:`resolve`.
+
+Nothing here deletes: a ``metrics`` row dropped from the registry may still be
+referenced by a stored set and by historical ``metric_scores``.
 """
 
 from __future__ import annotations
 
+import uuid
+
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.db.models import ScenarioMetric
-from scorekeeper.db.repositories import scenario_metrics as repo
+from scorekeeper.db.models import MetricDefinition, UseCase, UseCaseMetric
+from scorekeeper.db.repositories import use_cases as repo
 from scorekeeper.core.metrics import catalog as _catalog  # noqa: F401  (populate registry)
 from scorekeeper.core.metrics.base import Metric
 from scorekeeper.core.metrics.registry import MetricRegistry
 
-# Reserved use_case that applies when a scenario has no explicit metric rows.
+# The use case an upload that names none lands on. Scores every registered metric, so
+# an upload that picks no set still gets the full evaluation rather than nothing.
 DEFAULT_USE_CASE = "default"
 
 
-def declared_selection() -> set[tuple[str, str]]:
-    """Derive the desired ``(use_case, metric_name)`` pairs from the registry.
+async def sync_metrics(session: AsyncSession) -> None:
+    """Materialize the registered metrics and keep ``default`` scoring all of them.
 
-    A metric with no declared scenarios belongs to the ``default`` set.
+    Idempotent and insert-only: adds a ``metrics`` row for every registered metric
+    that has none, the ``default`` ``use_cases`` row if it is missing, and a link
+    from ``default`` to every registered metric it does not already score. A metric
+    added to the catalog therefore joins ``default`` on the next call, with no
+    migration. Caller commits.
+
+    ``default`` is maintained here rather than left to the migration because the
+    registry is what defines "all metrics" and it changes with the code, and because
+    the test suite builds its schema with ``Base.metadata.create_all``, never Alembic.
+
+    Only ``default`` is touched — a use case created through ``POST /use-cases`` owns
+    its set and is never reconciled.
     """
-    pairs: set[tuple[str, str]] = set()
-    for metric_cls in MetricRegistry.all():
-        use_cases = metric_cls.scenarios or (DEFAULT_USE_CASE,)
-        for use_case in use_cases:
-            pairs.add((use_case, metric_cls.name))
-    return pairs
+    registered = {metric_cls.name for metric_cls in MetricRegistry.all()}
+    for name in registered - await repo.metric_names(session):
+        session.add(MetricDefinition(name=name))
+
+    default_id = (await repo.use_case_ids(session)).get(DEFAULT_USE_CASE)
+    if default_id is None:
+        # Assigned here rather than at flush so the links below can reference it.
+        default_id = uuid.uuid4()
+        session.add(UseCase(id=default_id, name=DEFAULT_USE_CASE))
+
+    # The rows above must land before the links below can point at them.
+    await session.flush()
+
+    missing = sorted(registered - set(await repo.metric_names_for(session, default_id)))
+    metric_ids = await repo.metric_ids(session, missing)
+    for name in missing:
+        session.add(UseCaseMetric(use_case_id=default_id, metric_id=metric_ids[name]))
 
 
-async def sync_selection(session: AsyncSession) -> None:
-    """Reconcile ``scenario_metrics`` with the metrics' declared scenarios.
+async def metrics_for(session: AsyncSession, use_case_id: uuid.UUID) -> list[str]:
+    """Metric names linked to ``use_case_id``, ordered by name.
 
-    Idempotent: inserts missing rows and removes rows no longer declared, so the
-    table always reflects the current code taxonomy. Caller commits.
+    An empty list is a real answer, not a miss: a use case with no metrics scores
+    nothing. Ingest rejects a use case that does not exist, so there is no unknown-id
+    case to fall back from.
     """
-    desired = declared_selection()
-    existing = await repo.list_pairs(session)
-
-    for use_case, metric_name in desired - existing:
-        session.add(ScenarioMetric(use_case=use_case, metric_name=metric_name))
-
-    for use_case, metric_name in existing - desired:
-        await repo.delete_pair(session, use_case, metric_name)
+    return await repo.metric_names_for(session, use_case_id)
 
 
-async def metrics_for(session: AsyncSession, use_case: str) -> list[str]:
-    """Metric names selected for ``use_case``, falling back to the default set."""
-    names = await repo.metric_names_for(session, use_case)
-    if not names:
-        names = await repo.metric_names_for(session, DEFAULT_USE_CASE)
-    return names
+async def resolve(session: AsyncSession, use_case_id: uuid.UUID) -> list[Metric]:
+    """Instantiate the metrics linked to ``use_case_id``.
 
-
-async def resolve(session: AsyncSession, use_case: str) -> list[Metric]:
-    """Instantiate the metrics selected for ``use_case``.
-
-    Raises ``KeyError`` (Spanish message) if a stored ``metric_name`` is not in
-    the code registry.
+    Raises ``KeyError`` (Spanish message) if a stored metric name is not in the code
+    registry.
     """
-    return [MetricRegistry.create(name) for name in await metrics_for(session, use_case)]
-
-
-def parse_use_cases(raw: str) -> list[str]:
-    """Split a scenario's comma-separated ``use_case`` into clean, non-empty tokens."""
-    return [token.strip() for token in raw.split(",") if token.strip()]
-
-
-async def metrics_for_scenario(session: AsyncSession, use_case: str) -> list[str]:
-    """Union of metric names across a scenario's comma-separated ``use_case`` tokens.
-
-    Each token is resolved independently (no per-token default); the results are
-    unioned, deduplicated, and kept in a deterministic order (token order, then
-    metric name). Falls back to the default set only when *no* token matched any
-    rows.
-    """
-    names: list[str] = []
-    seen: set[str] = set()
-    for token in parse_use_cases(use_case):
-        for name in await repo.metric_names_for(session, token):
-            if name not in seen:
-                seen.add(name)
-                names.append(name)
-    if not names:
-        names = await repo.metric_names_for(session, DEFAULT_USE_CASE)
-    return names
-
-
-async def resolve_scenario(session: AsyncSession, use_case: str) -> list[Metric]:
-    """Instantiate the metrics for a comma-separated scenario ``use_case``.
-
-    Raises ``KeyError`` (Spanish message) if a stored ``metric_name`` is not in
-    the code registry.
-    """
-    return [MetricRegistry.create(name) for name in await metrics_for_scenario(session, use_case)]
-
-
+    return [MetricRegistry.create(name) for name in await metrics_for(session, use_case_id)]

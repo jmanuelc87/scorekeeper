@@ -66,6 +66,10 @@ async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
 
     try:
         run_id = await ingestion.ingest_evaluation(payload.platform, uploads)
+    except ingestion.UnknownUseCaseError as exc:
+        # A ValueError subclass, so this arm must precede the one below.
+        logger.warning("POST /captures rechazado: %s", exc)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
         logger.warning("POST /captures rechazado: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc

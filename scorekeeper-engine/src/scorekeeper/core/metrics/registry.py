@@ -2,25 +2,21 @@
 
 Concrete metrics register themselves with the ``@register`` decorator, co-located
 with their definition. Importing the ``catalog`` package imports every metric
-module, which populates this registry. Per-scenario selection is then derived by
-*querying these registered classes at runtime* (see ``selection.sync_selection``)
-and storing the result in the ``scenario_metrics`` table.
+module, which populates this registry::
 
-The decorator optionally carries the scenarios a metric applies to::
-
-    @register(scenarios=["soporte_tecnico", "ventas"])
-    class Correccion(SingleRubricMetric):
-        ...
-
-    @register  # applies to the "default" selection only
+    @register
     class Utilidad(SingleRubricMetric):
         ...
+
+The registry is the catalog of what *can* be scored. Which metrics a given use
+case actually scores is user data, composed through ``POST /use-cases`` and
+stored in ``use_case_metrics``; ``selection.sync_metrics`` mirrors the names
+registered here into the ``metrics`` table so those links have a key to point at.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from typing import TypeVar, overload
+from typing import TypeVar
 
 from scorekeeper.core.metrics.base import Metric
 
@@ -66,31 +62,7 @@ class MetricRegistry:
         cls._metrics.clear()
 
 
-@overload
-def register(metric_cls: type[_M]) -> type[_M]: ...
-
-
-@overload
-def register(
-    *, scenarios: Iterable[str] | None = ...
-) -> Callable[[type[_M]], type[_M]]: ...
-
-
-def register(
-    metric_cls: type[_M] | None = None,
-    *,
-    scenarios: Iterable[str] | None = None,
-) -> type[_M] | Callable[[type[_M]], type[_M]]:
-    """Register a metric class, optionally tagging the scenarios it applies to.
-
-    Usable bare (``@register``) or parameterized (``@register(scenarios=[...])``).
-    Scenario tags passed here override a class-level ``scenarios`` attribute.
-    """
-
-    def wrap(cls: type[_M]) -> type[_M]:
-        if scenarios is not None:
-            cls.scenarios = tuple(scenarios)
-        MetricRegistry.add(cls)
-        return cls
-
-    return wrap if metric_cls is None else wrap(metric_cls)
+def register(metric_cls: type[_M]) -> type[_M]:
+    """Register a metric class so the catalog and the judges can find it by name."""
+    MetricRegistry.add(metric_cls)
+    return metric_cls

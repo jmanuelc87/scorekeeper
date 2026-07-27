@@ -17,13 +17,15 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scorekeeper.db.repositories.runs import run_tree_options
 from scorekeeper.db.models import (
     BenchmarkRun,
+    MetricDefinition,
     MetricScore,
     PlatformExecution,
     RetrievedContextDocument,
-    ScenarioMetric,
     ScenarioResult,
     Turn,
     TurnTokenUsage,
+    UseCase,
+    UseCaseMetric,
 )
 from scorekeeper.core.metrics.base import (
     Metric,
@@ -172,11 +174,27 @@ def registry():
             MetricRegistry.add(metric_cls)
 
 
+async def _use_case(session: AsyncSession, name: str = USE_CASE) -> UseCase:
+    """Get-or-create the ``use_cases`` row named ``name``."""
+    row = (
+        await session.execute(select(UseCase).where(UseCase.name == name))
+    ).scalars().one_or_none()
+    if row is None:
+        row = UseCase(name=name)
+        session.add(row)
+        await session.flush()
+    return row
+
+
 async def _select_metrics(
     session: AsyncSession, names: list[str], use_case: str = USE_CASE
 ) -> None:
+    row = await _use_case(session, use_case)
     for name in names:
-        session.add(ScenarioMetric(use_case=use_case, metric_name=name))
+        metric = MetricDefinition(name=name)
+        session.add(metric)
+        await session.flush()
+        session.add(UseCaseMetric(use_case_id=row.id, metric_id=metric.id))
     await session.flush()
 
 
@@ -191,7 +209,9 @@ async def _seed_scenario(
     run = BenchmarkRun()
     platform_exec = PlatformExecution(platform="claude", run=run)
     scenario = ScenarioResult(
-        scenario_id="esc-1", use_case=use_case, platform_execution=platform_exec
+        scenario_id="esc-1",
+        use_case=await _use_case(session, use_case),
+        platform_execution=platform_exec,
     )
     for i, (prompt, response) in enumerate(exchanges, start=1):
         is_selected = selected is None or i in selected
@@ -382,9 +402,10 @@ async def test_run_platform_rolls_up_average(session: AsyncSession, registry) ->
     await _select_metrics(session, ["utilidad"])
     run = BenchmarkRun()
     platform_exec = PlatformExecution(platform="claude", run=run)
+    use_case = await _use_case(session)
     for sid in ("s1", "s2"):
         scenario = ScenarioResult(
-            scenario_id=sid, use_case=USE_CASE, platform_execution=platform_exec
+            scenario_id=sid, use_case=use_case, platform_execution=platform_exec
         )
         scenario.turns.append(
             Turn(turn_number=1, prompt="p", response="r", is_selected=True)
@@ -482,22 +503,6 @@ async def test_metrics_evaluate_concurrently(session: AsyncSession, registry) ->
     # cleared the barrier together; a sequential runner would time out and drop them.
     turn = scenario.turns[0]
     assert {ms.metric_name for ms in turn.metric_scores} == set(names)
-    assert turn.turn_score == pytest.approx(0.9)
-
-
-async def test_comma_separated_use_case_unions_metrics(session: AsyncSession, registry) -> None:
-    # Two tokens, each selecting a different metric; the scenario scores the union.
-    await _select_metrics(session, ["utilidad"], use_case="utilidad_uc")
-    await _select_metrics(session, ["correccion"], use_case="correccion_uc")
-    _, _, scenario = await _seed_scenario(
-        session, [("hola", "qué tal")], use_case="utilidad_uc, correccion_uc"
-    )
-
-    await EvalRunner(session, RecordingJudge(score_value=0.9)).run_scenario(scenario)
-    await session.commit()
-
-    turn = scenario.turns[0]
-    assert {ms.metric_name for ms in turn.metric_scores} == {"utilidad", "correccion"}
     assert turn.turn_score == pytest.approx(0.9)
 
 

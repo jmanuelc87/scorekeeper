@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import (
 )
 from sqlalchemy.pool import StaticPool
 
-from scorekeeper.db.models import Base
+from scorekeeper.db.models import Base, MetricDefinition, UseCase, UseCaseMetric
 from scorekeeper.core.runner import EvalRunner
 
 
@@ -70,6 +70,30 @@ async def session(session_factory) -> AsyncIterator[AsyncSession]:
 async def db_session(session: AsyncSession) -> AsyncSession:
     """Alias of ``session`` under the name tests/metrics fixtures ask for."""
     return session
+
+
+@pytest.fixture
+def compose_use_case(session: AsyncSession):
+    """Create a use case scoring the named metrics — what ``POST /use-cases`` does.
+
+    Metric selection is user data: no metric declares a use case, so a scenario scores
+    nothing until something links the two. Tests that ingest under ``"default"`` call
+    this first; ``sync_metrics`` then finds both rows present and inserts nothing.
+    """
+
+    async def _compose(metric_names: list[str], use_case: str = "default") -> UseCase:
+        row = UseCase(name=use_case)
+        session.add(row)
+        await session.flush()
+        for metric_name in metric_names:
+            metric = MetricDefinition(name=metric_name)
+            session.add(metric)
+            await session.flush()
+            session.add(UseCaseMetric(use_case_id=row.id, metric_id=metric.id))
+        await session.commit()
+        return row
+
+    return _compose
 
 
 #: The genuine pacing method, captured before ``_no_turn_delay`` ever patches it.

@@ -85,11 +85,16 @@ class Utilidad(_FakeMetric):
 
 
 @pytest.fixture
-def registry():
-    """Register a single fake metric (no scenarios → the 'default' set)."""
+async def registry(session: AsyncSession, compose_use_case):
+    """Register a single fake metric and link it to the ``default`` use case.
+
+    Metric selection is user data now: no metric declares a use case, so an upload
+    ingested under ``"default"`` scores nothing until a set links the two.
+    """
     saved = MetricRegistry.all()
     MetricRegistry.clear()
     MetricRegistry.add(Utilidad)
+    await compose_use_case([Utilidad.name])
     try:
         yield
     finally:

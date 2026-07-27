@@ -141,7 +141,7 @@ def _serialize_scenario(
         # human-readable, non-unique ``scenario_id`` label below).
         "id": str(scenario.id),
         "scenario_id": scenario.scenario_id,
-        "use_case": scenario.use_case,
+        "use_case": scenario.use_case.name,
         # The model that answered, when the capturing client reported one; null for
         # every .xlsx import.
         "model_name": scenario.model_name,
