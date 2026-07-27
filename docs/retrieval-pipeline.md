@@ -45,7 +45,7 @@ is performed inside the `ContentExtractor` (see [Extract](#extract)).
 | Stage | Protocol | Input → Output | Purpose |
 | --- | --- | --- | --- |
 | parse | `SourceRefParser` | `cell` → `list[SourceRef]` | Detect the `SourceFormat` and split the cell into ranked source references. |
-| locate | `DocumentLocatorResolver` | `SourceRef` → `DocumentLocator` | Derive the document URL (minus fragment), filename, `DocType`, host, and page/section from a `#page=N` fragment. |
+| locate | `DocumentLocatorResolver` | `SourceRef` → `DocumentLocator` | Derive the document URL (minus fragment), filename, `DocType`, scheme, host, and page/section from a `#page=N` fragment. |
 | authorize | `AuthProvider` | `DocumentLocator` → `AuthDecision` (+ `client`) | Classify the auth requirement, resolve it against available credentials, and expose the generic `AuthClient`. |
 | fetch | `DocumentFetcher` | `DocumentLocator`, `AuthClient \| None` → `FetchedDocument` | Fetch the document bytes through the auth client (gated) or a public GET, cached on disk by `document_url`. |
 | filter + extract | `ContentExtractor` | `FetchedDocument`, `DocumentLocator` → `ExtractedContent` | Select the requested PDF page and convert the document to markdown (titles/lists/tables; images dropped). |
@@ -101,7 +101,20 @@ stage: `fetch(locator, client) → FetchedDocument`. It consumes the authorize s
 
 - **gated host** → `client.download(locator)` (SharePoint `ClientContext`, OAuth2 bearer GET, …);
 - **public host** (`client is None`) → a plain `httpx2` GET; a network/HTTP error raises
-  `FetchError` (which a future orchestrator maps to `RetrievalStatus.FETCH_FAILED`).
+  `FetchError` (which the orchestrator maps to `RetrievalStatus.FETCH_FAILED`).
+
+**The response confirms the document type.** The locator's `DocType` comes from the URL alone,
+and is merely *provisional* for an extensionless web page, so a public GET's `Content-Type`
+overrides it when it names a type we convert (`text/html`, `application/pdf`,
+`…wordprocessingml.document`); an absent or unrecognized media type leaves the provisional
+type in place. The confirmed type is what the cache stores and what `extract` converts with,
+so a `.pdf` URL that actually served an HTML error page converts as HTML. An authenticated
+download surfaces no `Content-Type`, so a gated document keeps the locator's type.
+
+**Only globally routable targets.** Source references come from a model's answer, so a public
+GET refuses a host resolving to a loopback, private, link-local, reserved or multicast address
+(→ `FetchError`). Redirects are followed by hand (up to 5 hops) rather than by the client, so
+every hop is checked instead of only the first.
 
 **Local filesystem cache.** Every fetch is cached under `RETRIEVAL_CACHE_DIR`, indexed by the
 [`document_cache`](data-model.md#documentcacheentry) table (one row per `document_url`, unique).
@@ -165,7 +178,7 @@ and thus into the groundedness metrics' node text and the judge prompts.
 Each source reference ends in a `RetrievalStatus`:
 
 `PENDING` → `RETRIEVED` · `AUTH_MISSING` · `FETCH_FAILED` · `UNSUPPORTED_TYPE` ·
-`LOCATOR_NOT_FOUND` · `EMPTY_CONTENT` · `PARSE_ERROR`.
+`UNSUPPORTED_SCHEME` · `LOCATOR_NOT_FOUND` · `EMPTY_CONTENT` · `PARSE_ERROR`.
 
 `RetrievalSummary.from_outcomes` tallies these into counts. Together with the run-level
 `STATUS_EN_RECUPERACION` status, this lets `GET /evaluations` surface the retrieval phase
@@ -182,6 +195,7 @@ retrieves):
 
 | Stage result | `RetrievalStatus` |
 | --- | --- |
+| the located URL is not http(s) (checked before authorize) | `UNSUPPORTED_SCHEME` |
 | `classify` = `MISSING_CREDENTIALS`, or `CredentialError` building the client | `AUTH_MISSING` |
 | `supports(doc_type)` False (checked before fetch) | `UNSUPPORTED_TYPE` |
 | `FetchError` | `FETCH_FAILED` |

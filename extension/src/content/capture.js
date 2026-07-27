@@ -453,7 +453,7 @@
               })),
             );
         for (const citation of citations) {
-          const url = citation?.url;
+          const url = webUrl(citation?.url);
           if (url && !seen.has(url)) seen.set(url, citation.name ?? "");
         }
       }
@@ -462,6 +462,24 @@
     if (seen.size === 0) return "";
     const sources = Array.from(seen, ([url, name]) => (name ? { name, url } : { url }));
     return JSON.stringify(sources);
+  }
+
+  /**
+   * A citation `href` as the absolute http(s) URL the backend can retrieve, or `""`.
+   *
+   * A chip's href is whatever the page put there: a relative path, an in-page `#anchor`
+   * (which resolves to the chat page itself, not a source), or a `javascript:`/`mailto:`
+   * link the retrieval pipeline has nothing to fetch from. Resolving against the page and
+   * keeping only web URLs means the column holds sources, not markup artifacts.
+   */
+  function webUrl(href) {
+    if (!href || href.startsWith("#")) return "";
+    try {
+      const { protocol, href: absolute } = new URL(href, document.baseURI);
+      return protocol === "https:" || protocol === "http:" ? absolute : "";
+    } catch {
+      return ""; // Not a resolvable URL.
+    }
   }
 
   /** The citation records on one chip; a chip we cannot parse contributes nothing. */

@@ -55,6 +55,7 @@ def test_enum_members() -> None:
         "auth_missing",
         "fetch_failed",
         "unsupported_type",
+        "unsupported_scheme",
         "locator_not_found",
         "empty_content",
         "parse_error",
@@ -165,14 +166,18 @@ def test_summary_counts_by_status() -> None:
         RetrievalOutcome(source=SourceRef(name="c", url="u", rank=4), status=RetrievalStatus.UNSUPPORTED_TYPE),
         RetrievalOutcome(source=SourceRef(name="d", url="u", rank=5), status=RetrievalStatus.PARSE_ERROR),
         RetrievalOutcome(source=SourceRef(name="e", url="u", rank=6)),  # PENDING -> other
+        RetrievalOutcome(
+            source=SourceRef(name="f", url="mailto:x@y.z", rank=7),
+            status=RetrievalStatus.UNSUPPORTED_SCHEME,
+        ),
     ]
     summary = RetrievalSummary.from_outcomes(outcomes)
-    assert summary.total == 7
+    assert summary.total == 8
     assert summary.retrieved == 2
     assert summary.auth_missing == 1
     assert summary.fetch_failed == 1
-    assert summary.unsupported == 1
-    assert summary.other == 2  # PARSE_ERROR + PENDING
+    assert summary.unsupported == 1  # UNSUPPORTED_TYPE only
+    assert summary.other == 3  # PARSE_ERROR + PENDING + UNSUPPORTED_SCHEME
 
 
 def test_summary_empty() -> None:

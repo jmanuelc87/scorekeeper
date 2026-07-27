@@ -2,9 +2,17 @@
 
 from __future__ import annotations
 
-from scorekeeper.core.retrieval import RetrievalOrchestrator, RetrievalPipeline
+from scorekeeper.core.retrieval import (
+    RetrievalOrchestrator,
+    RetrievalPipeline,
+    UrlDocumentLocatorResolver,
+)
 from scorekeeper.core.retrieval.credentials import CredentialError
-from scorekeeper.core.retrieval.extract import ExtractError, PageNotFoundError
+from scorekeeper.core.retrieval.extract import (
+    ExtractError,
+    MarkdownContentExtractor,
+    PageNotFoundError,
+)
 from scorekeeper.core.retrieval.fetch import FetchError
 from scorekeeper.core.retrieval.types import (
     AuthDecision,
@@ -36,14 +44,16 @@ class _Parser:
 
 
 class _Resolver:
-    def __init__(self, doc_type=DocType.PDF):
+    def __init__(self, doc_type=DocType.PDF, scheme="https"):
         self._doc_type = doc_type
+        self._scheme = scheme
 
     def resolve(self, source):
         return DocumentLocator(
             document_url=source.url.split("#")[0],
             filename="f.pdf",
             doc_type=self._doc_type,
+            scheme=self._scheme,
             host="h",
             page=1,
         )
@@ -152,6 +162,35 @@ async def test_missing_credentials_is_auth_missing() -> None:
 async def test_unsupported_type() -> None:
     report = await _orch(extractor=_Extractor(supported=False)).run("cell")
     assert report.outcomes[0].status is RetrievalStatus.UNSUPPORTED_TYPE
+
+
+async def test_non_web_scheme_is_unsupported_scheme() -> None:
+    # The guard runs before authorize: an auth stage that would answer MISSING_CREDENTIALS
+    # never gets the chance, so the reference reads as a bad URL, not a missing credential.
+    report = await _orch(
+        resolver=_Resolver(scheme="mailto"), auth=_Auth(status=AuthStatus.MISSING_CREDENTIALS)
+    ).run("cell")
+    assert report.outcomes[0].status is RetrievalStatus.UNSUPPORTED_SCHEME
+    assert "mailto" in report.outcomes[0].error
+
+
+async def test_reference_without_a_scheme_is_unsupported_scheme() -> None:
+    report = await _orch(resolver=_Resolver(scheme="")).run("cell")
+    assert report.outcomes[0].status is RetrievalStatus.UNSUPPORTED_SCHEME
+    assert "sin esquema" in report.outcomes[0].error
+
+
+async def test_extensionless_web_page_is_retrieved() -> None:
+    # End to end over the real resolver and extractor: a plain article URL carries no
+    # extension, and must still reach the fetch stage instead of being ruled unsupported.
+    orch = _orch(
+        refs=[_ref(url="https://eleconomista.com.mx/noticias/")],
+        resolver=UrlDocumentLocatorResolver(),
+        extractor=MarkdownContentExtractor(converter=lambda body, ext: "# nota"),
+    )
+    report = await orch.run("cell")
+    assert report.outcomes[0].status is RetrievalStatus.RETRIEVED
+    assert report.to_context().documents[0].content == "# nota"
 
 
 async def test_client_build_failure_is_auth_missing() -> None:
