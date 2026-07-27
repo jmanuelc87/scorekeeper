@@ -82,6 +82,10 @@ async def create_evaluation(
 
     try:
         run_id = await ingestion.ingest_evaluation(parsed_payload.platform, uploads)
+    except ingestion.UnknownUseCaseError as exc:
+        # A ValueError subclass, so this arm must precede the one below.
+        logger.warning("POST /evaluations rechazado: %s", exc)
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
     except ValueError as exc:
         # Empty inputs or an unparseable sheet — a client error.
         logger.warning("POST /evaluations rechazado: %s", exc)

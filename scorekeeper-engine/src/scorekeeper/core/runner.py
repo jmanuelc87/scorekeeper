@@ -55,7 +55,7 @@ from scorekeeper.core.metrics.judge import Judge
 from scorekeeper.core.metrics.judges import make_judge
 from scorekeeper.core.metrics.judges.base import UsageAccumulator, collect_usage
 from scorekeeper.core.metrics.rollup import platform_average, scenario_average, turn_score
-from scorekeeper.core.metrics.selection import resolve_scenario
+from scorekeeper.core.metrics.selection import resolve
 from scorekeeper.core.retrieved_context import RetrievedContext
 
 logger = logging.getLogger(__name__)
@@ -119,20 +119,20 @@ class EvalRunner:
     async def run_scenario(self, scenario: ScenarioResult) -> None:
         """Score every turn of one conversation, roll up its average, and commit.
 
-        Metric selection follows ``scenario.use_case`` — a comma-separated list of
-        tokens whose metrics are unioned; the running conversation ``history`` is
-        fed forward so later turns see earlier exchanges. Consecutive turns are
-        paced by a short random delay (see ``_pace_between_turns``).
+        Metric selection follows the scenario's use case (its ``use_case_metrics``
+        links); the running conversation ``history`` is fed forward so later turns
+        see earlier exchanges. Consecutive turns are paced by a short random delay
+        (see ``_pace_between_turns``).
 
         Individual metric scores are already committed as they are written (see
         ``run_turn``); this final commit persists the scenario roll-up
         (``average_score`` / ``status``).
         """
-        metrics = await resolve_scenario(self.session, scenario.use_case)
+        metrics = await resolve(self.session, scenario.use_case_id)
         logger.info(
             "Escenario %s (use_case=%s): %d turno(s), métricas=%s",
             scenario.scenario_id,
-            scenario.use_case,
+            scenario.use_case.name,
             len(scenario.turns),
             [metric.name for metric in metrics],
         )

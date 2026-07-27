@@ -1,6 +1,6 @@
 """Core metric taxonomy.
 
-A ``Metric`` is *behavior*, not data: scale/weight/category/scenarios are
+A ``Metric`` is *behavior*, not data: scale/weight/category are
 class-level metadata, but how a score is produced is the polymorphic
 ``evaluate()`` method. Metrics operate on a decoupled ``TurnView`` — never the
 SQLAlchemy ``Turn`` — so the whole package is testable with no database.
@@ -153,10 +153,9 @@ class Metric(ABC):
     """Base class for an evaluation metric.
 
     Class-level metadata every concrete metric must set (``scale``), or may
-    override (``weight``, ``rubric_version``, ``scenarios``). ``scenarios`` lists
-    the ``use_case`` values this metric applies to; the ``@register`` decorator
-    can populate it. An empty tuple means the metric belongs to the reserved
-    ``"default"`` selection only.
+    override (``weight``, ``rubric_version``). Which use cases a metric belongs
+    to is *not* declared here: that mapping is user data, composed through
+    ``POST /use-cases`` and stored in ``use_case_metrics``.
     """
 
     name: ClassVar[str]
@@ -164,7 +163,6 @@ class Metric(ABC):
     scale: ClassVar[Scale]
     weight: ClassVar[float] = 1.0
     rubric_version: ClassVar[str] = "v1"
-    scenarios: ClassVar[tuple[str, ...]] = ()
 
     @abstractmethod
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:

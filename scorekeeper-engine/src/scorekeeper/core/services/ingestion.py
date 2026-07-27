@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.core.importer import normalize_messages, parse_conversation
-from scorekeeper.core.metrics.selection import sync_selection
+from scorekeeper.core.metrics.selection import DEFAULT_USE_CASE, sync_metrics
 from scorekeeper.core.services.status import STATUS_INGERIDO
 from scorekeeper.db.connection import session_scope
 from scorekeeper.db.models import (
@@ -31,10 +31,18 @@ from scorekeeper.db.models import (
     SourceFile,
     Turn,
 )
+from scorekeeper.db.repositories import use_cases as use_case_repo
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_USE_CASE = "default"
+
+class UnknownUseCaseError(ValueError):
+    """An upload named a ``use_case`` that does not exist.
+
+    A ``ValueError`` subclass so the existing rollback path still catches it, but its
+    own type so the HTTP layer answers 422 (unprocessable input) rather than the 400 it
+    gives a malformed sheet. Create the use case first with ``POST /use-cases``.
+    """
 
 
 @dataclass
@@ -140,10 +148,19 @@ async def ingest_evaluation(
 
     async with session_scope(session) as db:
         try:
-            # Seed the use_case -> metric table so resolve_scenario finds metrics;
-            # without this every turn scores None and every scenario is "fallido".
-            await sync_selection(db)
+            # Keep the metric catalog and the "default" use case in sync with the code
+            # registry, then resolve every upload's use_case name to its row.
+            await sync_metrics(db)
             await db.flush()
+
+            use_case_ids = await use_case_repo.use_case_ids(db)
+            unknown = sorted({upload.use_case for upload in files} - set(use_case_ids))
+            if unknown:
+                raise UnknownUseCaseError(
+                    "Caso(s) de uso desconocido(s): "
+                    + ", ".join(unknown)
+                    + ". Créalo con POST /use-cases."
+                )
 
             # Parse each file once and record its provenance as a SourceFile.
             parsed: list[tuple[UploadedFile, list[dict[str, Any]], SourceFile]] = []
@@ -178,7 +195,7 @@ async def ingest_evaluation(
                     executions[resolved] = platform_exec
                 scenario = ScenarioResult(
                     scenario_id=upload.scenario_id,
-                    use_case=upload.use_case,
+                    use_case_id=use_case_ids[upload.use_case],
                     model_name=upload.model_name,
                     source_ref=upload.filename,
                     raw_conversation={"messages": messages},

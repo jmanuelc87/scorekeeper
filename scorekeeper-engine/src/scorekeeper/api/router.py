@@ -11,9 +11,11 @@ from scorekeeper.api.v1 import (
     captures,
     evaluations,
     health,
+    metrics,
     runs,
     scenarios,
     turns,
+    use_cases,
 )
 
 api_router = APIRouter()
@@ -24,3 +26,5 @@ api_router.include_router(runs.router)
 api_router.include_router(scenarios.router)
 api_router.include_router(turns.router)
 api_router.include_router(auth_providers.router)
+api_router.include_router(use_cases.router)
+api_router.include_router(metrics.router)

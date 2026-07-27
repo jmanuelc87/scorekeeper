@@ -128,9 +128,11 @@ class ScenarioResult(Base):
         ForeignKey("platform_executions.id", ondelete="CASCADE"), index=True
     )
     scenario_id: Mapped[str] = mapped_column(String(128))
-    use_case: Mapped[str] = mapped_column(
-        String(128), default="default", server_default="default"
-    )
+    # The use case this conversation is scored under, as a foreign key rather than a
+    # repeated label: the metric set lives in ``use_case_metrics``. No ``ondelete`` —
+    # the default NO ACTION is what stops a use case a scored run points at from being
+    # deleted out from under it.
+    use_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("use_cases.id"), index=True)
     # The model that generated the responses in this conversation ("Claude Opus 4.5",
     # "2.5 Pro"), as reported by the capturing client. None when the client did not
     # know it: an .xlsx upload never does, and neither does a chat UI that stopped
@@ -151,6 +153,10 @@ class ScenarioResult(Base):
     platform_execution: Mapped[PlatformExecution] = relationship(
         back_populates="scenario_results"
     )
+    # Eager-load it (see ``db.repositories.runs``): the runner's log line and
+    # ``_serialize_scenario`` both read ``use_case.name``, and a lazy many-to-one under
+    # an AsyncSession is a MissingGreenlet, not a slow query.
+    use_case: Mapped[UseCase] = relationship()
     turns: Mapped[list[Turn]] = relationship(
         back_populates="scenario_result",
         cascade="all, delete-orphan",
@@ -322,23 +328,58 @@ class TurnTokenUsage(Base):
     turn: Mapped[Turn] = relationship(back_populates="token_usage")
 
 
-class ScenarioMetric(Base):
-    """Which metric applies to which scenario ``use_case``.
+class UseCase(Base):
+    """A named set of metrics — the use case a scenario is scored under.
 
-    The metric taxonomy lives in code (see ``scorekeeper.core.metrics``); this table is
-    the queryable projection of each metric's decorator-declared scenarios,
-    materialized by ``scorekeeper.core.metrics.selection.sync_selection``. The scoring
-    runner reads it to pick the metric subset for a scenario. ``metric_name`` is a
-    plain string validated against the code registry (no FK, since there is no
-    metric-definitions table). ``use_case == "default"`` is the fallback set.
+    Created through ``POST /use-cases``: this table and the ``use_case_metrics`` join
+    are user data, not a projection of code. Only ``metrics`` is code-owned (see
+    :class:`MetricDefinition`), so a set may only reference metrics that exist in the
+    registry. ``"default"`` is always present — it is what an upload that names no use
+    case lands on — and is seeded with no metrics.
+
+    Rows here are never deleted: every ``ScenarioResult`` foreign-keys the use case it
+    was scored under, so dropping one would rewrite history. The API exposes no DELETE.
     """
 
-    __tablename__ = "scenario_metrics"
-    __table_args__ = (UniqueConstraint("use_case", "metric_name", name="uq_scenario_metric"),)
+    __tablename__ = "use_cases"
+    __table_args__ = (UniqueConstraint("name", name="uq_use_case_name"),)
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    use_case: Mapped[str] = mapped_column(String(128), index=True)
-    metric_name: Mapped[str] = mapped_column(String(128))
+    name: Mapped[str] = mapped_column(String(128))
+
+
+class MetricDefinition(Base):
+    """One metric of the code registry, as a row a use-case set can point at.
+
+    ``name`` mirrors ``Metric.name``; the class stays the source of truth and this row
+    exists only so ``use_case_metrics`` has a key to reference instead of repeating the
+    string. Upserted from ``MetricRegistry`` by
+    ``scorekeeper.core.metrics.selection.sync_metrics``. Named ``MetricDefinition``
+    because ``Metric`` is the domain base class.
+    """
+
+    __tablename__ = "metrics"
+    __table_args__ = (UniqueConstraint("name", name="uq_metric_name"),)
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(128))
+
+
+class UseCaseMetric(Base):
+    """One metric belonging to one use case — the many-to-many join."""
+
+    __tablename__ = "use_case_metrics"
+    __table_args__ = (
+        UniqueConstraint("use_case_id", "metric_id", name="uq_use_case_metric"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    use_case_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("use_cases.id", ondelete="CASCADE"), index=True
+    )
+    metric_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("metrics.id", ondelete="CASCADE"), index=True
+    )
 
 
 class AuthProviderConfig(Base):

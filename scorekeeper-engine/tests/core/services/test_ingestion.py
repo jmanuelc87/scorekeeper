@@ -25,6 +25,7 @@ from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import JudgeVerdict
 from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.core.metrics.scale import Unit
+from scorekeeper.core.services import ingestion
 from scorekeeper.core.services.ingestion import UploadedFile, ingest_evaluation, project_turns
 from scorekeeper.core.services.runs import get_run_summary
 from scorekeeper.core.services.scoring import run_evaluation
@@ -91,11 +92,16 @@ class Utilidad(_FakeMetric):
 
 
 @pytest.fixture
-def registry():
-    """Register a single fake metric (no scenarios → the 'default' set)."""
+async def registry(session: AsyncSession, compose_use_case):
+    """Register a single fake metric and link it to the ``default`` use case.
+
+    Metric selection is user data now: no metric declares a use case, so an upload
+    ingested under ``"default"`` scores nothing until a set links the two.
+    """
     saved = MetricRegistry.all()
     MetricRegistry.clear()
     MetricRegistry.add(Utilidad)
+    await compose_use_case([Utilidad.name])
     try:
         yield
     finally:
@@ -463,3 +469,48 @@ async def test_captured_citations_reach_turn_context(session: AsyncSession) -> N
     assert turn.retrieved_context_source == context
     # Two blank-line-separated blocks, so the metrics see two retrieved documents.
     assert len(split_context_docs(turn.retrieved_context_source)) == 2
+
+
+async def test_ingest_rejects_an_unknown_use_case(session: AsyncSession, registry) -> None:
+    with pytest.raises(ingestion.UnknownUseCaseError, match="Caso\\(s\\) de uso desconocido"):
+        await ingest_evaluation(
+            "claude",
+            [
+                UploadedFile(
+                    filename="esc1.xlsx",
+                    content=_conversation_bytes(),
+                    scenario_id="esc1",
+                    use_case="inexistente",
+                )
+            ],
+            session=session,
+        )
+
+    # Rolled back: a rejected use case persists nothing, not even the SourceFile.
+    runs = (await session.execute(select(func.count()).select_from(BenchmarkRun))).scalar_one()
+    assert runs == 0
+
+
+async def test_ingest_links_the_scenario_to_its_use_case_row(
+    session: AsyncSession, registry
+) -> None:
+    await ingest_evaluation(
+        "claude",
+        [
+            UploadedFile(
+                filename="esc1.xlsx",
+                content=_conversation_bytes(),
+                scenario_id="esc1",
+                use_case="default",
+            )
+        ],
+        session=session,
+    )
+
+    scenario = (
+        await session.scalars(
+            select(ScenarioResult).options(selectinload(ScenarioResult.use_case))
+        )
+    ).one()
+    # The FK resolves to the named row; the name is no longer stored on the scenario.
+    assert scenario.use_case.name == "default"

@@ -17,12 +17,16 @@ are documented in the [Metrics catalog](metrics-catalog.md).
 ```mermaid
 flowchart TD
     subgraph sel["Selection — which metrics run"]
-        reg["@register(scenarios=…)<br/>on each Metric class"]
-        tbl[("scenario_metrics<br/>table")]
-        uc["ScenarioResult.use_case"]
+        reg["@register<br/>on each Metric class"]
+        cat[("metrics<br/>table")]
+        api["POST /use-cases"]
+        tbl[("use_cases +<br/>use_case_metrics")]
+        uc["ScenarioResult.use_case_id"]
         inst["Metric instances"]
-        reg -- "sync_selection()" --> tbl
-        uc -- "resolve_scenario()" --> tbl
+        reg -- "sync_metrics()" --> cat
+        cat --> tbl
+        api --> tbl
+        uc -- "resolve()" --> tbl
         tbl --> inst
     end
 
@@ -45,11 +49,13 @@ flowchart TD
     sa -- "average()" --> pa["PlatformExecution.average_score"]
 ```
 
-- A metric declares which scenarios it applies to with a decorator; that mapping
-  is materialized into the `scenario_metrics` table.
-- The scoring runner reads a scenario's `use_case` (a comma-separated list whose
-  metric sets are unioned), resolves its metric subset, and runs each metric's
-  `evaluate()` against the turn — the metrics of a turn evaluate concurrently.
+- `@register` puts a metric in the code catalog; `sync_metrics()` mirrors its name
+  into the `metrics` table and links it to the reserved `default` use case. Every
+  *other* use case is user data, composed through `POST /use-cases` and stored in
+  `use_case_metrics`.
+- The scoring runner follows a scenario's `use_case_id` foreign key, resolves that
+  set, and runs each metric's `evaluate()` against the turn — the metrics of a turn
+  evaluate concurrently.
 - `evaluate()` sees only a `TurnView`: prompt, response, conversation history,
   the turn's retrieved context, and the expected output.
 - Each result becomes a `MetricScore` row; rollup turns them into a per-turn
@@ -70,7 +76,9 @@ behavior is the `evaluate()` method.**
 | `scale` | A `Scale` (see below); the raw score's range. |
 | `weight` | Relative weight in the rollup (default `1.0`). |
 | `rubric_version` | Rubric version string; stored on each score (default `"v1"`). |
-| `scenarios` | The `use_case` values this metric applies to (usually set by the decorator). |
+
+Which use cases a metric belongs to is deliberately **not** class metadata: that
+mapping is user data, composed through `POST /use-cases`.
 
 ```python
 class Metric(ABC):
@@ -79,7 +87,6 @@ class Metric(ABC):
     scale: ClassVar[Scale]
     weight: ClassVar[float] = 1.0
     rubric_version: ClassVar[str] = "v1"
-    scenarios: ClassVar[tuple[str, ...]] = ()
 
     @abstractmethod
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult: ...
@@ -117,7 +124,7 @@ The common case. Declare a Spanish `rubric` and the metadata; the base class doe
 the rest.
 
 ```python
-@register(scenarios=["soporte_tecnico", "ventas"])
+@register
 class Correccion(SingleRubricMetric):
     name = "correccion"
     category = MetricCategory.RAG
@@ -133,7 +140,7 @@ When a score needs more than one step (extract → verify → aggregate), subcla
 whose `entries` keep the per-item detail as typed `TraceEntry`s.
 
 ```python
-@register(scenarios=["soporte_tecnico"])
+@register
 class SeguridadFactual(MultiStepMetric):
     name = "seguridad_factual"
     category = MetricCategory.RAG
@@ -238,14 +245,14 @@ on their own.
 ## Registry and the `@register` decorator
 
 Concrete metrics register themselves with `@register`
-(`scorekeeper.core.metrics.registry`), co-located with the class. The decorator also
-carries the **scenarios** the metric applies to:
+(`scorekeeper.core.metrics.registry`), co-located with the class. The decorator takes
+no arguments — it declares only that the metric exists and can be scored:
 
 ```python
-@register(scenarios=["soporte_tecnico", "ventas"])   # applies to these use cases
+@register
 class Correccion(SingleRubricMetric): ...
 
-@register                                             # applies to the "default" set
+@register
 class Utilidad(SingleRubricMetric): ...
 ```
 
@@ -254,31 +261,43 @@ class Utilidad(SingleRubricMetric): ...
 imports every metric module, which is what populates the registry — so **every
 metric module must be imported from `catalog/__init__.py`**.
 
-## Per-scenario selection (in the database)
+## Per-use-case selection (in the database)
 
-Different scenarios score on different metric subsets. The mapping is **data,
-stored in the `scenario_metrics` table** (see [Data model](data-model.md)), but
-the *authoring source of truth is the decorator on each class*:
+Different scenarios score on different metric subsets. Ownership is split in two:
 
-- `selection.declared_selection()` queries the registered classes at runtime and
-  returns the desired `(use_case, metric_name)` pairs (a metric with no declared
-  scenarios belongs to the reserved `"default"` set).
-- `selection.sync_selection(session)` reconciles the table with that declaration
-  — inserting missing rows and removing stale ones. It is **idempotent**; run it
-  after changing metric scenarios. The caller commits.
-- `selection.metrics_for(session, use_case)` returns the metric names for a
-  `use_case`, falling back to `"default"` when a scenario has no rows.
-- `selection.resolve(session, use_case)` instantiates those metrics (raising a
-  Spanish `KeyError` if a stored name is not in the code registry).
+**The catalog — and `default` — are code.** `selection.sync_metrics(session)` mirrors
+every registered metric name into the `metrics` table and links each one to the
+reserved `"default"` use case, creating it if missing. So `default` always means
+"every metric", and a metric added to the catalog joins it on the next call with no
+migration. It is **idempotent and insert-only** — a name dropped from the registry
+keeps its row, because a stored set and historical `metric_scores` may still
+reference it. The caller commits. It runs automatically on ingest and on
+`POST /use-cases`.
+
+**Every other set is data.** Use cases other than `default` are written only through
+`POST /use-cases` (see [APIs](apis.md)), which names a set and picks the metrics it
+scores; `sync_metrics` never touches them. A metric class does not declare which use
+cases it belongs to, so composing a set needs no code change and no deploy. A set can
+only reference metrics that exist in the registry — the API answers `422` otherwise.
+Create one when you want a **narrower** set than `default`'s everything.
+
+Reading a set back:
+
+- `selection.metrics_for(session, use_case_id)` returns the metric names linked to a
+  use case, ordered by name. There is no fallback: an empty list would be a real
+  answer, not a miss. In practice it cannot happen — `default` carries the whole
+  registry and `POST /use-cases` rejects an empty `metrics` list.
+- `selection.resolve(session, use_case_id)` instantiates those metrics, raising a
+  Spanish `KeyError` if a stored name is not in the code registry.
 
 ```python
 from scorekeeper.db.connection import SessionLocal
-from scorekeeper.core.metrics.selection import sync_selection, resolve
+from scorekeeper.core.services.use_cases import create_use_case
+from scorekeeper.core.metrics.selection import resolve
 
-with SessionLocal() as session:
-    sync_selection(session)          # materialize decorator scenarios → table
-    session.commit()
-    metrics = resolve(session, "soporte_tecnico")   # [Metric, Metric, ...]
+async with SessionLocal() as session:
+    uc = await create_use_case("soporte_tecnico", ["correccion"], session=session)
+    metrics = await resolve(session, uuid.UUID(uc["id"]))   # [Metric, Metric, ...]
 ```
 
 ## Rollup
@@ -306,11 +325,10 @@ derived and recomputable.
 2. Subclass `SingleRubricMetric` (one rubric) or `MultiStepMetric` (several
    steps). Set `name`, `category`, `scale`, `weight`, and — for single-rubric —
    the Spanish `rubric`.
-3. Decorate it with `@register(scenarios=[...])` listing the `use_case`s it
-   applies to (omit `scenarios` to put it in the `"default"` set).
+3. Decorate it with `@register`.
 4. Import the module in `catalog/__init__.py` so it registers on import.
-5. Run `sync_selection(session)` once to materialize the new mapping into
-   `scenario_metrics`.
+5. Link it to the use cases that should score it via `POST /use-cases` — no code
+   change needed, and `GET /metrics` lists it as soon as the process restarts.
 6. Add a unit test (see below).
 
 ```python
@@ -325,7 +343,7 @@ Evalúa la CLARIDAD de la respuesta (1-5): {prompt} {response}
 Devuelve la puntuación y una justificación breve en español.
 """
 
-@register(scenarios=["soporte_tecnico"])
+@register
 class Claridad(SingleRubricMetric):
     name = "claridad"
     category = MetricCategory.RAG

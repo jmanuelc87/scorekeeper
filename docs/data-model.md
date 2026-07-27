@@ -31,11 +31,20 @@ the *current* weights/scales — `rubric_version` captures rubric drift but not
 weight drift. This is acceptable for a benchmarking tool whose rollups are
 derived and recomputable.
 
-Which metrics apply to a scenario is data, stored in **ScenarioMetric** and keyed
-by `use_case`. Each metric class declares its scenarios via the `@register`
-decorator; `scorekeeper.core.metrics.selection.sync_selection` materializes that
-declaration into the table, and the scoring runner reads it to pick the metric
-subset per scenario.
+Which metrics apply to a scenario is data, normalized across three tables:
+**UseCase** (a named metric set), **MetricDefinition** (the registered metrics),
+and **UseCaseMetric** (the many-to-many between them). A `ScenarioResult` points
+at exactly one `UseCase` by foreign key, so a name is stored once per use case
+rather than repeated per pairing.
+
+Ownership is split. The *catalog* is code: each metric class registers itself
+with `@register`, and `scorekeeper.core.metrics.selection.sync_metrics` mirrors
+those names into `metrics`. The *sets* are user data, composed through
+`POST /use-cases` — a metric class no longer declares which use cases it belongs
+to. The one exception is the reserved `default` set, which `sync_metrics` keeps
+pointed at **every** registered metric so an upload that names no use case still
+gets a full evaluation. The scoring runner reads a scenario's set back through
+its FK.
 
 ## ER diagram
 
@@ -69,7 +78,7 @@ erDiagram
         UUID id PK
         UUID platform_execution_id FK
         String scenario_id
-        String use_case
+        UUID use_case_id FK
         String model_name
         String source_ref
         String status
@@ -123,10 +132,20 @@ erDiagram
         Integer output_tokens
     }
 
-    ScenarioMetric {
+    UseCase {
         UUID id PK
-        String use_case
-        String metric_name
+        String name UK
+    }
+
+    MetricDefinition {
+        UUID id PK
+        String name UK
+    }
+
+    UseCaseMetric {
+        UUID id PK
+        UUID use_case_id FK
+        UUID metric_id FK
     }
 
     AuthProviderConfig {
@@ -164,11 +183,13 @@ erDiagram
     Turn ||--o{ MetricScore : "has"
     Turn ||--|| TurnTokenUsage : "has"
     MetricScore ||--|| MetricTrace : "has"
+    UseCase ||--o{ ScenarioResult : "scores"
+    UseCase ||--o{ UseCaseMetric : "selects"
+    MetricDefinition ||--o{ UseCaseMetric : "selected by"
 ```
 
-`ScenarioMetric`, `AuthProviderConfig`, and `DocumentCacheEntry` are standalone tables (no FK
-into the run hierarchy). `ScenarioMetric` is joined to scenarios by matching `use_case`;
-`AuthProviderConfig` is read by the retrieval pipeline's authorize stage, keyed by `host`
+`AuthProviderConfig` and `DocumentCacheEntry` are standalone tables (no FK into the run
+hierarchy). `AuthProviderConfig` is read by the retrieval pipeline's authorize stage, keyed by `host`
 (unique together with `provider`); `DocumentCacheEntry` is the fetch stage's download index,
 keyed by `url`.
 
@@ -219,7 +240,7 @@ One conversation loaded from the source file for a use case.
 | `id` | UUID | Primary key. |
 | `platform_execution_id` | UUID | FK → `platform_executions.id`, `ON DELETE CASCADE`. |
 | `scenario_id` | String(128) | Identifier of the scenario / use case tested. |
-| `use_case` | String(128) | Human-readable use case label. |
+| `use_case_id` | UUID | FK → `use_cases.id` (indexed). The metric set this conversation is scored with. No `ON DELETE`: the default `NO ACTION` is what stops a use case a scored run points at from being deleted out from under it. |
 | `model_name` | String(128) | The model that generated the responses (`"Claude Opus 4.5"`, `"2.5 Pro"`), as reported by the capturing client. `NULL` when unknown — an `.xlsx` import never carries one, and the browser extension leaves it empty when the chat does not name its model. |
 | `source_ref` | String(256) | Reference into the source file: sheet name, conversation key, or row range. |
 | `status` | String(32) | Scenario lifecycle status. |
@@ -325,17 +346,46 @@ counts are collected.
 Re-scoring a turn updates the existing row in place, so there is always exactly
 one row per turn.
 
-### ScenarioMetric
+### UseCase
 
-Which metric applies to which scenario `use_case`. The metric taxonomy lives in
-code; this table is the queryable projection of each metric's decorator-declared
-scenarios, materialized by `scorekeeper.core.metrics.selection.sync_selection`.
+A named set of metrics — the use case a scenario is scored under (`table use_cases`).
+Created through `POST /use-cases`: this table and `use_case_metrics` are user data, not a
+projection of code. The exception is `"default"`, which `sync_metrics` creates and keeps
+linked to **every** registered metric, so an upload that names no use case gets the full
+evaluation and a newly added metric joins it automatically. Every other set is left
+alone by the sync.
+
+Rows are never deleted, and the API exposes no `DELETE`: every `ScenarioResult`
+foreign-keys the use case it was scored under, so dropping one would rewrite history.
 
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | UUID | Primary key. |
-| `use_case` | String(128) | Scenario type the metric applies to (indexed). `"default"` is the fallback set used when a `use_case` has no rows. |
-| `metric_name` | String(128) | Metric name, validated against the code registry at resolve time (no FK). Unique together with `use_case`. |
+| `name` | String(128) | Unique (`uq_use_case_name`). What ingestion payloads send as `use_case` and what the API emits. |
+
+### MetricDefinition
+
+One metric of the code registry, as a row a use-case set can point at (`table metrics`).
+`name` mirrors `Metric.name`; the class stays the source of truth and this row exists only
+so `use_case_metrics` has a key to reference instead of repeating the string. Upserted from
+`MetricRegistry` by `scorekeeper.core.metrics.selection.sync_metrics`, which never deletes —
+a name dropped from the registry may still be referenced by a stored set and by historical
+`metric_scores`.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `name` | String(128) | Unique (`uq_metric_name`). Resolved back to a metric class at score time. |
+
+### UseCaseMetric
+
+The many-to-many join: one metric belonging to one use case (`table use_case_metrics`).
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `use_case_id` | UUID | FK → `use_cases.id`, `ON DELETE CASCADE` (indexed). |
+| `metric_id` | UUID | FK → `metrics.id`, `ON DELETE CASCADE` (indexed). Unique together with `use_case_id` (`uq_use_case_metric`). |
 
 ### AuthProviderConfig
 

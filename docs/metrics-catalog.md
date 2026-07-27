@@ -4,35 +4,44 @@ The concrete evaluation metrics that ship in
 `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/`. Each entry documents *what* the metric
 measures and *how* it is scored; for the taxonomy those metrics are built on
 (the `Metric` base classes, scales, the `Judge` seam, registration and
-per-scenario selection) see [Evaluation metrics](evaluation-metrics.md), and for
+per-use-case selection) see [Evaluation metrics](evaluation-metrics.md), and for
 where the scores land see the [Data model](data-model.md).
 
 All rubrics, prompts and justifications are in Spanish.
 
-| Metric (`name`) | Category | Scale | Weight | Higher means | Applies to |
-| --- | --- | --- | --- | --- | --- |
-| [`answer_relevance`](#answer_relevance) | `rag` | `Unit()` 0–1 | 1.0 | answer sticks closer to the question (better) | `answer_relevance` |
-| [`contextual_precision`](#contextual_precision) | `rag` | `Unit()` 0–1 | 1.0 | retriever ranks relevant nodes ahead of irrelevant ones (better) | `contextual_precision` |
-| [`faithfulness_ragas`](#faithfulness_ragas) | `rag` | `Unit()` 0–1 | 1.0 | more answer statements entailed by context (better) | `faithfulness_ragas` |
-| [`faithfulness_deepeval`](#faithfulness_deepeval) | `rag` | `Unit()` 0–1 | 1.0 | fewer answer claims contradicted by context (better) | `faithfulness_deepeval` |
-| [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination — worse raw score, but `Inverted` normalizes it to higher-is-better faithfulness | `hallucination` |
+| Metric (`name`) | Category | Scale | Weight | Higher means |
+| --- | --- | --- | --- | --- |
+| [`answer_relevance`](#answer_relevance) | `rag` | `Unit()` 0–1 | 1.0 | answer sticks closer to the question (better) |
+| [`contextual_precision`](#contextual_precision) | `rag` | `Unit()` 0–1 | 1.0 | retriever ranks relevant nodes ahead of irrelevant ones (better) |
+| [`faithfulness_ragas`](#faithfulness_ragas) | `rag` | `Unit()` 0–1 | 1.0 | more answer statements entailed by context (better) |
+| [`faithfulness_deepeval`](#faithfulness_deepeval) | `rag` | `Unit()` 0–1 | 1.0 | fewer answer claims contradicted by context (better) |
+| [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination — worse raw score, but `Inverted` normalizes it to higher-is-better faithfulness |
+
+Which use case scores which metric is not shown here — it is data, not a property of the
+metric (see below).
 
 Every metric here is a `MultiStepMetric` — it orchestrates several `Judge` calls
 and records what each step produced as a structured `MetricTrace` (`steps` → typed
 `entries`), persisted on the `metric_traces` table (1:1 with `MetricScore`). None
 import an LLM SDK: they depend only on the `Judge` seam.
 
-Every metric declares the `use_case`(s) it applies to via `@register(scenarios=…)`,
-and each one applies to a single use case named after itself
-(`scenarios=["answer_relevance"]`, `["contextual_precision"]`,
-`["faithfulness_ragas"]`, `["faithfulness_deepeval"]`, `["hallucination"]`) — so a
-scenario opts into exactly the metrics it names. The two `faithfulness_*` variants
-are selected independently: a scenario that wants both lists both tokens
-(`use_case = "faithfulness_ragas,faithfulness_deepeval"`). None of these catalog
-metrics belong to the reserved **`default`** set, so a scenario is scored by a
-metric only when its comma-separated `use_case` names that metric's use case (see
-[Evaluation metrics → Per-scenario
-selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
+A metric does not declare which use cases it applies to — that mapping is user data,
+composed through `POST /use-cases` (see [Evaluation metrics → Per-use-case
+selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
+
+A fresh database holds exactly one use case, the reserved **`default`**, which scores
+**every metric on this page** — so an upload that names no use case gets the full
+evaluation, and a metric added later joins it automatically. Create your own use case
+when you want a narrower set:
+
+```http
+POST /api/v1/use-cases
+{"name": "rag_completo", "metrics": ["faithfulness_ragas", "faithfulness_deepeval"]}
+```
+
+then ingest under `use_case: "rag_completo"`. Any combination works — the two
+`faithfulness_*` variants are independent metrics, so a set may list one, the other, or
+both. `default` is the only set maintained from code; every other one is yours.
 
 ## `answer_relevance`
 
@@ -83,13 +92,11 @@ embeddings never raise.
 so the metric short-circuits to `raw_score = 0.0` (no relevance) with **no embed
 call**.
 
-### Scenarios
+### Use cases
 
-Registered with `@register(scenarios=["answer_relevance"])`, so it materializes under
-the `answer_relevance` use case (not the reserved `default` set). To change the use
-cases it applies to, edit the decorator and run `sync_selection(session)` once to
-re-materialize the mapping (see [Evaluation metrics → Per-scenario
-selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
+Belongs to no use case until one lists it in `POST /use-cases` — the metric itself
+declares nothing (see [Evaluation metrics → Per-use-case
+selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 
 ### Notes
 
@@ -169,13 +176,11 @@ is *useful for constructing the expected answer*. Only `{expected_output}` and
 other braces so formatting never trips on stray `{}`. The turn's input question is
 appended automatically by the judge.
 
-### Scenarios
+### Use cases
 
-Registered with `@register(scenarios=["contextual_precision"])`, so it materializes
-under the `contextual_precision` use case (not the reserved `default` set). To change
-the use cases it applies to, edit the decorator and run `sync_selection(session)` once
-to re-materialize the mapping (see [Evaluation metrics → Per-scenario
-selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
+Belongs to no use case until one lists it in `POST /use-cases` — the metric itself
+declares nothing (see [Evaluation metrics → Per-use-case
+selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 
 ### Notes
 
@@ -239,14 +244,11 @@ Raw score is already in `[0, 1]` (`Unit()`), **higher is better**.
   It must **not** contain `{prompt}`/`{response}`/`{context}` — the judge appends
   the full turn (including retrieved context) automatically.
 
-### Scenarios
+### Use cases
 
-Registered with `@register(scenarios=["faithfulness_ragas"])`, so it materializes
-under the `faithfulness_ragas` use case (not the reserved `default` set) and is
-selected independently of the DeepEval variant. To change the use cases it applies
-to, edit the decorator and run `sync_selection(session)` once to re-materialize the
-mapping (see [Evaluation metrics → Per-scenario
-selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
+A separate metric from the DeepEval variant, so a use case may list either or both.
+Add it to a set with `POST /use-cases` (see [Evaluation metrics → Per-use-case
+selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 
 ### Tests
 
@@ -303,15 +305,18 @@ rendering.
 - `VERIFY_DEEPEVAL` asks whether the `{truths}` contradict the `{claim}`; it too
   must not contain the turn placeholders.
 
-### Scenarios
+### Use cases
 
-Registered with `@register(scenarios=["faithfulness_deepeval"])`, so it materializes
-under the `faithfulness_deepeval` use case (not the reserved `default` set). A
-scenario that wants both groundedness algorithms names both use cases:
-`use_case = "faithfulness_ragas,faithfulness_deepeval"`. To change the use cases it
-applies to, edit the decorator and run `sync_selection(session)` once to
-re-materialize the mapping (see [Evaluation metrics → Per-scenario
-selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
+A separate metric from the RAGAS variant. A scenario that wants both groundedness
+algorithms is ingested under a use case listing both:
+
+```http
+POST /api/v1/use-cases
+{"name": "rag_completo", "metrics": ["faithfulness_ragas", "faithfulness_deepeval"]}
+```
+
+(see [Evaluation metrics → Per-use-case
+selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 
 ### Tests
 
@@ -380,20 +385,17 @@ contradiction, a direct conflict in any stated attribute is a contradiction, be
 decisive, …), a JSON output shape, and three worked examples. `{documento}` is the
 premise (one document); `{response}` is the hypothesis.
 
-### Scenarios
+### Use cases
 
-Registered with `@register(scenarios=["hallucination"])`, so it materializes under the
-`hallucination` use case rather than the reserved `default` set. To change the use
-cases it applies to, edit the decorator and re-sync:
+Belongs to no use case until one lists it. Add it when creating that use case:
 
-```python
-@register(scenarios=["hallucination"])
-class Hallucination(MultiStepMetric): ...
+```http
+POST /api/v1/use-cases
+{"name": "soporte", "metrics": ["hallucination", "answer_relevance"]}
 ```
 
-Then run `sync_selection(session)` once to materialize the new mapping into
-`scenario_metrics` (see [Evaluation metrics → Per-scenario
-selection](evaluation-metrics.md#per-scenario-selection-in-the-database)).
+(see [Evaluation metrics → Per-use-case
+selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 
 ### Notes
 

@@ -73,12 +73,12 @@ def test_registry_lookup_and_errors(registered_metrics) -> None:
         register(DuplicateMetric)
 
 
-def test_decorator_declares_scenarios(registered_metrics) -> None:
-    @register(scenarios=["soporte_tecnico", "ventas"])
+def test_decorator_registers_the_class(registered_metrics) -> None:
+    @register
     class NewMetric(SingleRubricMetric):
         name = "new_metric"
         scale = Likert()
         rubric = "..."
 
-    assert NewMetric.scenarios == ("soporte_tecnico", "ventas")
+    # The decorator returns the class unchanged, so subclass attributes survive it.
     assert MetricRegistry.get("new_metric") is NewMetric

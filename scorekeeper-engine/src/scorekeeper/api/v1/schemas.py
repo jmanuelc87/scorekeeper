@@ -198,3 +198,29 @@ class AuthProviderRead(BaseModel):
     settings: dict[str, Any] | None
     created_at: datetime
     updated_at: datetime
+
+
+class UseCaseCreate(BaseModel):
+    """Body for ``POST /use-cases`` — a name and the metrics it scores."""
+
+    name: str = Field(..., min_length=1, description="Nombre único del caso de uso.")
+    metrics: list[str] = Field(
+        ..., min_length=1, description="Nombres de métricas, tal como los lista GET /metrics."
+    )
+
+
+class UseCaseRead(BaseModel):
+    """A use case and the metric names linked to it."""
+
+    id: str
+    name: str
+    metrics: list[str]
+
+
+class MetricRead(BaseModel):
+    """One registered metric — the catalog a use case is composed from."""
+
+    name: str
+    category: str
+    weight: float
+    rubric_version: str

@@ -94,11 +94,16 @@ class Utilidad(_FakeMetric):
 
 
 @pytest.fixture
-def registry():
-    """Register a single fake metric (no scenarios → the 'default' set)."""
+async def registry(session: AsyncSession, compose_use_case):
+    """Register a single fake metric and link it to the ``default`` use case.
+
+    Metric selection is user data now: no metric declares a use case, so an upload
+    ingested under ``"default"`` scores nothing until a set links the two.
+    """
     saved = MetricRegistry.all()
     MetricRegistry.clear()
     MetricRegistry.add(Utilidad)
+    await compose_use_case([Utilidad.name])
     try:
         yield
     finally:
@@ -347,11 +352,13 @@ async def test_scenario_serialization_exposes_id(session: AsyncSession, registry
 
 
 async def test_retrieve_scenario_turns_empty_scenario_returns_list(
-    session: AsyncSession,
+    session: AsyncSession, compose_use_case
 ) -> None:
     execution = PlatformExecution(platform="claude", run=BenchmarkRun())
     scenario = ScenarioResult(
-        scenario_id="vacio", use_case="default", platform_execution=execution
+        scenario_id="vacio",
+        use_case=await compose_use_case([]),
+        platform_execution=execution,
     )
     session.add(scenario)
     await session.commit()

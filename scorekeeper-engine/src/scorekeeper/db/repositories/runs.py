@@ -29,6 +29,9 @@ def run_tree_options(*, metric_scores: bool = True, retrieval: bool = True):
     ``MetricScore.trace`` is required, not an optimization: clearing
     ``turn.metric_scores`` cascades delete-orphan into it, which the unit of work
     resolves *at flush time* — the least obvious place to take a lazy load.
+
+    ``ScenarioResult.use_case`` comes along because ``run_scenario`` names it in its
+    log line and metric selection reads its links.
     """
     turn_opts = [selectinload(Turn.token_usage)]
     if metric_scores:
@@ -38,8 +41,10 @@ def run_tree_options(*, metric_scores: bool = True, retrieval: bool = True):
     return (
         selectinload(BenchmarkRun.platform_executions)
         .selectinload(PlatformExecution.scenario_results)
-        .selectinload(ScenarioResult.turns)
-        .options(*turn_opts)
+        .options(
+            selectinload(ScenarioResult.use_case),
+            selectinload(ScenarioResult.turns).options(*turn_opts),
+        )
     )
 
 
@@ -47,7 +52,8 @@ def _list_options(*, with_metric_scores: bool):
     """Eager-load the run tree down to the depth serialization requires (no N+1).
 
     Turns are loaded at *every* depth, not just for metric scores: serializing a
-    run always reports turn-level progress, which counts a scenario's turns.
+    run always reports turn-level progress, which counts a scenario's turns. The
+    use case comes along at every depth too — ``_serialize_scenario`` emits its name.
     """
     turns = selectinload(ScenarioResult.turns)
     if with_metric_scores:
@@ -55,7 +61,7 @@ def _list_options(*, with_metric_scores: bool):
     return (
         selectinload(BenchmarkRun.platform_executions)
         .selectinload(PlatformExecution.scenario_results)
-        .options(turns)
+        .options(turns, selectinload(ScenarioResult.use_case))
     )
 
 

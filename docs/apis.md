@@ -1,7 +1,8 @@
 # HTTP APIs
 
 The HTTP API (`scorekeeper.main` / `scorekeeper.api.v1`, run with `scorekeeper-api`) serves the results
-dashboard, triggers evaluations, and manages the retrieval credential store. This page
+dashboard, triggers evaluations, composes the metric set of each use case, and manages the
+retrieval credential store. This page
 documents every endpoint; add new ones as their own `##` section below. For the models these
 endpoints read and write, see the [Data model](data-model.md); for how metrics are chosen and
 scored, see [Evaluation metrics](evaluation-metrics.md); for the credential store, see
@@ -17,6 +18,9 @@ scored, see [Evaluation metrics](evaluation-metrics.md); for the credential stor
 | `GET /api/v1/evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /api/v1/runs`                  | Retrieve full scored run details, filtered and at a chosen granularity. |
 | `GET /api/v1/scenarios/{scenario_id}/turns` | Retrieve one scenario's turns — conversation content plus per-metric scores. |
+| `GET /api/v1/metrics`               | List the registered metrics a use case can be composed from. |
+| `POST /api/v1/use-cases`            | Create a use case: a name plus the set of metrics it is scored with. |
+| `GET /api/v1/use-cases`             | List every use case with its metric names. |
 | `GET /api/v1/auth-providers`        | List the retrieval credential store's provider rows (optional filters). |
 | `POST /api/v1/auth-providers`       | Create a credential provider row (write-only `private_key`, stored encrypted). |
 | `GET /api/v1/auth-providers/{id}`   | Fetch one credential provider by UUID. |
@@ -79,7 +83,7 @@ anything — the run lands at status `ingerido` and stays there until
 | Field       | Type                     | Required | Default     | Description |
 |-------------|--------------------------|----------|-------------|-------------|
 | `platform`  | `string`                 | yes      | —           | The **default** platform for the upload (e.g. `"claude"`, `"copilot"`, `"gemini"`). Applies to every file that does not override it. Must be non-empty. |
-| `use_case`  | `string`                 | no       | `"default"` | Default metric-selection use case for every file. Comma-separated tokens are unioned (e.g. `"faithfulness_ragas,hallucination"`). |
+| `use_case`  | `string`                 | no       | `"default"` | Default use case for every file — the metric set it is scored with. Must already exist (create it with [`POST /use-cases`](#post-apiv1use-cases)); an unknown name is a `422`. The fallback `"default"` scores **every** registered metric. |
 | `files`     | `object` (filename → overrides) | no | `{}`   | Per-file overrides keyed by the uploaded filename. A file with no entry uses the defaults. |
 
 Per-file override object:
@@ -87,7 +91,7 @@ Per-file override object:
 | Field         | Type     | Default              | Description |
 |---------------|----------|----------------------|-------------|
 | `scenario_id` | `string` | the file's stem      | Identifier stored on the `ScenarioResult`. |
-| `use_case`    | `string` | the payload `use_case` | Metric-selection use case for this file. |
+| `use_case`    | `string` | the payload `use_case` | Use case for this file. Must already exist. |
 | `platform`    | `string` | the payload `platform` | Platform to score this file under, overriding the payload default. |
 
 ### Semantics: one platform per file (defaulting to the payload platform)
@@ -116,8 +120,11 @@ provenance; the run links `source_file` only when exactly one file is uploaded
 
 On the request (`ingest_evaluation`):
 
-1. Seed the `use_case → metric` selection table (`sync_selection`) so metrics
-   resolve — without it every turn scores `None`.
+1. Mirror the code metric registry into the `metrics` table and seed the
+   `default` use case (`sync_metrics`), then resolve each upload's `use_case`
+   **name** to its `use_cases` row. An unknown name aborts the whole request with
+   `422` before anything is persisted — metric sets are data now, so a typo is a
+   client error rather than a run that silently scores nothing.
 2. Parse each file into raw messages, then **project** them into `Turn` rows:
    messages are grouped by turn number, `user` content becomes the `prompt` and
    `model` content the `response` (a missing side becomes `""`). The raw
@@ -166,7 +173,7 @@ Call `POST /api/v1/evaluations/{run_id}/start` to begin scoring, then poll
 
 | Status | When |
 |--------|------|
-| `422`  | `payload` is not valid JSON or fails schema validation (e.g. empty `platform`). |
+| `422`  | `payload` is not valid JSON or fails schema validation (e.g. empty `platform`), **or** a `use_case` names a use case that does not exist. |
 | `400`  | An uploaded file is not `.xlsx`, is empty, has no `role`/`content` columns, or no file/platform was provided. Ingest rolls back — nothing is persisted. |
 
 ## `POST /api/v1/captures`
@@ -188,7 +195,7 @@ conversation is indistinguishable downstream from an uploaded one.
 | Field           | Type       | Required | Default     | Description |
 |-----------------|------------|----------|-------------|-------------|
 | `platform`      | `string`   | yes      | —           | The **default** platform for the request. Applies to every conversation that does not override it. |
-| `use_case`      | `string`   | no       | `"default"` | Default metric-selection use case. Comma-separated tokens are unioned. |
+| `use_case`      | `string`   | no       | `"default"` | Default use case — the metric set the conversations are scored with. Must already exist ([`POST /use-cases`](#post-apiv1use-cases)); an unknown name is a `422`. |
 | `conversations` | `array`    | yes      | —           | One or more captured conversations; **each is one scenario**. Must be non-empty. |
 
 Conversation object:
@@ -197,7 +204,7 @@ Conversation object:
 |---------------|-------------------|----------|--------------------|-------------|
 | `scenario_id` | `string`          | yes      | —                  | Identifier stored on the `ScenarioResult`. |
 | `messages`    | `array`           | yes      | —                  | The conversation, in order. Must be non-empty and at least one message must have content. |
-| `use_case`    | `string`          | no       | the payload `use_case` | Metric-selection use case for this conversation. |
+| `use_case`    | `string`          | no       | the payload `use_case` | Use case for this conversation. Must already exist. |
 | `platform`    | `string`          | no       | the payload `platform` | Platform to score this conversation under. |
 | `model_name`  | `string`          | no       | `null`             | The model that produced the responses (`"Claude Opus 4.5"`), stored on the `ScenarioResult`. The browser extension detects it from the chat's model picker and lets the user correct it; omitted, `null` or blank all store `NULL`. |
 | `source_ref`  | `string`          | no       | the `scenario_id`  | Where the capture came from (the chat URL); stored as the scenario's `source_ref`. |
@@ -228,7 +235,7 @@ Identical to `POST /api/v1/evaluations` — the run is persisted at `ingerido`. 
 
 | Status | When |
 |--------|------|
-| `422`  | The body fails schema validation (empty `platform`, empty `conversations`, a conversation with no `messages`). |
+| `422`  | The body fails schema validation (empty `platform`, empty `conversations`, a conversation with no `messages`), **or** a `use_case` names a use case that does not exist. |
 | `400`  | A conversation's messages are all blank, or ingest rejected the run. Nothing is persisted. |
 
 ## `PATCH /api/v1/evaluations/{run_id}/turns/selection`
@@ -440,6 +447,80 @@ read it via [`GET /api/v1/turns/{turn_id}/traces`](#get-apiv1turnsturn_idtraces)
 |--------|------|
 | `404`  | The `scenario_id` is unknown or not a valid UUID. |
 
+## `GET /api/v1/metrics`
+
+List every metric that can be linked to a use case — the catalog to pick from when
+composing one. Read straight off the code registry, so adding a *metric* is still a
+code change; only composing use cases from them is runtime data.
+
+### Response `200`
+
+```json
+[
+  {"name": "answer_relevance", "category": "rag", "weight": 1.0, "rubric_version": "v1"},
+  {"name": "hallucination", "category": "seguridad", "weight": 1.0, "rubric_version": "v1"}
+]
+```
+
+Ordered by `name`. See the [Metrics catalog](metrics-catalog.md) for what each measures.
+
+## `POST /api/v1/use-cases`
+
+Create a use case: a **name** plus the set of metrics a conversation ingested under it
+is scored with. This is what makes a metric set data rather than code — see
+[Data model → UseCase](data-model.md#usecase).
+
+### Body
+
+| Field     | Type       | Required | Notes |
+|-----------|------------|----------|-------|
+| `name`    | `string`   | yes      | Unique. What `use_case` in an ingestion payload names. |
+| `metrics` | `string[]` | yes      | At least one metric name, as listed by `GET /api/v1/metrics`. Repeats are deduplicated. |
+
+```json
+{"name": "soporte", "metrics": ["hallucination", "answer_relevance"]}
+```
+
+### Response `201`
+
+```json
+{
+  "id": "a20ff2cb-50ab-4c79-ae34-c42af36d0d5c",
+  "name": "soporte",
+  "metrics": ["answer_relevance", "hallucination"]
+}
+```
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `422`  | Blank `name`, an empty `metrics` list, or a metric name not in the registry. |
+| `409`  | A use case with that `name` already exists. |
+
+> **No update, no delete.** Every scenario result foreign-keys the use case it was
+> scored under, so changing or removing a set would rewrite what a finished run
+> means. To score differently, create a new use case.
+
+## `GET /api/v1/use-cases`
+
+List every use case with its metric names.
+
+### Response `200`
+
+```json
+[
+  {"id": "…", "name": "default", "metrics": []},
+  {"id": "…", "name": "soporte", "metrics": ["answer_relevance", "hallucination"]}
+]
+```
+
+`default` scores **every registered metric** and is the only use case on a fresh
+database — it is what an upload that names no use case lands on, so a run works out of
+the box without composing anything. It is kept in sync automatically: a metric added to
+the code catalog joins `default` on the next ingest. Create your own use case when you
+want a *narrower* set than "everything".
+
 ## Auth providers CRUD
 
 Manage the retrieval pipeline's credential store — the [`auth_providers`](data-model.md#authproviderconfig)
@@ -638,10 +719,33 @@ curl -X POST http://localhost:8001/api/v1/evaluations \
         "platform": "claude",
         "use_case": "default",
         "files": {
-          "esc1.xlsx": {"scenario_id": "esc1", "use_case": "faithfulness_ragas,hallucination"},
+          "esc1.xlsx": {"scenario_id": "esc1", "use_case": "rag_completo"},
           "esc2.xlsx": {"platform": "gemini"}
         }
       }'
+```
+
+Compose a use case, then ingest under it:
+
+```bash
+curl http://localhost:8001/api/v1/metrics
+# [{"name":"answer_relevance","category":"rag","weight":1.0,"rubric_version":"v1"}, …]
+
+curl -X POST http://localhost:8001/api/v1/use-cases \
+  -H 'Content-Type: application/json' \
+  -d '{"name":"soporte","metrics":["hallucination","answer_relevance"]}'
+# {"id":"a20ff2cb-…","name":"soporte","metrics":["answer_relevance","hallucination"]}
+
+curl -X POST http://localhost:8001/api/v1/evaluations \
+  -F 'files=@esc1.xlsx' \
+  -F 'payload={"platform":"copilot","use_case":"soporte"}'
+# {"run_id":"…","status":"ingerido"}
+
+# A use case that does not exist is rejected up front:
+curl -X POST http://localhost:8001/api/v1/evaluations \
+  -F 'files=@esc1.xlsx' \
+  -F 'payload={"platform":"copilot","use_case":"inexistente"}'
+# 422 {"detail":"Caso(s) de uso desconocido(s): inexistente. Créalo con POST /use-cases."}
 ```
 
 Configure a SharePoint credential provider, then list it (note the key is not echoed back):
@@ -687,6 +791,7 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Queries — `scorekeeper-engine/src/scorekeeper/db/repositories/`; models — `scorekeeper-engine/src/scorekeeper/db/models.py`
 - Retrieval orchestrator — `scorekeeper-engine/src/scorekeeper/core/retrieval/pipeline.py` (`RetrievalOrchestrator`)
 - Auth-provider CRUD service — `scorekeeper-engine/src/scorekeeper/core/retrieval/credentials/service.py`
+- Use-case composition service — `scorekeeper-engine/src/scorekeeper/core/services/use_cases.py`
 - Celery app & tasks — `scorekeeper-engine/src/scorekeeper/celery_app.py`, `scorekeeper-engine/src/scorekeeper/tasks.py`
   (`run_pipeline_task` = retrieval then scoring; `enqueue_run`)
 - Parsing & message normalization — `scorekeeper-engine/src/scorekeeper/core/importer.py`
@@ -694,3 +799,4 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Browser capture client — `extension/` (see its [README](../extension/README.md))
 - Scoring — `scorekeeper-engine/src/scorekeeper/core/runner.py`
 - Metric selection — `scorekeeper-engine/src/scorekeeper/core/metrics/selection.py`
+  (`sync_metrics` mirrors the registry into `metrics`; `resolve` reads a use case's set)
