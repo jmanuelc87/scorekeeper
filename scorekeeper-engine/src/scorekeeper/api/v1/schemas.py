@@ -278,3 +278,31 @@ class PromptDetailRead(BaseModel):
     required_variables: list[str]
     description: str
     versions: list[PromptVersionRead]
+
+
+class PromptVersionCreate(BaseModel):
+    """Body for ``POST /prompts/{prompt_id}/versions`` — a new draft of a slot's text.
+
+    ``template`` is not validated against the slot's contract here; that gate is publish.
+    A draft you cannot save until it is correct is not a draft.
+    """
+
+    template: str = Field(
+        ...,
+        min_length=1,
+        description="Texto de la plantilla; no se puede modificar después de crearla.",
+    )
+    changelog: str | None = Field(None, description="Por qué se hizo la edición.")
+    # ``max_length`` matches ``String(128)`` on ``created_by``: without it an
+    # over-long name is a database error rather than a 422.
+    author: str | None = Field(
+        None, max_length=128, description="Quién escribe el borrador."
+    )
+
+
+class PromptVersionPublish(BaseModel):
+    """Body for ``POST /prompts/{prompt_id}/versions/{version_id}/publish``."""
+
+    author: str | None = Field(
+        None, max_length=128, description="Quién publica la versión."
+    )
