@@ -18,6 +18,8 @@ scored, see [Evaluation metrics](evaluation-metrics.md); for the credential stor
 | `POST /api/v1/evaluations/{run_id}/start` | Start scoring an ingested run: flip it from `ingerido` to `en_cola` and **enqueue** the pipeline. |
 | `GET /api/v1/evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /api/v1/runs`                  | Retrieve full scored run details, filtered and at a chosen granularity. |
+| `GET /api/v1/runs/{run_id}/scenarios` | Retrieve one run's scenario results as a flat list of rollups (optional `platform`/`status` filters). |
+| `GET /api/v1/platform-executions`   | Retrieve platform executions as a flat list of rollups, filtered by platform and scoring window. |
 | `GET /api/v1/scenarios/{scenario_id}/turns` | Retrieve one scenario's turns — conversation content plus per-metric scores. |
 | `GET /api/v1/metrics`               | List the registered metrics a use case can be composed from. |
 | `POST /api/v1/use-cases`            | Create a use case: a name plus the set of metrics it is scored with. |
@@ -407,6 +409,116 @@ human-readable, **non-unique** `scenario_id` label (e.g. the file stem).
 |--------|------|
 | `400`  | `granularity` is not one of the three accepted values, or `start_date`/`end_date` is not a valid ISO-8601 date. No-match filters are **not** errors — they return `[]`. |
 
+## `GET /api/v1/runs/{run_id}/scenarios`
+
+Retrieve one run's scenario results as a **flat** list of rollups. Same data as the
+`scenario_results` granularity of [`GET /api/v1/runs`](#get-apiv1runs), but scoped by path
+and already flattened: no `platforms[]` nesting to walk, each entry instead names the
+`platform` it ran under. A run holding several platform executions yields every one of its
+scenarios in a single list.
+
+Depth stops at the scenario rollup — no turns, no metric scores. Read a scenario's turns
+with [`GET /api/v1/scenarios/{scenario_id}/turns`](#get-apiv1scenariosscenario_idturns),
+using the `id` of each entry.
+
+Unlike the `run_id` **query parameter** on `GET /api/v1/runs` (which yields `[]` for an
+unknown id), an unknown or malformed `{run_id}` here is a `404`.
+
+### Query parameters
+
+Both are optional, exact matches, combined with AND.
+
+| Param      | Type     | Default | Description |
+|------------|----------|---------|-------------|
+| `platform` | `string` | —       | Exact, **case-sensitive** platform match (e.g. `claude`, `copilot`, `gemini`). |
+| `status`   | `string` | —       | Exact match on the scenario's `status` (e.g. `completado`, `pending`). |
+
+### Response `200`
+
+Ordered by platform, then by the `scenario_id` label. A known run whose scenarios no
+filter matches yields `[]`.
+
+```json
+[
+  {
+    "id": "3f0a…",
+    "scenario_id": "reseña-hotel",
+    "platform": "claude",
+    "use_case": "rag_completo",
+    "model_name": null,
+    "status": "completado",
+    "average_score": 0.81
+  }
+]
+```
+
+Each scenario carries both an `id` (its `ScenarioResult` UUID) and the human-readable,
+**non-unique** `scenario_id` label (e.g. the file stem). `model_name` is the model that
+answered, when the capturing client reported one — always `null` for an `.xlsx` import.
+`average_score` is `null` until the scenario has been scored.
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | The `run_id` is unknown or not a valid UUID. No-match filters are **not** errors — they return `[]`. |
+
+## `GET /api/v1/platform-executions`
+
+Retrieve platform executions as a **flat** list of rollups, filtered by platform and
+scoring window. Same data as the `platform_executions` granularity of
+[`GET /api/v1/runs`](#get-apiv1runs), but one entry per platform execution instead of per
+run: there is no `platforms[]` nesting to walk, and each entry names the `run_id` it
+belongs to. A run holding several platform executions (files can override the platform)
+yields one entry per execution, all sharing that `run_id`.
+
+Depth stops at the platform rollup — no scenario results, no turns. Read a run's scenarios
+via [`GET /api/v1/runs/{run_id}/scenarios`](#get-apiv1runsrun_idscenarios).
+
+### Query parameters
+
+Both are optional and combined with AND.
+
+| Param        | Type     | Default | Description |
+|--------------|----------|---------|-------------|
+| `platform`   | `string` | —       | Exact, **case-sensitive** platform match (e.g. `claude`, `copilot`, `gemini`). |
+| `start_date` | `string` | —       | ISO-8601 lower bound (`YYYY-MM-DD` or full timestamp) on the scoring window. |
+| `end_date`   | `string` | —       | ISO-8601 upper bound on the scoring window. |
+
+The date range filters the **scoring window** (`started_at` / `finished_at`) with the same
+semantics as [`GET /api/v1/runs`](#get-apiv1runs): `started_at >= start_date` and
+`finished_at <= end_date`. Both columns stay `null` until a worker scores the run, so a
+bound excludes still-queued and in-progress executions. The two bounds are therefore
+asymmetric — a lower bound alone still returns an execution that started but has not
+finished, while any upper bound excludes it.
+
+Results are ordered by the run's creation date, then by `platform` (which breaks the tie
+between the several executions of one run). `id` is the `PlatformExecution` UUID;
+`average_score` is the mean of this platform's scenario averages, `null` until scored.
+
+### Response `200`
+
+```json
+[
+  {
+    "id": "9c4e…",
+    "run_id": "b1f2…",
+    "platform": "claude",
+    "started_at": "2026-07-10T12:00:00+00:00",
+    "finished_at": "2026-07-10T12:05:00+00:00",
+    "average_score": 0.81,
+    "scenarios": 4,
+    "status_breakdown": {"completado": 4}
+  }
+]
+```
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `400`  | `start_date`/`end_date` is not a valid ISO-8601 date. No-match filters are **not** errors — they return `[]`. |
+
 ## `GET /api/v1/scenarios/{scenario_id}/turns`
 
 Retrieve a single scenario's turns, in `turn_number` order — the conversation
@@ -417,7 +529,8 @@ so a caller can read what was actually scored without re-uploading the source.
 
 The `{scenario_id}` is a **`ScenarioResult` UUID** — the unique handle for one
 conversation scored under one platform in one run — discoverable as the `id` on each
-scenario in `GET /api/v1/runs?granularity=scenario_results`. The human-readable, non-unique
+scenario in `GET /api/v1/runs?granularity=scenario_results` or, flat,
+[`GET /api/v1/runs/{run_id}/scenarios`](#get-apiv1runsrun_idscenarios). The human-readable, non-unique
 `ScenarioResult.scenario_id` label is **not** accepted here (it can match many
 scenarios). Takes no query parameters.
 
@@ -784,7 +897,14 @@ Retrieve full details for all `claude` runs scored in July, down to metric score
 curl 'http://localhost:8001/api/v1/runs?platform=claude&start_date=2026-07-01&end_date=2026-07-31&granularity=metric_scores'
 ```
 
-Read a scenario's turns (its `id` comes from `/api/v1/runs?granularity=scenario_results`):
+List one run's scenarios, flat — all of them, then only the scored `claude` ones:
+
+```bash
+curl 'http://localhost:8001/api/v1/runs/b1f2…/scenarios'
+curl 'http://localhost:8001/api/v1/runs/b1f2…/scenarios?platform=claude&status=completado'
+```
+
+Read a scenario's turns (its `id` comes from `/api/v1/runs/{run_id}/scenarios`):
 
 ```bash
 curl 'http://localhost:8001/api/v1/scenarios/3f0a…/turns'
@@ -892,7 +1012,8 @@ dedicated broker (e.g. Redis) instead of Postgres.
   (`ingestion.ingest_evaluation`, `runs.set_turn_selection`, `retrieval.retrieve_run`,
   `scoring.score_run`, `runs.get_run_summary`, `scoring.run_evaluation`)
 - Read paths — `scorekeeper-engine/src/scorekeeper/core/services/read_models.py` (`retrieve_runs`,
-  `retrieve_scenario_turns`, `retrieve_turn_traces`, `retrieve_turn_token_usage`);
+  `retrieve_run_scenarios`, `retrieve_platform_executions`, `retrieve_scenario_turns`,
+  `retrieve_turn_traces`, `retrieve_turn_token_usage`);
   their projections — `scorekeeper-engine/src/scorekeeper/core/services/serializers.py`
 - Queries — `scorekeeper-engine/src/scorekeeper/db/repositories/`; models — `scorekeeper-engine/src/scorekeeper/db/models.py`
 - Retrieval orchestrator — `scorekeeper-engine/src/scorekeeper/core/retrieval/pipeline.py` (`RetrievalOrchestrator`)

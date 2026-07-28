@@ -134,6 +134,22 @@ def _serialize_platform(
     return entry
 
 
+def serialize_platform_execution(platform_exec: PlatformExecution) -> dict[str, Any]:
+    """One platform execution as a flat row: its rollup plus its own and its run's id.
+
+    The projection ``GET /platform-executions`` returns — the same fields
+    :func:`serialize_run` nests under ``platforms``, lifted to the top level. The
+    granularity is fixed at ``platform_executions`` rather than taken as an argument:
+    that is what guarantees no caller can ask for a depth the repository did not
+    eager-load, which under an ``AsyncSession`` is a ``MissingGreenlet``.
+    """
+    return {
+        "id": str(platform_exec.id),
+        "run_id": str(platform_exec.run_id),
+        **_serialize_platform(platform_exec, GRANULARITY_PLATFORM),
+    }
+
+
 def _serialize_scenario(
     scenario: ScenarioResult, granularity: str
 ) -> dict[str, Any]:
@@ -152,6 +168,24 @@ def _serialize_scenario(
     if granularity == GRANULARITY_METRIC:
         entry["turns"] = [_serialize_turn(turn) for turn in scenario.turns]
     return entry
+
+
+def serialize_run_scenario(scenario: ScenarioResult) -> dict[str, Any]:
+    """One scenario of a run as a flat entry, tagged with the platform that ran it.
+
+    Same fields as :func:`_serialize_scenario` plus ``platform``, which that projection
+    leaves implicit in its nesting under a platform execution. Depth stops at the
+    scenario rollup — read its turns via ``/scenarios/{scenario_id}/turns``.
+    """
+    return {
+        "id": str(scenario.id),
+        "scenario_id": scenario.scenario_id,
+        "platform": scenario.platform_execution.platform,
+        "use_case": scenario.use_case.name,
+        "model_name": scenario.model_name,
+        "status": scenario.status,
+        "average_score": scenario.average_score,
+    }
 
 
 def _serialize_metric_score(score: MetricScore) -> dict[str, Any]:

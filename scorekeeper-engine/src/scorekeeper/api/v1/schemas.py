@@ -110,6 +110,44 @@ class PlatformSummary(BaseModel):
     status_breakdown: dict[str, int]
 
 
+class PlatformExecutionRead(BaseModel):
+    """One platform execution as a flat row — the ``GET /platform-executions`` entry.
+
+    ``started_at``/``finished_at`` are ISO-8601 strings the serializer already
+    formatted, and stay ``null`` until a worker scores the run.
+    """
+
+    id: str
+    run_id: str
+    platform: str
+    started_at: str | None = None
+    finished_at: str | None = None
+    average_score: float | None = None
+    scenarios: int
+    status_breakdown: dict[str, int]
+
+
+class RunScenarioResult(BaseModel):
+    """One scenario result of a run — the ``GET /runs/{run_id}/scenarios`` entry.
+
+    ``id`` is the ``ScenarioResult`` UUID, the handle
+    ``GET /scenarios/{scenario_id}/turns`` takes; ``scenario_id`` is the
+    human-readable, **non-unique** label (e.g. the file stem). ``platform`` names the
+    platform execution this scenario ran under, since the list is flat.
+    """
+
+    id: str
+    scenario_id: str
+    platform: str
+    use_case: str
+    # The model that answered, when the capturing client reported one; null for every
+    # .xlsx import.
+    model_name: str | None = None
+    status: str
+    # Null until the scenario has been scored.
+    average_score: float | None = None
+
+
 class EvaluationResponse(BaseModel):
     run_id: str
     status: str
