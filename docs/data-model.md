@@ -488,12 +488,12 @@ fetches the same URL.
 
 ## Prompt catalog
 
-> **Status: partly implemented.** The three tables, the prompt-slot declarations,
-> `sync_prompts`, the read-only `GET /prompts` endpoints, runtime resolution and
-> the `RunPromptBinding` writes are all in — editing a stored `PromptVersion`
-> changes what the judge receives on the next run. Still pending: the editing
-> endpoints (draft → publish → activate / discard), so today a version is created
-> only by the migration or by writing the table directly.
+> **Status: implemented.** The three tables, the prompt-slot declarations,
+> `sync_prompts`, the `GET /prompts` reads, the editing endpoints (draft →
+> publish → activate / discard, see [HTTP APIs](apis.md)), runtime resolution and
+> the `RunPromptBinding` writes are all in — publishing a `PromptVersion` changes
+> what the judge receives on the next run. The seed migration is the only writer
+> outside the API.
 
 The Spanish prompt texts the judge runs are editable at runtime and versioned,
 so a rubric can be tuned without a deploy while every past benchmark keeps a
@@ -608,8 +608,10 @@ the metric computed a value the prompt never shows the judge; anything else
 reaches the model as a literal `{foo}`. A judge variable may *also* be required —
 the hallucination prompt pre-fills `{response}` per document, and the judge's
 later pass over it is a no-op. Escaped `{{ }}` are not placeholders, so a prompt
-may embed a JSON example. Publishing additionally test-renders against a dummy
-`TurnView`.
+may embed a JSON example; unbalanced ones are rejected with the same `422`.
+
+This check runs at **publish**, not when a draft is saved — a draft you cannot
+save until it is correct is not a draft.
 
 Metrics fill their variables with `prompts.safe_format`, not `str.format`, so an
 edited template that references a judge variable survives the metric's pass

@@ -24,6 +24,10 @@ scored, see [Evaluation metrics](evaluation-metrics.md); for the credential stor
 | `GET /api/v1/use-cases`             | List every use case with its metric names. |
 | `GET /api/v1/prompts`               | List every prompt slot the metrics render, with the version currently active. |
 | `GET /api/v1/prompts/{prompt_id}`   | Fetch one prompt slot with its full version history. |
+| `POST /api/v1/prompts/{prompt_id}/versions` | Open a new draft of a slot's text (replaces any open draft). |
+| `POST /api/v1/prompts/{prompt_id}/versions/{version_id}/publish` | Validate a draft and make it the live version. |
+| `POST /api/v1/prompts/{prompt_id}/versions/{version_id}/activate` | Roll back to an already-published version. |
+| `POST /api/v1/prompts/{prompt_id}/versions/{version_id}/discard` | Abandon an open draft. |
 | `GET /api/v1/auth-providers`        | List the retrieval credential store's provider rows (optional filters). |
 | `POST /api/v1/auth-providers`       | Create a credential provider row (write-only `private_key`, stored encrypted). |
 | `GET /api/v1/auth-providers/{id}`   | Fetch one credential provider by UUID. |
@@ -610,11 +614,134 @@ discarded draft keeps its number. That is the honest edit sequence, and it keeps
 |--------|------|
 | `404`  | No prompt with that id — including a malformed one. |
 
-> **Read-only for now, and never a delete.** Editing (draft → publish →
-> activate / discard) is the next slice; until then a version is created only by the
-> prompt-catalog migration. There will be no `DELETE`: a version a finished benchmark
-> points at is what makes that benchmark's scores readable. An unwanted draft is
-> discarded, an unwanted published version deactivated.
+> **Never a delete, and never a deactivate.** There is no `DELETE`: a version a finished
+> benchmark points at is what makes that benchmark's scores readable. There is no route
+> that clears `is_active` either — it only ever *moves* to another published version, so
+> a slot that has a live version keeps one. An unwanted draft is discarded, an unwanted
+> published version superseded by activating another.
+
+## `POST /api/v1/prompts/{prompt_id}/versions`
+
+Open a new **draft** of a slot's text. Drafts are not scored under; publishing is what
+makes text live.
+
+### Request
+
+```json
+{
+  "template": "¿Las siguientes verdades contradicen la afirmación?\nVerdades: {truths}\nAfirmación: {claim}",
+  "changelog": "Se aclara que 'no mencionado' no es contradicción.",
+  "author": "ana"
+}
+```
+
+| Field | Type | Required | Notes |
+|-------|------|----------|-------|
+| `template` | `string` | yes | The Spanish prompt text. Write-once: it is never rewritten after this call. |
+| `changelog` | `string \| null` | no | Why the edit was made. |
+| `author` | `string \| null` | no | Stored as `created_by`; max 128 chars. |
+
+### Response `201`
+
+The created version, shaped like the `active_version` object above — `status` is
+`"draft"`, `is_active` is `false`, and `published_by` / `published_at` are `null`.
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | No prompt with that id — including a malformed one. |
+| `422`  | `template` is empty or whitespace-only. |
+
+> **Saving over a draft burns a version number.** `template` is write-once *even while a
+> version is a draft*, so a re-save discards the open draft and inserts a new row. Each
+> slot has at most one open draft, enforced by a partial unique index. The template is
+> **not** validated here — a draft you cannot save until it is correct is not a draft.
+
+## `POST /api/v1/prompts/{prompt_id}/versions/{version_id}/publish`
+
+Validate a draft against its slot's contract and make it the live version.
+
+### Request
+
+```json
+{"author": "ana"}
+```
+
+`author` is optional and stored as `published_by`.
+
+### Response `200`
+
+The published version: `status` is `"published"`, `is_active` is `true`, and
+`published_by` / `published_at` are set.
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | Unknown or malformed `prompt_id` or `version_id` — including a version belonging to a different prompt. |
+| `409`  | The version is not a draft (already published, or discarded). |
+| `422`  | The template omits a required variable, or uses one the slot does not declare. |
+
+A `422` body names the offending variables:
+
+```json
+{"detail": "La plantilla no usa la(s) variable(s) requerida(s): truths."}
+```
+
+> **Publishing activates.** The previously active version is deactivated in the same
+> transaction, so exactly one version is live at every instant. A published-but-inactive
+> version is precisely the state scoring refuses to run under, so there is no way to
+> reach it deliberately. A run already in flight is unaffected: it pins the versions it
+> scored under at the start of scoring.
+
+## `POST /api/v1/prompts/{prompt_id}/versions/{version_id}/activate`
+
+Roll the live version back to an **already-published** one. The text is not copied
+forward; `is_active` simply moves.
+
+Takes no request body.
+
+### Response `200`
+
+The now-active version.
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | Unknown or malformed `prompt_id` or `version_id`. |
+| `409`  | The version is a draft or has been discarded — only a published version can be activated. |
+
+Activating the version that is already live is a `200` no-op, so the control is
+idempotent.
+
+## `POST /api/v1/prompts/{prompt_id}/versions/{version_id}/discard`
+
+Abandon an open draft. The row and its version number are kept — nothing is deleted.
+
+Takes no request body.
+
+### Response `200`
+
+The discarded version, with `status` set to `"discarded"`.
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | Unknown or malformed `prompt_id` or `version_id`. |
+| `409`  | The version is not a draft. |
+
+> **A published version is never discardable, even when inactive.** A finished run's
+> `run_prompt_bindings` row points at it, and marking it discarded would claim that run
+> scored under nothing.
+
+> **Known edge: concurrent edits to one slot.** The next version number is computed from
+> the slot's current history, so two operators opening a draft for the *same* slot at the
+> same instant produce a unique-constraint violation for the loser, surfacing as a `500`.
+> The constraints guarantee the stored state stays correct — the cost of the race is an
+> ugly error, not a wrong catalog. Retry the request.
 
 ## Auth providers CRUD
 
@@ -854,6 +981,27 @@ curl http://localhost:8001/api/v1/prompts/3f2b9e01-7c44-4a1e-9d2b-1a5c8e6f0d33
 # {"metric":"faithfulness_deepeval","slug":"verify","versions":[{"version":1, …}]}
 ```
 
+Edit one: draft the new text, publish it (which makes it live), then roll back:
+
+```bash
+PROMPT=3f2b9e01-7c44-4a1e-9d2b-1a5c8e6f0d33
+
+VERSION=$(curl -s -X POST http://localhost:8001/api/v1/prompts/$PROMPT/versions \
+  -H 'Content-Type: application/json' \
+  -d '{"template":"¿Contradicen estas verdades la afirmación?\nVerdades: {truths}\nAfirmación: {claim}",
+       "changelog":"Se aclara que omitir algo no es contradecirlo.","author":"ana"}' | jq -r .id)
+# 201 {"version":2,"status":"draft","is_active":false, …}
+
+curl -X POST http://localhost:8001/api/v1/prompts/$PROMPT/versions/$VERSION/publish \
+  -H 'Content-Type: application/json' -d '{"author":"ana"}'
+# 200 {"version":2,"status":"published","is_active":true,"published_by":"ana", …}
+# 422 {"detail":"La plantilla no usa la(s) variable(s) requerida(s): truths."}  ← if it were wrong
+
+# The v1 that was live is still published, just no longer active — roll back to it:
+curl -X POST http://localhost:8001/api/v1/prompts/$PROMPT/versions/$V1/activate
+# 200 {"version":1,"is_active":true, …}
+```
+
 Configure a SharePoint credential provider, then list it (note the key is not echoed back):
 
 ```bash
@@ -898,11 +1046,12 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Retrieval orchestrator — `scorekeeper-engine/src/scorekeeper/core/retrieval/pipeline.py` (`RetrievalOrchestrator`)
 - Auth-provider CRUD service — `scorekeeper-engine/src/scorekeeper/core/retrieval/credentials/service.py`
 - Use-case composition service — `scorekeeper-engine/src/scorekeeper/core/services/use_cases.py`
-- Prompt catalog read service — `scorekeeper-engine/src/scorekeeper/core/services/prompts.py`;
-  its queries — `scorekeeper-engine/src/scorekeeper/db/repositories/prompts.py`
+- Prompt catalog service — `scorekeeper-engine/src/scorekeeper/core/services/prompts.py`
+  (reads, plus the `create_version` → `publish_version` → `activate_version` / `discard_version`
+  lifecycle); its queries — `scorekeeper-engine/src/scorekeeper/db/repositories/prompts.py`
 - Prompt slot declarations & template validation — `scorekeeper-engine/src/scorekeeper/core/metrics/prompts.py`
-  (`PromptSlot`, `safe_format`, `validate_template`); each metric's slots live on its class in
-  `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/`
+  (`PromptSlot`, `safe_format`, `validate_template` — the publish gate); each metric's slots live
+  on its class in `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/`
 - Celery app & tasks — `scorekeeper-engine/src/scorekeeper/celery_app.py`, `scorekeeper-engine/src/scorekeeper/tasks.py`
   (`run_pipeline_task` = retrieval then scoring; `enqueue_run`)
 - Parsing & message normalization — `scorekeeper-engine/src/scorekeeper/core/importer.py`
