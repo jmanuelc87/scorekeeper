@@ -13,11 +13,14 @@ from scorekeeper.core.services.serializers import (
     GRANULARITY_SCENARIO,
     _GRANULARITIES,
     serialize_metric_trace,
+    serialize_platform_execution,
     serialize_run,
+    serialize_run_scenario,
     serialize_scenario_turn,
     serialize_turn_token_usage,
 )
 from scorekeeper.db.connection import session_scope
+from scorekeeper.db.repositories import platform_executions as platform_execution_repo
 from scorekeeper.db.repositories import runs as run_repo
 from scorekeeper.db.repositories import scenarios as scenario_repo
 from scorekeeper.db.repositories import turns as turn_repo
@@ -93,6 +96,39 @@ async def retrieve_scenario_turns(
         return [serialize_scenario_turn(turn) for turn in scenario.turns]
 
 
+async def retrieve_run_scenarios(
+    run_id: str,
+    *,
+    platform: str | None = None,
+    status: str | None = None,
+    session: AsyncSession | None = None,
+) -> list[dict[str, Any]] | None:
+    """Return one run's scenario results as a flat list, or ``None`` if unknown.
+
+    ``run_id`` is a ``BenchmarkRun`` id (its UUID). Each entry is a scenario rollup —
+    ``id``, ``scenario_id``, ``platform``, ``use_case``, ``model_name``, ``status`` and
+    ``average_score`` — flattened across the run's platform executions, so a run holding
+    several platforms yields every scenario in one list. Turns are not included; read
+    them via :func:`retrieve_scenario_turns` using each entry's ``id``.
+
+    Both filters are optional, exact and combined with AND: ``platform`` matches
+    ``PlatformExecution.platform`` (case-sensitive), ``status`` matches
+    ``ScenarioResult.status``.
+
+    A malformed or unknown ``run_id`` yields ``None`` (the HTTP layer maps that to
+    ``404``); a known run whose scenarios no filter matches yields ``[]``. The run is
+    looked up first precisely so those two cases stay distinguishable.
+    """
+    async with session_scope(session) as db:
+        run = await run_repo.get_run(db, run_id)
+        if run is None:
+            return None
+        scenarios = await scenario_repo.list_scenarios_for_run(
+            db, run.id, platform=platform, status=status
+        )
+        return [serialize_run_scenario(scenario) for scenario in scenarios]
+
+
 async def retrieve_runs(
     *,
     run_id: str | None = None,
@@ -145,6 +181,46 @@ async def retrieve_runs(
             with_metric_scores=granularity == GRANULARITY_METRIC,
         )
         return [serialize_run(run, granularity) for run in runs]
+
+
+async def retrieve_platform_executions(
+    *,
+    platform: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    session: AsyncSession | None = None,
+) -> list[dict[str, Any]]:
+    """Return the platform executions matching the given filters, as a flat list.
+
+    One entry per :class:`PlatformExecution` rather than per run, so a run holding
+    several platforms (files can carry a per-file platform override) yields several
+    entries sharing a ``run_id``. Each entry is the platform's rollup — no nested
+    scenario results; read those through :func:`retrieve_runs`.
+
+    Both filters are optional and combined with AND:
+
+    * ``platform`` — exact, case-sensitive match on ``PlatformExecution.platform``
+      (e.g. ``"claude"``, ``"copilot"``, ``"gemini"``).
+    * ``start_date`` / ``end_date`` — an ISO-8601 range (``YYYY-MM-DD`` or a full
+      timestamp) over the **scoring window**, with the same semantics as
+      :func:`retrieve_runs`: ``started_at >= start_date`` and
+      ``finished_at <= end_date``. Those columns stay ``NULL`` until a worker scores
+      the run, so a bound naturally excludes queued/in-progress executions.
+
+    Raises ``ValueError`` for an unparseable date. Results are ordered by the run's
+    creation date, then by platform; no match yields ``[]``.
+    """
+    start = _parse_date(start_date, "start_date")
+    end = _parse_date(end_date, "end_date")
+
+    async with session_scope(session) as db:
+        executions = await platform_execution_repo.list_platform_executions(
+            db,
+            platform=platform,
+            start=start,
+            end=end,
+        )
+        return [serialize_platform_execution(execution) for execution in executions]
 
 
 def _parse_date(value: str | None, field: str) -> datetime | None:

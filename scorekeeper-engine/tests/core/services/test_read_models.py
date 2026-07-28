@@ -27,6 +27,8 @@ from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.core.metrics.scale import Unit
 from scorekeeper.core.services.ingestion import UploadedFile, ingest_evaluation
 from scorekeeper.core.services.read_models import (
+    retrieve_platform_executions,
+    retrieve_run_scenarios,
     retrieve_runs,
     retrieve_scenario_turns,
     retrieve_turn_token_usage,
@@ -480,3 +482,235 @@ async def test_retrieve_invalid_granularity_raises(session: AsyncSession) -> Non
 async def test_retrieve_invalid_date_raises(session: AsyncSession) -> None:
     with pytest.raises(ValueError):
         await retrieve_runs(start_date="ayer", session=session)
+
+
+async def _score_two(session: AsyncSession, *, platform: str = "claude") -> str:
+    """Ingest + score a two-file run (two scenarios), returning its run_id."""
+    files = [
+        UploadedFile(f"{scenario_id}.xlsx", _conversation_bytes(), scenario_id, "default")
+        for scenario_id in ("esc1", "esc2")
+    ]
+    summary = await run_evaluation(platform, files, session=session, judge=RecordingJudge(0.8))
+    return summary["run_id"]
+
+
+async def test_retrieve_run_scenarios_returns_flat_rollups(
+    session: AsyncSession, registry
+) -> None:
+    run_id = await _score_two(session)
+
+    scenarios = await retrieve_run_scenarios(run_id, session=session)
+
+    assert scenarios is not None
+    # Flat: one entry per scenario, no platform nesting to walk.
+    assert [scenario["scenario_id"] for scenario in scenarios] == ["esc1", "esc2"]
+    assert set(scenarios[0]) == {
+        "id",
+        "scenario_id",
+        "platform",
+        "use_case",
+        "model_name",
+        "status",
+        "average_score",
+    }
+    # The platform each scenario ran under, and the use case resolved to its name.
+    assert scenarios[0]["platform"] == "claude"
+    assert scenarios[0]["use_case"] == "default"
+    assert scenarios[0]["average_score"] == pytest.approx(0.8)
+    # The id is the ScenarioResult UUID the turns endpoint takes.
+    assert await retrieve_scenario_turns(scenarios[0]["id"], session=session) is not None
+
+
+async def test_retrieve_run_scenarios_scopes_to_its_own_run(
+    session: AsyncSession, registry
+) -> None:
+    run_id = await _score_one(session, scenario_id="esc1")
+    await _score_one(session, scenario_id="esc2")
+
+    scenarios = await retrieve_run_scenarios(run_id, session=session)
+
+    assert [scenario["scenario_id"] for scenario in scenarios] == ["esc1"]
+
+
+async def test_retrieve_run_scenarios_platform_filter(
+    session: AsyncSession, registry
+) -> None:
+    run_id = await _score_one(session, platform="claude")
+
+    assert len(await retrieve_run_scenarios(run_id, platform="claude", session=session)) == 1
+    # Exact match: a different platform yields nothing — but the run still exists.
+    assert await retrieve_run_scenarios(run_id, platform="gemini", session=session) == []
+
+
+async def test_retrieve_run_scenarios_status_filter(
+    session: AsyncSession, registry
+) -> None:
+    run_id = await _score_one(session)
+    scenarios = await retrieve_run_scenarios(run_id, session=session)
+    status = scenarios[0]["status"]
+
+    assert len(await retrieve_run_scenarios(run_id, status=status, session=session)) == 1
+    assert await retrieve_run_scenarios(run_id, status="pendiente", session=session) == []
+
+
+async def test_retrieve_run_scenarios_unknown_or_malformed_is_none(
+    session: AsyncSession,
+) -> None:
+    # None (-> 404) is what distinguishes an unknown run from a run with no matches.
+    assert await retrieve_run_scenarios("not-a-uuid", session=session) is None
+    assert (
+        await retrieve_run_scenarios(
+            "00000000-0000-0000-0000-000000000000", session=session
+        )
+        is None
+    )
+
+
+async def test_retrieve_run_scenarios_unscored_run_returns_entries(
+    session: AsyncSession, registry
+) -> None:
+    """An ingested-but-unscored run still lists its scenarios, with null rollups."""
+    run_id = await ingest_evaluation(
+        "claude",
+        [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")],
+        session=session,
+    )
+
+    scenarios = await retrieve_run_scenarios(run_id, session=session)
+
+    assert len(scenarios) == 1
+    assert scenarios[0]["average_score"] is None
+
+
+async def test_retrieve_platform_executions_returns_flat_entries(
+    session: AsyncSession, registry
+) -> None:
+    run_id = await _score_one(session)
+
+    rows = await retrieve_platform_executions(session=session)
+
+    assert len(rows) == 1
+    row = rows[0]
+    # Flat: the platform rollup is the whole entry, never a nested scenario tree.
+    assert set(row) == {
+        "id",
+        "run_id",
+        "platform",
+        "started_at",
+        "finished_at",
+        "average_score",
+        "scenarios",
+        "status_breakdown",
+    }
+    assert row["run_id"] == run_id
+    assert uuid.UUID(row["id"])
+    assert row["platform"] == "claude"
+    assert row["average_score"] == pytest.approx(0.8)
+    assert row["scenarios"] == 1
+    assert row["status_breakdown"] == {"completado": 1}
+    assert row["started_at"] is not None
+    assert row["finished_at"] is not None
+
+
+async def test_retrieve_platform_executions_platform_filter(
+    session: AsyncSession, registry
+) -> None:
+    await _score_one(session, platform="claude")
+
+    assert len(await retrieve_platform_executions(platform="claude", session=session)) == 1
+    assert await retrieve_platform_executions(platform="gemini", session=session) == []
+    # The match is case-sensitive.
+    assert await retrieve_platform_executions(platform="Claude", session=session) == []
+
+
+async def test_retrieve_platform_executions_date_range(
+    session: AsyncSession, registry
+) -> None:
+    await _score_one(session)
+    platform_exec = (await session.execute(select(PlatformExecution))).scalars().one()
+    platform_exec.started_at = datetime(2026, 7, 10, 12, 0, 0)
+    platform_exec.finished_at = datetime(2026, 7, 10, 12, 5, 0)
+    await session.commit()
+
+    # The scoring window falls inside July.
+    assert (
+        len(
+            await retrieve_platform_executions(
+                start_date="2026-07-01", end_date="2026-07-31", session=session
+            )
+        )
+        == 1
+    )
+    assert await retrieve_platform_executions(start_date="2026-08-01", session=session) == []
+    assert await retrieve_platform_executions(end_date="2026-07-05", session=session) == []
+    # Both bounds are inclusive.
+    assert (
+        len(await retrieve_platform_executions(start_date="2026-07-10T12:00:00", session=session))
+        == 1
+    )
+    assert (
+        len(await retrieve_platform_executions(end_date="2026-07-10T12:05:00", session=session))
+        == 1
+    )
+
+
+async def test_retrieve_platform_executions_unfinished_execution(session: AsyncSession) -> None:
+    execution = PlatformExecution(
+        platform="claude", started_at=datetime(2026, 7, 10, 12, 0, 0), run=BenchmarkRun()
+    )
+    session.add(execution)
+    await session.commit()
+
+    rows = await retrieve_platform_executions(session=session)
+    assert len(rows) == 1
+    # An execution with no scenarios still projects, with an empty rollup.
+    assert rows[0]["scenarios"] == 0
+    assert rows[0]["status_breakdown"] == {}
+    assert rows[0]["finished_at"] is None
+    # The bounds are asymmetric: a lower bound only tests started_at, so an
+    # in-progress execution survives it...
+    assert len(await retrieve_platform_executions(start_date="2026-07-01", session=session)) == 1
+    # ...but an upper bound tests finished_at, and NULL <= end is never true.
+    assert await retrieve_platform_executions(end_date="2026-07-31", session=session) == []
+
+
+async def test_retrieve_platform_executions_flattens_multiple_platforms(
+    session: AsyncSession,
+) -> None:
+    run = BenchmarkRun()
+    session.add_all(
+        [
+            PlatformExecution(platform="gemini", run=run),
+            PlatformExecution(platform="claude", run=run),
+        ]
+    )
+    await session.commit()
+
+    rows = await retrieve_platform_executions(session=session)
+
+    # One entry per platform execution — both sharing the run they belong to.
+    assert len(rows) == 2
+    assert {row["run_id"] for row in rows} == {str(run.id)}
+    # Within a run, platform breaks the created_at tie (inserted gemini first).
+    assert [row["platform"] for row in rows] == ["claude", "gemini"]
+
+
+async def test_retrieve_platform_executions_ordering(session: AsyncSession, registry) -> None:
+    first = await _score_one(session, scenario_id="esc1")
+    second = await _score_one(session, scenario_id="esc2")
+
+    rows = await retrieve_platform_executions(session=session)
+
+    # Ordered by the run's creation date, matching GET /runs.
+    assert [row["run_id"] for row in rows] == [first, second]
+
+
+async def test_retrieve_platform_executions_empty(session: AsyncSession) -> None:
+    assert await retrieve_platform_executions(session=session) == []
+
+
+async def test_retrieve_platform_executions_invalid_date_raises(session: AsyncSession) -> None:
+    with pytest.raises(ValueError):
+        await retrieve_platform_executions(start_date="ayer", session=session)
+    with pytest.raises(ValueError):
+        await retrieve_platform_executions(end_date="nunca", session=session)

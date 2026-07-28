@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from fastapi import APIRouter, HTTPException, Query
 
+from scorekeeper.api.v1.schemas import RunScenarioResult
 from scorekeeper.core.services import read_models
 
 router = APIRouter(prefix="/runs", tags=["runs"])
@@ -45,3 +46,28 @@ async def list_runs(
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get("/{run_id}/scenarios", response_model=list[RunScenarioResult])
+async def get_run_scenarios(
+    run_id: str,
+    platform: str | None = Query(None, description="Coincidencia exacta de plataforma."),
+    status: str | None = Query(
+        None, description="Coincidencia exacta del estado del escenario."
+    ),
+) -> list[dict]:
+    """Retrieve a run's scenario results as a flat list.
+
+    One entry per scenario, flattened across the run's platform executions and tagged
+    with the ``platform`` that produced it. Each entry stops at the scenario rollup —
+    read a scenario's turns via ``GET /scenarios/{scenario_id}/turns`` using its ``id``.
+
+    Both filters are optional, exact and AND-combined. ``404`` when the ``run_id`` is
+    unknown or malformed; a known run no scenario matches yields ``[]``.
+    """
+    scenarios = await read_models.retrieve_run_scenarios(
+        run_id, platform=platform, status=status
+    )
+    if scenarios is None:
+        raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
+    return scenarios
