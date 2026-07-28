@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from scorekeeper.core.metrics.base import TurnView
+from scorekeeper.core.metrics.base import NOT_APPLICABLE, TurnView
 from scorekeeper.core.metrics.catalog.hallucination import (
     Hallucination,
     NLIJudgment,
@@ -10,6 +10,7 @@ from scorekeeper.core.metrics.catalog.hallucination import (
     split_context_docs,
 )
 from scorekeeper.core.retrieved_context import RetrievedContext
+from seeded_prompts import build
 
 
 def _turn(context: str) -> TurnView:
@@ -58,7 +59,7 @@ def test_no_contradictions_is_zero_hallucination(make_judge) -> None:
             NLIJudgment(label=NLILabel.NEUTRAL, justification="Ni respalda ni contradice"),
         ]
     )
-    result = Hallucination().evaluate(_turn("doc A\n\ndoc B"), judge)
+    result = build(Hallucination).evaluate(_turn("doc A\n\ndoc B"), judge)
 
     assert result.raw_score == 0.0  # no contradictions
     # Inverted scale: raw 0.0 hallucination → 1.0 faithfulness (higher-is-better).
@@ -74,7 +75,7 @@ def test_contradiction_raises_score(make_judge) -> None:
             NLIJudgment(label=NLILabel.ENTAILMENT, justification="Respalda"),
         ]
     )
-    result = Hallucination().evaluate(_turn("doc A\n\ndoc B"), judge)
+    result = build(Hallucination).evaluate(_turn("doc A\n\ndoc B"), judge)
 
     # 1 of 2 documents contradicts → hallucination 0.5, faithfulness 0.5.
     assert result.raw_score == 0.5
@@ -86,13 +87,14 @@ def test_contradiction_raises_score(make_judge) -> None:
     assert "1 de 2 documentos contradicen" in result_step.summary
 
 
-def test_no_context_is_zero_without_judge_calls(make_judge) -> None:
+def test_no_context_is_not_applicable_without_judge_calls(make_judge) -> None:
     judge = make_judge()
-    result = Hallucination().evaluate(_turn(""), judge)
+    result = build(Hallucination).evaluate(_turn(""), judge)
 
-    assert result.raw_score == 0.0
-    # No context to contradict → fully faithful (higher-is-better).
-    assert result.normalized_score == 1.0
+    # No context to contradict → nothing measured. The sentinel is returned as-is,
+    # never through Inverted.normalize (which would map -1.0 to 2.0).
+    assert result.raw_score == NOT_APPLICABLE
+    assert result.normalized_score == NOT_APPLICABLE
     assert judge.calls == []
     assert len(result.trace.steps) == 1
     assert "No hay contexto recuperado" in result.trace.steps[0].summary

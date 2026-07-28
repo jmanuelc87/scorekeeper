@@ -92,14 +92,14 @@ vectors, so degenerate embeddings never raise.
 
 | Case | Result | Embed call |
 | --- | --- | --- |
-| Every generation blank (no question could be generated) | `raw_score = 0.0` (no relevance) | **none** — short-circuits |
+| Every generation blank (no question could be generated) | `raw_score = NOT_APPLICABLE` (nothing measured) | **none** — short-circuits |
 | On-topic answer | high AR (→ 1.0) | one batched call |
 | Off-topic answer | low AR (→ 0.0) | one batched call |
 
 **No-question short-circuit** is an implementation detail the pseudocode does not
 spell out: if every generation is blank there is nothing to compare, so the
-metric returns `0.0` with **no embed call** (the pseudocode would divide by `n`
-over an empty/degenerate set).
+metric returns `NOT_APPLICABLE` with **no embed call** (the pseudocode would
+divide by `n` over an empty/degenerate set) and rollup drops it from the averages.
 
 ## Note: implementation vs. reference
 

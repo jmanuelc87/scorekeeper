@@ -79,7 +79,7 @@ order** with `judge.structured(..., schema=RelevanceVerdict)`.
 - The node is judged in an isolated `TurnView(prompt=…, response="")`, so the
   judge sees the question and the node but **never the assistant's actual answer**
   or the other nodes.
-- `VERDICT_PROMPT` frames the judge as a retrieval evaluator deciding whether a
+- `contextual_precision.verdict` frames the judge as a retrieval evaluator deciding whether a
   node is *useful for constructing the expected answer*. Only `{expected_output}`
   and `{node}` are interpolated via `.format()`; the template deliberately
   contains no other braces so formatting never trips on stray `{}`.
@@ -106,7 +106,8 @@ into the single Spanish `justification`.
 
 | Case | Result | Judge calls |
 | --- | --- | --- |
-| No relevant node (or empty `retrieved_context`) | `0.0` | none for empty context |
+| No relevant node | `0.0` | one per node |
+| Empty `retrieved_context` (no ranking to measure) | `NOT_APPLICABLE` — excluded from the averages | none |
 | Relevant nodes ranked first | `1.0` | one per node |
 | Relevant nodes ranked last (e.g. `[irrelevant, relevant]`) | `0.5` | one per node |
 

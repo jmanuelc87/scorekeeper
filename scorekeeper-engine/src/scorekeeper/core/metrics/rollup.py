@@ -6,6 +6,10 @@ each raw ``MetricScore.score`` is normalized to [0, 1] via its metric's ``scale`
 (looked up in the registry by ``metric_name``) and weighted by the metric's
 ``weight``. Scenario and platform averages are plain means of their already-
 normalized children.
+
+Every mean here skips the ``NOT_APPLICABLE`` sentinel: a metric that had nothing
+to measure (no retrieved context, no claims) reports a negative score instead of
+inventing a 0.0 or a 1.0, and an unmeasured child must not move an average.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from typing import Protocol
 
 import numpy as np
 
+from scorekeeper.core.metrics.base import is_not_applicable
 from scorekeeper.core.metrics.registry import MetricRegistry
 
 
@@ -28,12 +33,17 @@ class _Scored(Protocol):
 def turn_score(scores: Iterable[_Scored]) -> float | None:
     """Weighted mean of normalized metric scores for one turn.
 
-    Returns ``None`` when there are no scores. Raises ``KeyError`` if a
-    ``metric_name`` is not in the registry.
+    Not-applicable scores are skipped before normalizing — a sentinel must never
+    reach ``scale.normalize`` (``Inverted`` would map ``-1.0`` to ``2.0``) — and
+    carry no weight, so the mean is over the metrics that actually measured
+    something. Returns ``None`` when there are no such scores. Raises ``KeyError``
+    if a ``metric_name`` is not in the registry.
     """
     numerator = 0.0
     denominator = 0.0
     for score in scores:
+        if is_not_applicable(score.score):
+            continue
         metric = MetricRegistry.get(score.metric_name)
         numerator += metric.scale.normalize(score.score) * metric.weight
         denominator += metric.weight
@@ -41,14 +51,14 @@ def turn_score(scores: Iterable[_Scored]) -> float | None:
 
 
 def average(values: Iterable[float | None]) -> float | None:
-    """Mean of the non-null values, excluding exact-0.0 and exact-1.0 outliers.
+    """Plain mean of the children that carry a score.
 
-    ``None`` values are dropped, then any value equal to ``0.0`` or ``1.0`` is
-    treated as an outlier and removed before computing the mean with numpy.
-    Returns ``None`` if nothing remains.
+    ``None`` (never scored) and negative values (:data:`NOT_APPLICABLE`, nothing to
+    measure) are dropped; everything else counts, including a legitimate ``0.0`` or
+    ``1.0``. Returns ``None`` if nothing remains.
     """
     present = np.array(
-        [v for v in values if v is not None and v != 0.0 and v != 1.0],
+        [v for v in values if v is not None and not is_not_applicable(v)],
         dtype=float,
     )
     return float(np.mean(present)) if present.size else None

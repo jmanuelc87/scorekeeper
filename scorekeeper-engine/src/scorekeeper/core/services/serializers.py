@@ -12,6 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from scorekeeper.core.metrics.base import is_not_applicable
 from scorekeeper.core.runner import (
     STATUS_COMPLETADO,
     STATUS_FALLIDO,
@@ -153,6 +154,21 @@ def _serialize_scenario(
     return entry
 
 
+def _serialize_metric_score(score: MetricScore) -> dict[str, Any]:
+    """One metric's score on a turn, without its structured trace.
+
+    The stored not-applicable sentinel is a negative number — an internal encoding
+    for "this metric had nothing to measure here". It surfaces as ``null`` so no
+    client mistakes it for a score.
+    """
+    return {
+        "metric_name": score.metric_name,
+        "score": None if is_not_applicable(score.score) else score.score,
+        "judge_model": score.judge_model,
+        "rubric_version": score.rubric_version,
+    }
+
+
 def serialize_metric_trace(
     score: MetricScore, include_provenance: bool
 ) -> dict[str, Any]:
@@ -198,15 +214,7 @@ def serialize_scenario_turn(turn: Turn) -> dict[str, Any]:
         "expected_output": turn.expected_output,
         "retrieved_context_source": turn.retrieved_context_source,
         "turn_score": turn.turn_score,
-        "metric_scores": [
-            {
-                "metric_name": score.metric_name,
-                "score": score.score,
-                "judge_model": score.judge_model,
-                "rubric_version": score.rubric_version,
-            }
-            for score in turn.metric_scores
-        ],
+        "metric_scores": [_serialize_metric_score(score) for score in turn.metric_scores],
     }
 
 
@@ -218,13 +226,5 @@ def _serialize_turn(turn: Turn) -> dict[str, Any]:
         "turn_id": str(turn.id),
         "turn_number": turn.turn_number,
         "turn_score": turn.turn_score,
-        "metric_scores": [
-            {
-                "metric_name": score.metric_name,
-                "score": score.score,
-                "judge_model": score.judge_model,
-                "rubric_version": score.rubric_version,
-            }
-            for score in turn.metric_scores
-        ],
+        "metric_scores": [_serialize_metric_score(score) for score in turn.metric_scores],
     }

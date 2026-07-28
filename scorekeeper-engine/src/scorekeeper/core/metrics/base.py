@@ -20,14 +20,35 @@ from __future__ import annotations
 import json
 import re
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 from pydantic import BaseModel, Field
 
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
+from scorekeeper.core.metrics.prompts import PromptSlot
 from scorekeeper.core.metrics.scale import Scale
 from scorekeeper.core.retrieved_context import RetrievedContext
+
+
+NOT_APPLICABLE = -1.0
+"""Sentinel score for a turn the metric could not measure at all.
+
+A metric short-circuits with this when its input is absent (no retrieved context,
+no claims, no questions): there is nothing to score, and inventing a ``0.0`` or a
+``1.0`` would push a fabricated value into every mean above it. Rollup skips it
+instead — see :func:`scorekeeper.core.metrics.rollup.turn_score`.
+"""
+
+
+def is_not_applicable(score: float) -> bool:
+    """Whether ``score`` is the not-applicable sentinel.
+
+    Any negative value counts: real scores live in their scale's own range, which
+    is never below zero, so the sign alone carries the meaning.
+    """
+    return score < 0.0
 
 
 def context_documents(raw: str) -> list[str]:
@@ -142,8 +163,8 @@ class MetricResult(BaseModel):
     """A metric's output for one turn — persisted onto a ``MetricScore`` row."""
 
     metric_name: str
-    raw_score: float  # in the metric's own scale
-    normalized_score: float  # always [0, 1], used at rollup
+    raw_score: float  # in the metric's own scale, or NOT_APPLICABLE
+    normalized_score: float  # [0, 1] used at rollup, or NOT_APPLICABLE
     trace: MetricTrace = MetricTrace()  # structured record, persisted as JSON
     judge_model: str | None = None
     rubric_version: str | None = None
@@ -156,6 +177,16 @@ class Metric(ABC):
     override (``weight``, ``rubric_version``). Which use cases a metric belongs
     to is *not* declared here: that mapping is user data, composed through
     ``POST /use-cases`` and stored in ``use_case_metrics``.
+
+    ``prompts`` declares the metric's prompt *slots* — the same split one level
+    down: the slug and required variables are code, the text is not. Empty by
+    default, so a metric with no editable prompt declares nothing.
+
+    The text arrives by **injection**: ``selection.resolve`` reads the active
+    ``PromptVersion`` for each slot and passes it to the constructor, and
+    ``evaluate`` reads it back with :meth:`prompt`. A metric therefore never
+    holds a session and never queries for its own rubric, which is what keeps
+    this package importable and unit-testable with no database.
     """
 
     name: ClassVar[str]
@@ -163,6 +194,38 @@ class Metric(ABC):
     scale: ClassVar[Scale]
     weight: ClassVar[float] = 1.0
     rubric_version: ClassVar[str] = "v1"
+    prompts: ClassVar[tuple[PromptSlot, ...]] = ()
+
+    def __init__(self, templates: Mapping[str, str] | None = None) -> None:
+        """Bind this instance's prompt templates, keyed by slot slug.
+
+        ``templates`` is optional so a metric declaring no slot still constructs as
+        ``Cls()``. A *non-empty* map must cover every declared slot: a partial one is
+        a resolution bug, and catching it here — on the event loop, in ``resolve`` —
+        beats letting :meth:`prompt` raise later inside a judge worker thread, where
+        the runner's skip-metric-continue would swallow it as a warning.
+        """
+        self._templates = dict(templates or {})
+        missing = [slot.slug for slot in self.prompts if slot.slug not in self._templates]
+        if self._templates and missing:
+            raise ValueError(
+                f"La métrica {self.name} no recibió plantilla para: {', '.join(missing)}."
+            )
+
+    def prompt(self, slug: str) -> str:
+        """The template bound to ``slug``.
+
+        Raises ``LookupError`` when nothing is bound — either the metric was built
+        with no templates at all (a test constructing it directly), or it is asking
+        for a slug it never declared in ``prompts``.
+        """
+        try:
+            return self._templates[slug]
+        except KeyError:
+            raise LookupError(
+                f"La métrica {self.name} no tiene plantilla asignada para el prompt "
+                f"{slug!r}. ¿Se construyó sin plantillas o el slot no está declarado?"
+            ) from None
 
     @abstractmethod
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:

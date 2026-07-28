@@ -24,9 +24,11 @@ Nodes come from the turn's structured ``retrieved_context`` documents, in retrie
 rank order, each rendered to node text (source ``document`` + ``content``) by
 ``RetrievedContext.node_texts`` (the same node convention the hallucination metric
 uses). Labeling is a *classification* step, so it goes through the judge's
-``structured()`` seam rather than ``score()``. With no relevant node (or no
-retrieved context at all) the score is ``0.0``. All prompts and justification
-output are Spanish.
+``structured()`` seam rather than ``score()``. With no relevant node the score is
+``0.0`` — a real measurement of a failed retrieval; with no retrieved context at
+all there is no ranking to measure, so the metric returns ``NOT_APPLICABLE`` and
+rollup leaves it out of the averages. All prompts and justification output are
+Spanish.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from scorekeeper.core.metrics.base import (
+    NOT_APPLICABLE,
     MetricResult,
     MetricTrace,
     MultiStepMetric,
@@ -43,6 +46,7 @@ from scorekeeper.core.metrics.base import (
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
+from scorekeeper.core.metrics.prompts import PromptSlot, safe_format
 from scorekeeper.core.metrics.registry import register
 from scorekeeper.core.metrics.scale import Unit
 
@@ -54,35 +58,6 @@ class RelevanceVerdict(BaseModel):
     justification: str  # Spanish rationale
 
 
-# Relevance-labeling instruction. Only ``{expected_output}`` and ``{node}`` are
-# interpolated (with .format() in the metric); it deliberately contains no other
-# ``{...}`` so formatting never trips on stray braces. The turn's input question
-# is appended automatically by the judge, so the rubric does not repeat it. The
-# node is judged against the EXPECTED answer, never the assistant's response.
-VERDICT_PROMPT = """\
-Eres un evaluador de recuperación (retrieval) para un sistema RAG. Debes decidir \
-si un NODO recuperado es relevante para poder construir la RESPUESTA ESPERADA a \
-la pregunta del usuario.
-
-Un nodo es RELEVANTE si aporta información que ayuda directamente a llegar a la \
-respuesta esperada (un hecho, dato, definición o paso que aparece o se usa en \
-ella). Es NO RELEVANTE si trata de otro tema, es genérico o no contribuye a la \
-respuesta esperada, aunque esté relacionado por encima.
-
-Juzga únicamente la utilidad del nodo respecto a la respuesta esperada; no \
-evalúes la respuesta del asistente ni la redacción del nodo.
-
-RESPUESTA ESPERADA (verdad de referencia):
-{expected_output}
-
-NODO RECUPERADO:
-{node}
-
-Devuelve tu veredicto: relevant=true si el nodo es relevante, relevant=false si \
-no lo es, junto con una justificación breve en español.
-"""
-
-
 @register
 class ContextualPrecision(MultiStepMetric):
     """Average Precision of relevant nodes over the retriever's ranking."""
@@ -91,6 +66,16 @@ class ContextualPrecision(MultiStepMetric):
     category = MetricCategory.RAG
     scale = Unit()  # 0-1 (weighted cumulative precision)
     weight = 1.0
+    prompts = (
+        PromptSlot(
+            slug="verdict",
+            required_variables=("expected_output", "node"),
+            description=(
+                "Veredicto binario de relevancia de un nodo recuperado frente a la "
+                "respuesta esperada, no frente a la respuesta del asistente."
+            ),
+        ),
+    )
     # strict_mode collapses the score to a pass/fail: only a perfect ranking
     # (every relevant node ahead of every irrelevant one → 1.0) passes.
     strict_mode: bool = False
@@ -99,15 +84,15 @@ class ContextualPrecision(MultiStepMetric):
         nodes = turn.retrieved_context.node_texts()
 
         if not nodes:
-            # No retrieved nodes to rank: nothing relevant was retrieved.
+            # No retrieved nodes to rank: there is no ranking to measure.
             summary = (
-                "No hay nodos de contexto recuperado que ordenar; la precisión "
-                "contextual es 0.000."
+                "No hay nodos de contexto recuperado que ordenar; la métrica no "
+                "aplica a este turno y queda fuera de los promedios."
             )
             return MetricResult(
                 metric_name=self.name,
-                raw_score=0.0,
-                normalized_score=self.normalize(0.0),
+                raw_score=NOT_APPLICABLE,
+                normalized_score=NOT_APPLICABLE,
                 trace=MetricTrace(
                     steps=[TraceStep(label="Sin nodos recuperados", summary=summary)]
                 ),
@@ -123,10 +108,11 @@ class ContextualPrecision(MultiStepMetric):
         label_step = TraceStep(label="Relevancia por nodo")
         node_view = TurnView(prompt=turn.prompt, response="")
         judge_model = judge.model_for(JudgeStep.EXTRACT)
+        template = self.prompt("verdict")
         for k, node in enumerate(nodes, start=1):
             verdict = judge.structured(
-                instruction=VERDICT_PROMPT.format(
-                    expected_output=turn.expected_output, node=node
+                instruction=safe_format(
+                    template, expected_output=turn.expected_output, node=node
                 ),
                 turn=node_view,
                 schema=RelevanceVerdict,

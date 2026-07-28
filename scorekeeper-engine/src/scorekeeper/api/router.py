@@ -12,6 +12,7 @@ from scorekeeper.api.v1 import (
     evaluations,
     health,
     metrics,
+    prompts,
     runs,
     scenarios,
     turns,
@@ -28,3 +29,4 @@ api_router.include_router(turns.router)
 api_router.include_router(auth_providers.router)
 api_router.include_router(use_cases.router)
 api_router.include_router(metrics.router)
+api_router.include_router(prompts.router)

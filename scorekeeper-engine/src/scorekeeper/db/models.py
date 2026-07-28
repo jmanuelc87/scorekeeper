@@ -18,14 +18,17 @@ from typing import Any
 from sqlalchemy import (
     JSON,
     Boolean,
+    CheckConstraint,
     DateTime,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
     Uuid,
+    text,
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncAttrs
@@ -379,6 +382,137 @@ class UseCaseMetric(Base):
     )
     metric_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("metrics.id", ondelete="CASCADE"), index=True
+    )
+
+
+class Prompt(Base):
+    """One prompt *slot* a metric renders, as a row its versions can point at.
+
+    Code-owned in the same sense as :class:`MetricDefinition`: the slug and the
+    required variables are declared on the metric class as a ``PromptSlot`` (see
+    ``scorekeeper.core.metrics.prompts``) and mirrored here, insert-only, by
+    ``scorekeeper.core.metrics.selection.sync_prompts``. What is *not* code is the
+    text — that lives in :class:`PromptVersion`, seeded from the slot's default.
+
+    ``faithfulness_deepeval`` declares two slots (truths extraction and the per-claim
+    verdict), ``answer_relevance`` one. Rows here are never deleted; the API exposes
+    no DELETE.
+    """
+
+    __tablename__ = "prompts"
+    __table_args__ = (
+        UniqueConstraint("metric_id", "slug", name="uq_prompt_metric_slug"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    # No ``ondelete`` — the default NO ACTION is what stops a metric a prompt belongs
+    # to from being deleted out from under it.
+    metric_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("metrics.id"), index=True)
+    slug: Mapped[str] = mapped_column(String(128))  # slot name within the metric.
+    # The placeholder names the metric's own fill supplies (``["claim", "truths"]``).
+    # Code-owned, which is why it lives here and not on the version: a version must
+    # *satisfy* this contract, not declare one.
+    required_variables: Mapped[list[Any] | None] = mapped_column(JsonColumn, default=None)
+    description: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+
+    versions: Mapped[list[PromptVersion]] = relationship(
+        back_populates="prompt",
+        cascade="all, delete-orphan",
+        order_by="PromptVersion.version",
+    )
+
+
+class PromptVersion(Base):
+    """One edit of one prompt slot — append-only.
+
+    ``template`` is write-once: no transition ever rewrites it, so a version a finished
+    benchmark points at cannot change under it. Only ``status`` and ``is_active``
+    transition. An edit lands as a ``draft`` (nothing can score under it), publishing
+    validates it and makes it live, and rollback moves ``is_active`` back to an earlier
+    published version rather than copying its text forward.
+
+    ``version`` is a per-prompt monotonic counter assigned at row creation, so a
+    discarded draft consumes one and the published history has gaps (v1, v5, v9). That
+    is the honest edit sequence, and it keeps ``MetricScore.rubric_version`` — derived
+    as ``slug@version`` — unique and resolvable.
+    """
+
+    __tablename__ = "prompt_versions"
+    __table_args__ = (
+        UniqueConstraint("prompt_id", "version", name="uq_prompt_version"),
+        # ``is_active`` is meaningless on a draft or a discarded row.
+        CheckConstraint(
+            "NOT is_active OR status = 'published'",
+            name="ck_prompt_version_active_published",
+        ),
+        # At most one live version, and at most one open draft, per prompt. Partial
+        # indexes rather than plain unique ones because the constraint only applies to
+        # a subset of rows; both dialects the project runs on support them, so the
+        # SQLite test schema enforces exactly what Alembic creates on PostgreSQL.
+        Index(
+            "uq_prompt_version_active",
+            "prompt_id",
+            unique=True,
+            postgresql_where=text("status = 'published' AND is_active"),
+            sqlite_where=text("status = 'published' AND is_active"),
+        ),
+        Index(
+            "uq_prompt_version_draft",
+            "prompt_id",
+            unique=True,
+            postgresql_where=text("status = 'draft'"),
+            sqlite_where=text("status = 'draft'"),
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    prompt_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("prompts.id", ondelete="CASCADE"), index=True
+    )
+    version: Mapped[int] = mapped_column(Integer)  # per-prompt counter; gaps expected.
+    template: Mapped[str] = mapped_column(Text)  # the Spanish prompt text; write-once.
+    status: Mapped[str] = mapped_column(String(16), default="draft")  # draft/published/discarded.
+    is_active: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+    # The version this edit was based on — the seeded v1 has none.
+    supersedes_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("prompt_versions.id"), default=None
+    )
+    changelog: Mapped[str | None] = mapped_column(Text, default=None)  # why the edit was made.
+    created_by: Mapped[str | None] = mapped_column(String(128), default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
+    # NULL while draft or discarded.
+    published_by: Mapped[str | None] = mapped_column(String(128), default=None)
+    published_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), default=None
+    )
+
+    prompt: Mapped[Prompt] = relationship(back_populates="versions")
+
+
+class RunPromptBinding(Base):
+    """One prompt version a benchmark run was scored under — the many-to-many join.
+
+    Written once at the start of scoring, one row per prompt slot in play, so every
+    score within a run is comparable by construction and an old run can be read back
+    against the exact text that produced it. Only ``published`` versions are bound;
+    that is a service-level rule, not a constraint — the table itself is indifferent to
+    status, which is what would let a future "test-run this draft" flow reuse it
+    unchanged.
+    """
+
+    __tablename__ = "run_prompt_bindings"
+    __table_args__ = (
+        UniqueConstraint("run_id", "prompt_version_id", name="uq_run_prompt_binding"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("benchmark_runs.id", ondelete="CASCADE"), index=True
+    )
+    # No ``ondelete`` — a version a run was scored under is not deletable.
+    prompt_version_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("prompt_versions.id"), index=True
     )
 
 

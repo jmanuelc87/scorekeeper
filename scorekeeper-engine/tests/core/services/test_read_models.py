@@ -13,6 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.core.metrics.base import (
+    NOT_APPLICABLE,
     Metric,
     MetricResult,
     MetricTrace,
@@ -337,6 +338,38 @@ async def test_retrieve_scenario_turns_returns_content_and_scores(
     assert scores[0]["judge_model"] == "judge-test"
     # The structured trace is not surfaced here (read it via /turns/{id}/traces).
     assert "trace" not in scores[0]
+
+
+async def test_not_applicable_score_serializes_as_null(
+    session: AsyncSession, registry
+) -> None:
+    await _score_one(session)
+    scenario = (await session.execute(select(ScenarioResult))).scalars().one()
+    # A metric that had nothing to measure stores the negative sentinel.
+    first_turn = (
+        (await session.execute(select(Turn).where(Turn.turn_number == 1)))
+        .scalars()
+        .one()
+    )
+    score_row = (
+        (
+            await session.execute(
+                select(MetricScore).where(MetricScore.turn_id == first_turn.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    score_row.score = NOT_APPLICABLE
+    await session.commit()
+
+    turns = await retrieve_scenario_turns(str(scenario.id), session=session)
+    runs = await retrieve_runs(granularity="metric_scores", session=session)
+
+    # Both projections hide the internal encoding behind a null.
+    assert turns[0]["metric_scores"][0]["score"] is None
+    run_turns = runs[0]["platforms"][0]["scenario_results"][0]["turns"]
+    assert run_turns[0]["metric_scores"][0]["score"] is None
 
 
 async def test_scenario_serialization_exposes_id(session: AsyncSession, registry) -> None:

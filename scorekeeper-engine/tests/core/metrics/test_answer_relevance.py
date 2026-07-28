@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import pytest
 
-from scorekeeper.core.metrics.base import TurnView
+from scorekeeper.core.metrics.base import NOT_APPLICABLE, TurnView
 from scorekeeper.core.metrics.catalog.answer_relevance import (
     AnswerRelevance,
     cosine_similarity,
 )
+from seeded_prompts import build
 
 
 def _questions(*questions: str):
@@ -43,7 +44,7 @@ def test_perfect_relevance_when_questions_match_original(make_judge) -> None:
         },
         model="claude-x",
     )
-    metric = AnswerRelevance()
+    metric = build(AnswerRelevance)
     metric.n_questions = 2  # instance override keeps the test small
 
     result = metric.evaluate(turn, judge)
@@ -72,7 +73,7 @@ def test_partial_relevance_is_averaged(make_judge) -> None:
             "ortogonal": [0.0, 1.0],  # cosine 0.0 with q
         },
     )
-    metric = AnswerRelevance()
+    metric = build(AnswerRelevance)
     metric.n_questions = 2
 
     result = metric.evaluate(turn, judge)
@@ -90,7 +91,7 @@ def test_negative_cosine_is_clamped_to_zero(make_judge) -> None:
         extractions=_questions("opuesta"),
         embeddings={"q": [1.0, 0.0], "opuesta": [-1.0, 0.0]},  # cosine -1.0
     )
-    metric = AnswerRelevance()
+    metric = build(AnswerRelevance)
     metric.n_questions = 1
 
     result = metric.evaluate(turn, judge)
@@ -99,22 +100,26 @@ def test_negative_cosine_is_clamped_to_zero(make_judge) -> None:
     assert result.raw_score == 0.0
 
 
-def test_no_questions_generated_is_safe(make_judge) -> None:
+def test_no_questions_generated_is_not_applicable(make_judge) -> None:
     turn = TurnView(prompt="q", response="respuesta")
     # The model returns only blank questions, which are filtered out.
     judge = make_judge(extractions=_questions("", "   "))
-    metric = AnswerRelevance()
+    metric = build(AnswerRelevance)
     metric.n_questions = 2
 
     result = metric.evaluate(turn, judge)
 
-    assert result.raw_score == 0.0
+    # Nothing to compare against the original question → nothing measured.
+    assert result.raw_score == NOT_APPLICABLE
+    assert result.normalized_score == NOT_APPLICABLE
     # No embedding call happens when there is nothing to compare.
     assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
-    # No questions → generation step has no entries; relevance is zero.
+    # No questions → generation step has no entries, and the closing step records
+    # that nothing was measured rather than a similarity.
     gen_step = result.trace.steps[0]
     assert gen_step.entries == []
-    assert result.trace.steps[-1].entries[0].value == 0.0
+    assert result.trace.steps[-1].entries == []
+    assert "no aplica" in result.trace.steps[-1].summary
 
 
 def test_generation_step_does_not_leak_original_question(make_judge) -> None:
@@ -134,7 +139,7 @@ def test_generation_step_does_not_leak_original_question(make_judge) -> None:
         )
 
     judge.structured = _spy
-    metric = AnswerRelevance()
+    metric = build(AnswerRelevance)
     metric.n_questions = 1
     metric.evaluate(turn, judge)
 

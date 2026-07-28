@@ -102,8 +102,8 @@ class Metric(ABC):
 ```python
 class MetricResult(BaseModel):
     metric_name: str
-    raw_score: float          # in the metric's own scale
-    normalized_score: float   # always [0, 1], used at rollup
+    raw_score: float          # in the metric's own scale, or NOT_APPLICABLE
+    normalized_score: float   # [0, 1] used at rollup, or NOT_APPLICABLE
     trace: MetricTrace = MetricTrace()   # structured record, persisted as JSON
     judge_model: str | None = None
     rubric_version: str | None = None
@@ -314,10 +314,77 @@ turn_score = Σ (scale.normalize(score) · weight) / Σ weight
 `average(values)` (aliased as `scenario_average` / `platform_average`) is the
 plain mean of the non-null children, used for scenario and platform rollups.
 
+### Not-applicable scores
+
+A metric that had nothing to measure — no retrieved context, no claims, no
+generated questions — returns the `NOT_APPLICABLE` sentinel (`-1.0`, defined in
+`core.metrics.base`) instead of inventing a `0.0` or a `1.0`. Which polarity a
+metric would otherwise pick is arbitrary, and a fabricated value moves every mean
+above it: an ungrounded turn used to earn a perfect hallucination score.
+
+Every mean skips the sentinel. `turn_score` drops it *before* normalizing (an
+`Inverted` scale would map `-1.0` to `2.0`) and does not count its weight, so the
+turn is scored on the metrics that measured something; a turn where every metric
+was inapplicable rolls up to `None`, exactly like a turn whose metrics all failed.
+`average` drops it too, which leaves a genuine `0.0` or `1.0` child counting
+normally.
+
+The sentinel is persisted on `MetricScore.score` — the trace explains why the
+metric did not apply — but the read models surface it as `null`, so no client ever
+sees the negative encoding.
+
 Because scale and weight are code metadata (not stored per score), recomputing an
 old run applies the *current* weights/scales — `rubric_version` captures rubric
 drift but not weight drift. This is acceptable for a tool whose rollups are
 derived and recomputable.
+
+## Prompt slots
+
+**A metric holds no prompt text.** Each prompt it renders is declared as a
+`PromptSlot` (`core/metrics/prompts.py`) in a `prompts` tuple on the class — the slug,
+the placeholder names the metric fills itself, and a description. That is all:
+
+```python
+prompts = (
+    PromptSlot(
+        slug="verify",
+        required_variables=("truths", "claim"),
+        description="Veredicto por afirmación.",
+    ),
+)
+```
+
+The text lives in `prompt_versions`, seeded by the prompt-catalog migration, and reaches
+the metric by **injection**: `selection.resolve` reads the active version for each slot
+and passes it to the constructor, and `evaluate` reads it back with `self.prompt(slug)`:
+
+```python
+def evaluate(self, turn, judge):
+    rubric = safe_format(self.prompt("verify"), truths=..., claim=...)
+```
+
+This is what keeps the package database-free without keeping a copy of the text in code:
+a metric never queries for its rubric, it is handed one. `score_run` resolves once per
+run and pins the result, so an edit landing mid-job cannot split a run's rollups across
+two rubrics; a slot with no active published version fails the run up front rather than
+being silently skipped by the runner's skip-metric-continue. Editing a stored version
+changes what the judge receives on the next run. See
+[Data model → Prompt catalog](data-model.md#prompt-catalog).
+
+Constructing a metric directly — as unit tests do — yields one with no templates bound,
+and `self.prompt(...)` raises. `tests/seeded_prompts.py` reads the shipped text out of
+the migration for exactly this case.
+
+Two audiences share one template, which is what `required_variables` pins down:
+
+- the **metric** fills its own variables before the call, with
+  `prompts.safe_format` — not `str.format`, so a placeholder it does not supply
+  survives instead of raising `KeyError` inside the worker,
+- the **judge** then fills `{prompt}`, `{response}` and `{context}` from the turn
+  (`judges/base.py::_fill_placeholders`) and appends the full turn regardless.
+
+So a template may use its required variables plus those three, and nothing else —
+`prompts.validate_template` enforces exactly that.
 
 ## Adding a metric
 
@@ -329,7 +396,10 @@ derived and recomputable.
 4. Import the module in `catalog/__init__.py` so it registers on import.
 5. Link it to the use cases that should score it via `POST /use-cases` — no code
    change needed, and `GET /metrics` lists it as soon as the process restarts.
-6. Add a unit test (see below).
+6. Declare a `PromptSlot` per prompt the metric renders, in a `prompts` tuple on
+   the class, so its text becomes editable rather than frozen in code (see
+   [Prompt slots](#prompt-slots)).
+7. Add a unit test (see below).
 
 ```python
 # scorekeeper-engine/src/scorekeeper/core/metrics/catalog/claridad.py

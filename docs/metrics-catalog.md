@@ -9,6 +9,13 @@ where the scores land see the [Data model](data-model.md).
 
 All rubrics, prompts and justifications are in Spanish.
 
+> **The prompt text is not in these modules.** Each metric declares only its prompt
+> *slots* — referred to below as `metric.slug`, e.g. `faithfulness_ragas.verify`. The
+> text itself lives in `prompt_versions`, seeded by the prompt-catalog migration and
+> injected at resolution, so the wording described here is the shipped default and may
+> have been edited since. `GET /api/v1/prompts` shows what is actually live. See
+> [Evaluation metrics → Prompt slots](evaluation-metrics.md#prompt-slots).
+
 | Metric (`name`) | Category | Scale | Weight | Higher means |
 | --- | --- | --- | --- | --- |
 | [`answer_relevance`](#answer_relevance) | `rag` | `Unit()` 0–1 | 1.0 | answer sticks closer to the question (better) |
@@ -89,8 +96,8 @@ normalized) and **higher is better**.
 embeddings never raise.
 
 **No-question turns.** If every generation is blank there is nothing to compare,
-so the metric short-circuits to `raw_score = 0.0` (no relevance) with **no embed
-call**.
+so the metric short-circuits to `raw_score = NOT_APPLICABLE` with **no embed
+call**, and rollup leaves the turn out of its averages.
 
 ### Use cases
 
@@ -160,9 +167,10 @@ This is a `MultiStepMetric`: one judge call per node, no single rubric.
 4. Each node's verdict is a typed `TraceEntry` (`value` = relevant, `metadata.rank`),
    with a summary `TraceStep` for the Average Precision result.
 
-**No relevant nodes / no context.** If nothing relevant was retrieved (or
-`retrieved_context` is empty), the metric short-circuits to `raw_score = 0.0` —
-the empty-context case makes **no judge calls**.
+**No relevant nodes / no context.** If nothing relevant was retrieved the metric
+short-circuits to `raw_score = 0.0` — a real measurement of a failed ranking. If
+`retrieved_context` is empty there is no ranking to measure at all, so it returns
+`raw_score = NOT_APPLICABLE` with **no judge calls** and stays out of the averages.
 
 **`strict_mode`.** Off by default. When enabled, the score collapses to a pass/fail:
 only a perfect ranking (every relevant node ahead of every irrelevant one → `1.0`)
@@ -170,7 +178,7 @@ passes; anything less becomes `0.0`.
 
 ### The verdict prompt
 
-`VERDICT_PROMPT` frames the judge as a retrieval evaluator deciding whether a node
+`contextual_precision.verdict` frames the judge as a retrieval evaluator deciding whether a node
 is *useful for constructing the expected answer*. Only `{expected_output}` and
 `{node}` are interpolated (via `.format()`); the template deliberately contains no
 other braces so formatting never trips on stray `{}`. The turn's input question is
@@ -228,10 +236,12 @@ Raw score is already in `[0, 1]` (`Unit()`), **higher is better**.
 
 1. **Extract claims** from the answer via `judge.structured(EXTRACT_CLAIMS,
    schema=Claims)`.
-2. If **no claims** were extracted, nothing can be unfaithful → short-circuit to
-   `raw_score = 1.0` with no verification calls.
-3. **Verify** each claim with `judge.score(VERIFY_RAGAS.format(claim=...),
-   scale=Boolean())`: `1` if the claim is entailed by the context, `0` if it is
+2. If **no claims** were extracted there is nothing to verify → short-circuit to
+   `raw_score = NOT_APPLICABLE` with no verification calls, excluded from the
+   averages rather than counted as perfect faithfulness.
+3. **Verify** each claim with
+   `judge.structured(safe_format(self.prompt("verify"), claim=...), schema=RagasEntailment)`:
+   `entailed` is true if the claim is inferable from the context, false if it is
    not entailed or is contradicted.
 4. `raw_score = mean(verdicts)` — on the `Boolean` scale each verdict is `0`/`1`,
    so the mean is exactly `supported / n`.
@@ -240,7 +250,7 @@ Raw score is already in `[0, 1]` (`Unit()`), **higher is better**.
 
 - `EXTRACT_CLAIMS` turns each sentence of the answer into verifiable, independent
   statements (may reference `{prompt}`/`{response}`).
-- `VERIFY_RAGAS` asks whether a single `{claim}` can be inferred from the context.
+- `faithfulness_ragas.verify` asks whether a single `{claim}` can be inferred from the context.
   It must **not** contain `{prompt}`/`{response}`/`{context}` — the judge appends
   the full turn (including retrieved context) automatically.
 
@@ -289,10 +299,11 @@ rendering.
    extracted *first* so the no-claims case short-circuits before paying for
    truths extraction; the reference pseudocode runs the two extractions
    concurrently, so leading with claims is equivalent.
-2. If **no claims**, short-circuit to `raw_score = 1.0`.
-3. **Extract truths** from the context (`GENERATE_TRUTHS` → `Truths`).
+2. If **no claims**, short-circuit to `raw_score = NOT_APPLICABLE` (nothing to
+   measure, excluded from the averages).
+3. **Extract truths** from the context (`faithfulness_deepeval.generate_truths` → `Truths`).
 4. **Verify** each claim against the joined truths with
-   `judge.score(VERIFY_DEEPEVAL.format(truths=..., claim=...), scale=Boolean())`:
+   `judge.score(safe_format(self.prompt("verify"), truths=..., claim=...), scale=Boolean())`:
    `0` **only** if the truths directly contradict the claim, else `1` (agrees or
    not mentioned).
 5. `raw_score = mean(verdicts) = not_contradicted / n`.
@@ -300,9 +311,9 @@ rendering.
 ### The prompts
 
 - `EXTRACT_CLAIMS` — shared with the RAGAS variant.
-- `GENERATE_TRUTHS` extracts atomic, verifiable facts from the retrieved context
+- `faithfulness_deepeval.generate_truths` extracts atomic, verifiable facts from the retrieved context
   (references `{context}`).
-- `VERIFY_DEEPEVAL` asks whether the `{truths}` contradict the `{claim}`; it too
+- `faithfulness_deepeval.verify` asks whether the `{truths}` contradict the `{claim}`; it too
   must not contain the turn placeholders.
 
 ### Use cases
@@ -374,12 +385,13 @@ This is a `MultiStepMetric`: one judge call per document, no single rubric.
    `justification` = the Spanish rationale), with a summary `TraceStep` for the rate.
 
 **No-context turns.** When `retrieved_context` is empty there is nothing to
-contradict, so the metric short-circuits to `raw_score = 0.0` (no hallucination)
-with **no judge calls**.
+contradict and nothing to measure, so the metric short-circuits to
+`raw_score = NOT_APPLICABLE` with **no judge calls**. It no longer earns a free
+perfect faithfulness score: rollup drops the turn from its averages instead.
 
 ### The NLI prompt
 
-`NLI_PROMPT` frames the judge as a strict NLI classifier. It spells out the three
+`hallucination.nli` frames the judge as a strict NLI classifier. It spells out the three
 labels, six judging rules (judge only from the premise, a missing detail is not a
 contradiction, a direct conflict in any stated attribute is a contradiction, be
 decisive, …), a JSON output shape, and three worked examples. `{documento}` is the

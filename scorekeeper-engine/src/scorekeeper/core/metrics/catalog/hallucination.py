@@ -13,9 +13,9 @@ We store the hallucination rate as the raw score (higher = worse). Rollup averag
 *normalized* scores as higher-is-better, so the metric uses an ``Inverted(Unit())``
 scale: the raw score keeps its intuitive direction while normalization maps it to
 the faithfulness complement (``1 - rate``), which composes correctly with the other
-metrics. When a turn has no retrieved context there is nothing to contradict, so
-the answer is treated as non-hallucinated (``raw_score`` ``0.0``, fully faithful)
-with no judge calls.
+metrics. When a turn has no retrieved context there is nothing to contradict and
+nothing to measure, so the metric returns ``NOT_APPLICABLE`` with no judge calls
+and rollup leaves it out of the averages.
 
 The NLI judgment is a *classification* step, so it goes through the judge's
 ``structured()`` seam rather than ``score()``.
@@ -28,6 +28,7 @@ from enum import StrEnum
 from pydantic import BaseModel
 
 from scorekeeper.core.metrics.base import (
+    NOT_APPLICABLE,
     MetricResult,
     MetricTrace,
     MultiStepMetric,
@@ -38,6 +39,7 @@ from scorekeeper.core.metrics.base import (
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
+from scorekeeper.core.metrics.prompts import PromptSlot, safe_format
 from scorekeeper.core.metrics.registry import register
 from scorekeeper.core.metrics.scale import Inverted, Unit
 
@@ -55,70 +57,6 @@ class NLIJudgment(BaseModel):
 
     label: NLILabel
     justification: str  # Spanish rationale
-
-
-# NLI classification prompt. ``{documento}`` is the premise (one retrieved context
-# document); the hypothesis is the model's answer, which the judge also receives
-# as the turn's ``{response}``. Placeholder to be refined manually.
-NLI_PROMPT = """\
-Eres un juez estricto de inferencia de lenguaje natural (NLI). Se te
-proporciona una PREMISA y una HIPÓTESIS. Determina la relación lógica de la
-HIPÓTESIS con la PREMISA y devuelve exactamente una etiqueta.
-
-ETIQUETAS
-- "entailment":    Una persona que leyera únicamente la PREMISA concluiría
-                   que la HIPÓTESIS es definitivamente verdadera.
-- "contradiction": Una persona que leyera únicamente la PREMISA concluiría
-                   que la HIPÓTESIS es definitivamente falsa.
-- "neutral":       La HIPÓTESIS podría ser verdadera o falsa — la PREMISA no
-                   aporta información suficiente para decidir en ningún
-                   sentido.
-
-REGLAS DE JUICIO
-1. Juzga ÚNICAMENTE con base en la PREMISA. No uses conocimiento del mundo
-   externo, suposiciones ni hechos que no estén enunciados en la PREMISA.
-2. Trata la PREMISA como la descripción de una única escena/evento concreto.
-   Las dos oraciones pueden describir la misma escena.
-3. La falta de un detalle NO es contradicción. Si la HIPÓTESIS añade
-   información que la PREMISA ni confirma ni niega, la etiqueta es "neutral".
-4. Un conflicto directo en cualquier atributo, acción, cantidad o actor
-   enunciado (p. ej. color, ubicación, quién hace qué) es "contradiction".
-5. No te dejes influir por la fluidez ni la verosimilitud — solo por la
-   relación lógica.
-6. Sé decisivo. Elige la única etiqueta que mejor se ajuste.
-
-SALIDA
-Devuelve ÚNICAMENTE un objeto JSON, sin markdown, sin texto adicional:
-{{
-  "label": "entailment" | "neutral" | "contradiction",
-  "reason": "<una oración que cite el detalle específico de la premisa que lo decidió>"
-}}
-
-EJEMPLOS
-
-PREMISA: Un hombre de cabello rubio y camisa marrón está bebiendo de una
-fuente de agua pública.
-HIPÓTESIS: Una persona rubia está bebiendo agua en público.
-{{"label": "entailment", "reason": "La premisa indica que un hombre rubio bebe de una fuente pública, lo cual la hipótesis reformula de manera más general."}}
-
-PREMISA: Un hombre de cabello rubio y camisa marrón está bebiendo de una
-fuente de agua pública.
-HIPÓTESIS: El hombre lleva una camisa roja.
-{{"label": "contradiction", "reason": "La premisa especifica una camisa marrón, lo cual entra en conflicto con la camisa roja de la hipótesis."}}
-
-PREMISA: Un hombre de cabello rubio y camisa marrón está bebiendo de una
-fuente de agua pública.
-HIPÓTESIS: El hombre tiene sed después de una larga carrera.
-{{"label": "neutral", "reason": "La premisa menciona que bebe, pero no dice nada sobre correr ni sobre la causa, por lo que no puede confirmarse ni negarse."}}
-
-AHORA JUZGA
-
-PREMISA (documento de contexto recuperado):
-{documento}
-
-HIPÓTESIS (respuesta del asistente):
-{response}
-"""
 
 
 def split_context_docs(context: str) -> list[str]:
@@ -142,20 +80,30 @@ class Hallucination(MultiStepMetric):
     # correctly alongside the other metrics.
     scale = Inverted(Unit())
     weight = 1.0
+    prompts = (
+        PromptSlot(
+            slug="nli",
+            required_variables=("documento", "response"),
+            description=(
+                "Clasificación NLI de la respuesta (hipótesis) frente a un documento "
+                "recuperado (premisa): entailment, contradiction o neutral."
+            ),
+        ),
+    )
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
         docs = turn.retrieved_context.node_texts()
 
         if not docs:
-            # No retrieved context to contradict: nothing to hallucinate.
+            # No retrieved context to contradict: the metric does not apply here.
             summary = (
-                "No hay contexto recuperado para verificar; la respuesta no "
-                "presenta alucinación por defecto (tasa 0/0)."
+                "No hay contexto recuperado para verificar; la métrica no aplica "
+                "a este turno y queda fuera de los promedios."
             )
             return MetricResult(
                 metric_name=self.name,
-                raw_score=0.0,
-                normalized_score=self.normalize(0.0),
+                raw_score=NOT_APPLICABLE,
+                normalized_score=NOT_APPLICABLE,
                 trace=MetricTrace(
                     steps=[TraceStep(label="Sin contexto recuperado", summary=summary)]
                 ),
@@ -165,10 +113,11 @@ class Hallucination(MultiStepMetric):
         # One NLI classification per document; the label is a typed entry value.
         contradicted = 0
         judge_model = judge.model_for(JudgeStep.EXTRACT)
+        template = self.prompt("nli")
         nli_step = TraceStep(label="Clasificación NLI por documento")
         for i, doc in enumerate(docs, start=1):
             judgment = judge.structured(
-                instruction=NLI_PROMPT.format(documento=doc, response=turn.response),
+                instruction=safe_format(template, documento=doc, response=turn.response),
                 turn=turn,
                 schema=NLIJudgment,
                 step=JudgeStep.EXTRACT,

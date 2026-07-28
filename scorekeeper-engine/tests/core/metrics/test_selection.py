@@ -16,17 +16,27 @@ import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper.db.models import MetricDefinition, UseCase, UseCaseMetric
+from scorekeeper.db.models import (
+    MetricDefinition,
+    Prompt,
+    PromptVersion,
+    UseCase,
+    UseCaseMetric,
+)
 from scorekeeper.db.repositories import use_cases as repo
 from scorekeeper.core.metrics.base import Metric, MetricResult, TurnView
 from scorekeeper.core.metrics.category import MetricCategory
+from scorekeeper.core.metrics.prompts import PromptSlot
 from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.core.metrics.scale import Unit
 from scorekeeper.core.metrics.selection import (
     DEFAULT_USE_CASE,
+    MissingPromptError,
+    active_templates,
     metrics_for,
     resolve,
     sync_metrics,
+    sync_prompts,
 )
 
 CATALOG_NAMES = {
@@ -43,6 +53,18 @@ class _Nueva(Metric):
     name: ClassVar[str] = "nueva"
     category = MetricCategory.RAG
     scale = Unit()
+
+    def evaluate(self, turn: TurnView, judge) -> MetricResult:  # pragma: no cover - unused
+        raise NotImplementedError
+
+
+class _ConPrompt(Metric):
+    """A metric declaring a prompt slot, added to the registry after the first sync."""
+
+    name: ClassVar[str] = "con_prompt"
+    category = MetricCategory.RAG
+    scale = Unit()
+    prompts = (PromptSlot(slug="saludo", required_variables=("nombre",)),)
 
     def evaluate(self, turn: TurnView, judge) -> MetricResult:  # pragma: no cover - unused
         raise NotImplementedError
@@ -165,7 +187,10 @@ async def test_metrics_for_reads_the_linked_set(
 async def test_resolve_returns_metric_instances(
     db_session: AsyncSession, registered_metrics
 ) -> None:
-    await sync_metrics(db_session)
+    await _sync_all(db_session)
+    # Every declared slot needs a live version now — resolve binds templates, it does
+    # not fall back to a constant in code.
+    await _publish_all(db_session)
     use_case = await _link(db_session, "soporte", ["contextual_precision"])
 
     metrics = await resolve(db_session, use_case.id)
@@ -180,3 +205,234 @@ async def test_resolve_raises_on_unknown_stored_metric(
 
     with pytest.raises(KeyError, match="Métrica desconocida"):
         await resolve(db_session, use_case.id)
+
+
+# --- sync_prompts / active_templates ------------------------------------------
+# The same two-halves split one level down, but the halves sit differently: a slot's
+# slug, required variables and description are code, and ``sync_prompts`` reconciles
+# them. The *text* is not code at all — it is seeded by the prompt-catalog migration,
+# so ``sync_prompts`` never writes a version and a slot it creates has none.
+
+
+async def _slots(session: AsyncSession) -> dict[str, list[str]]:
+    """``metric name -> slugs`` currently materialized in ``prompts``."""
+    stmt = select(MetricDefinition.name, Prompt.slug).join(
+        Prompt, Prompt.metric_id == MetricDefinition.id
+    )
+    found: dict[str, list[str]] = {}
+    for metric_name, slug in await session.execute(stmt):
+        found.setdefault(metric_name, []).append(slug)
+    return {name: sorted(slugs) for name, slugs in found.items()}
+
+
+async def _sync_all(session: AsyncSession) -> None:
+    await sync_metrics(session)
+    await session.flush()
+    await sync_prompts(session)
+    await session.flush()
+
+
+async def _publish_all(session: AsyncSession, template: str = "Plantilla {claim}") -> None:
+    """Give every prompt row a published, active v1 — what the migration does."""
+    for prompt in (await session.execute(select(Prompt))).scalars().all():
+        session.add(
+            PromptVersion(
+                prompt_id=prompt.id,
+                version=1,
+                template=template,
+                status="published",
+                is_active=True,
+            )
+        )
+    await session.flush()
+
+
+async def test_sync_prompts_materializes_every_declared_slot(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    await _sync_all(db_session)
+
+    assert await _slots(db_session) == {
+        "contextual_precision": ["verdict"],
+        "faithfulness_deepeval": ["generate_truths", "verify"],
+        "faithfulness_ragas": ["verify"],
+        "hallucination": ["nli"],
+    }
+
+
+async def test_sync_prompts_records_the_code_owned_contract(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    await _sync_all(db_session)
+
+    row = (
+        await db_session.execute(
+            select(Prompt)
+            .join(MetricDefinition, MetricDefinition.id == Prompt.metric_id)
+            .where(MetricDefinition.name == "hallucination")
+        )
+    ).scalars().one()
+
+    assert row.required_variables == ["documento", "response"]
+    assert "NLI" in (row.description or "")
+
+
+async def test_sync_prompts_writes_no_version(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    """The text is the migration's to seed, never code's to invent."""
+    await _sync_all(db_session)
+
+    count = (await db_session.execute(select(func.count(PromptVersion.id)))).scalar_one()
+    assert count == 0
+
+
+async def test_sync_prompts_is_idempotent(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    await _sync_all(db_session)
+    await _sync_all(db_session)
+
+    count = (await db_session.execute(select(func.count(Prompt.id)))).scalar_one()
+    assert count == 5  # the fixture registry omits AnswerRelevance; production has 6
+
+
+async def test_sync_prompts_refreshes_a_changed_contract(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    """required_variables and description track the code; a stale row lies to the editor."""
+    await _sync_all(db_session)
+    row = (
+        await db_session.execute(
+            select(Prompt)
+            .join(MetricDefinition, MetricDefinition.id == Prompt.metric_id)
+            .where(MetricDefinition.name == "faithfulness_ragas")
+        )
+    ).scalars().one()
+    row.required_variables = ["obsoleta"]
+    row.description = "vieja"
+    await db_session.flush()
+
+    await _sync_all(db_session)
+
+    await db_session.refresh(row)
+    assert row.required_variables == ["claim"]
+    assert row.description != "vieja"
+
+
+async def test_sync_prompts_never_touches_stored_text(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    """A resync must not undo an edit — the version is data, not a projection of code."""
+    await _sync_all(db_session)
+    prompt = (await db_session.execute(select(Prompt))).scalars().first()
+    db_session.add(
+        PromptVersion(
+            prompt_id=prompt.id,
+            version=1,
+            template="Rúbrica editada {claim}",
+            status="published",
+            is_active=True,
+        )
+    )
+    await db_session.flush()
+
+    await _sync_all(db_session)
+
+    stored = (await db_session.execute(select(PromptVersion.template))).scalars().all()
+    assert stored == ["Rúbrica editada {claim}"]
+
+
+async def test_sync_prompts_picks_up_a_slot_added_later(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    """A metric added to the registry brings its slots on the next sync, with no migration."""
+    await _sync_all(db_session)
+    MetricRegistry.add(_ConPrompt)
+
+    await _sync_all(db_session)
+
+    assert (await _slots(db_session))["con_prompt"] == ["saludo"]
+
+
+async def test_active_templates_returns_the_active_version(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    await _sync_all(db_session)
+    prompt = (
+        await db_session.execute(
+            select(Prompt)
+            .join(MetricDefinition, MetricDefinition.id == Prompt.metric_id)
+            .where(MetricDefinition.name == "faithfulness_ragas")
+        )
+    ).scalars().one()
+    db_session.add(
+        PromptVersion(
+            prompt_id=prompt.id,
+            version=7,
+            template="Afirmación: {claim}",
+            status="published",
+            is_active=True,
+        )
+    )
+    await db_session.flush()
+
+    resolved = await active_templates(db_session, ["faithfulness_ragas"])
+
+    assert resolved["faithfulness_ragas"]["verify"].template == "Afirmación: {claim}"
+    assert resolved["faithfulness_ragas"]["verify"].version == 7
+
+
+async def test_active_templates_ignores_inactive_versions(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    """A superseded version is history, not something a run can bind."""
+    await _sync_all(db_session)
+    prompt = (
+        await db_session.execute(
+            select(Prompt)
+            .join(MetricDefinition, MetricDefinition.id == Prompt.metric_id)
+            .where(MetricDefinition.name == "faithfulness_ragas")
+        )
+    ).scalars().one()
+    db_session.add(
+        PromptVersion(
+            prompt_id=prompt.id, version=1, template="vieja {claim}", status="published"
+        )
+    )
+    await db_session.flush()
+
+    with pytest.raises(MissingPromptError, match="faithfulness_ragas.verify"):
+        await active_templates(db_session, ["faithfulness_ragas"])
+
+
+async def test_active_templates_lists_every_missing_slot_at_once(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    """One message naming all of them beats dying on the first."""
+    await _sync_all(db_session)
+
+    with pytest.raises(MissingPromptError) as exc:
+        await active_templates(db_session, ["faithfulness_deepeval"])
+
+    assert "faithfulness_deepeval.generate_truths" in str(exc.value)
+    assert "faithfulness_deepeval.verify" in str(exc.value)
+
+
+async def test_active_templates_of_nothing_is_empty(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    assert await active_templates(db_session, []) == {}
+
+
+async def test_resolve_injects_the_stored_template(
+    db_session: AsyncSession, registered_metrics
+) -> None:
+    """The payoff: editing the stored text changes what the metric renders."""
+    await _sync_all(db_session)
+    use_case = await _link(db_session, "soporte", ["faithfulness_ragas"])
+    await _publish_all(db_session, "Editada: {claim}")
+
+    metrics = await resolve(db_session, use_case.id)
+
+    assert metrics[0].prompt("verify") == "Editada: {claim}"

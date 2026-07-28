@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections.abc import Mapping
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -45,6 +46,7 @@ from scorekeeper.db.models import (
     MetricScore,
     MetricTrace,
     PlatformExecution,
+    PromptVersion,
     ScenarioResult,
     Turn,
     TurnTokenUsage,
@@ -73,9 +75,20 @@ class EvalRunner:
     configured judge from ``make_judge()``). Tests inject a stub judge.
     """
 
-    def __init__(self, session: AsyncSession, judge: Judge | None = None) -> None:
+    def __init__(
+        self,
+        session: AsyncSession,
+        judge: Judge | None = None,
+        templates: Mapping[str, dict[str, PromptVersion]] | None = None,
+    ) -> None:
         self.session = session
         self.judge = judge or make_judge()
+        # The prompt versions this run is pinned to, resolved once by ``score_run``.
+        # Per-run immutable configuration, like ``judge`` — which is why it lives here
+        # rather than being threaded through ``run_benchmark``: every level of the
+        # runner is a public entry point, and a caller starting at ``run_scenario``
+        # must get the same pinning.
+        self.templates = templates
         settings = get_settings()
         self._turn_delay_min = settings.turn_delay_min_seconds
         self._turn_delay_max = settings.turn_delay_max_seconds
@@ -128,7 +141,7 @@ class EvalRunner:
         ``run_turn``); this final commit persists the scenario roll-up
         (``average_score`` / ``status``).
         """
-        metrics = await resolve(self.session, scenario.use_case_id)
+        metrics = await resolve(self.session, scenario.use_case_id, self.templates)
         logger.info(
             "Escenario %s (use_case=%s): %d turno(s), métricas=%s",
             scenario.scenario_id,

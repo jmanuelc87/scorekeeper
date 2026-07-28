@@ -38,6 +38,7 @@ import syntok.segmenter as segmenter
 from pydantic import BaseModel
 
 from scorekeeper.core.metrics.base import (
+    NOT_APPLICABLE,
     MetricResult,
     MetricTrace,
     MultiStepMetric,
@@ -47,6 +48,7 @@ from scorekeeper.core.metrics.base import (
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
+from scorekeeper.core.metrics.prompts import PromptSlot, safe_format
 from scorekeeper.core.metrics.registry import register
 from scorekeeper.core.metrics.scale import Boolean, Unit
 
@@ -104,46 +106,6 @@ class RagasEntailment(BaseModel):
     justification: str = ""
 
 
-# --- Spanish prompts ----------------------------------------------------------
-
-# Extraction instructions may reference {prompt}/{response}/{context}; the judge
-# fills them.
-GENERATE_TRUTHS = (
-    "Extrae las verdades o hechos presentes en el contexto recuperado. Cada "
-    "verdad debe ser un enunciado atómico y verificable tomado únicamente del "
-    "contexto. Devuelve también un breve resumen en español.\n"
-    "Contexto: {context}"
-)
-
-# Verification rubrics: {claim}/{truths} are pre-filled in the metric with
-# .format(); they must NOT contain {prompt}/{response}/{context} — the judge
-# appends the full turn (including retrieved context) automatically.
-# RAGAS entailment is run via judge.structured() (returning RagasEntailment), so the
-# prompt must be self-describing: it elicits the verdict, a calibrated confidence and a
-# justification directly (structured() does not append a scale instruction the way
-# score() does).
-VERIFY_RAGAS = (
-    "¿Puede inferirse la siguiente afirmación a partir del contexto recuperado?\n"
-    "Devuelve:\n"
-    "- entailed: true si la afirmación se deduce del contexto, false si no se "
-    "deduce o lo contradice.\n"
-    "- confidence: tu confianza en ese veredicto, un número entre 0.0 y 1.0 "
-    "(1.0 = certeza total; usa valores bajos si el contexto es ambiguo o "
-    "insuficiente).\n"
-    "- justification: una justificación breve en español.\n"
-    "Afirmación: {claim}"
-)
-
-VERIFY_DEEPEVAL = (
-    "¿Las siguientes verdades contradicen la afirmación? Asigna 0 SOLO si las "
-    "verdades contradicen directamente la afirmación. Asigna 1 si la afirmación "
-    "concuerda con las verdades o si no se menciona (no verificable). Justifica "
-    "brevemente en español.\n"
-    "Verdades:\n{truths}\n"
-    "Afirmación: {claim}"
-)
-
-
 # --- Metrics ------------------------------------------------------------------
 
 
@@ -155,6 +117,16 @@ class FaithfulnessRagas(MultiStepMetric):
     category = MetricCategory.RAG
     scale = Unit()  # 0-1
     weight = 1.0
+    prompts = (
+        PromptSlot(
+            slug="verify",
+            required_variables=("claim",),
+            description=(
+                "Veredicto de entailment de una afirmación frente al contexto "
+                "recuperado, con confianza para la cascada Haiku→Opus."
+            ),
+        ),
+    )
 
     # Per-call model pins for the entailment cascade (per-claim, the n× hot loop),
     # overridable per instance. A cheap high-volume model (bulk, Haiku) decides every
@@ -176,7 +148,8 @@ class FaithfulnessRagas(MultiStepMetric):
         (Opus) and that verdict wins. Returns ``(entailed, justification,
         escalated)`` where ``justification`` is from the model whose verdict is used.
         """
-        prompt = VERIFY_RAGAS.format(claim=claim)
+        # Resolved once so both cascade tiers judge the exact same text.
+        prompt = safe_format(self.prompt("verify"), claim=claim)
         bulk = judge.structured(
             instruction=prompt,
             turn=turn,
@@ -203,12 +176,12 @@ class FaithfulnessRagas(MultiStepMetric):
         claims = split_sentences(turn.response)
         steps.append(_extraction_step(claims))
 
-        # Nothing to verify → nothing can be unfaithful.
+        # Nothing to verify → nothing to measure; the metric does not apply.
         if not claims:
             return MetricResult(
                 metric_name=self.name,
-                raw_score=1.0,
-                normalized_score=self.normalize(1.0),
+                raw_score=NOT_APPLICABLE,
+                normalized_score=NOT_APPLICABLE,
                 trace=MetricTrace(steps=steps),
                 judge_model=None,
                 rubric_version=self.rubric_version,
@@ -262,6 +235,23 @@ class FaithfulnessDeepeval(MultiStepMetric):
     category = MetricCategory.RAG
     scale = Unit()  # 0-1
     weight = 1.0
+    prompts = (
+        PromptSlot(
+            slug="generate_truths",
+            description=(
+                "Extracción de verdades atómicas del contexto recuperado, contra las "
+                "que se verifica cada afirmación de la respuesta."
+            ),
+        ),
+        PromptSlot(
+            slug="verify",
+            required_variables=("truths", "claim"),
+            description=(
+                "Veredicto por afirmación: 0 solo si las verdades la contradicen "
+                "directamente, 1 si concuerda o no se menciona."
+            ),
+        ),
+    )
 
     # Per-call model pins for the two live LLM steps, overridable per instance. Both
     # are high-impact, so neither runs on a weak model: truths extraction (very high,
@@ -283,15 +273,15 @@ class FaithfulnessDeepeval(MultiStepMetric):
         if not claims:
             return MetricResult(
                 metric_name=self.name,
-                raw_score=1.0,
-                normalized_score=self.normalize(1.0),
+                raw_score=NOT_APPLICABLE,
+                normalized_score=NOT_APPLICABLE,
                 trace=MetricTrace(steps=steps),
                 judge_model=None,
                 rubric_version=self.rubric_version,
             )
 
         truths = judge.structured(
-            instruction=GENERATE_TRUTHS,
+            instruction=self.prompt("generate_truths"),
             turn=turn,
             schema=Truths,
             step=JudgeStep.EXTRACT,
@@ -328,9 +318,10 @@ class FaithfulnessDeepeval(MultiStepMetric):
             )
 
         truths_text = "\n".join(truths.truths)
+        verify_template = self.prompt("verify")
         verdicts = [
             judge.score(
-                rubric=VERIFY_DEEPEVAL.format(truths=truths_text, claim=claim),
+                rubric=safe_format(verify_template, truths=truths_text, claim=claim),
                 turn=turn,
                 scale=Boolean(),
                 rubric_version=self.rubric_version,

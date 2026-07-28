@@ -21,7 +21,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.core.importer import normalize_messages, parse_conversation
-from scorekeeper.core.metrics.selection import DEFAULT_USE_CASE, sync_metrics
+from scorekeeper.core.metrics.selection import DEFAULT_USE_CASE, sync_metrics, sync_prompts
 from scorekeeper.core.services.status import STATUS_INGERIDO
 from scorekeeper.db.connection import session_scope
 from scorekeeper.db.models import (
@@ -151,6 +151,9 @@ async def ingest_evaluation(
             # Keep the metric catalog and the "default" use case in sync with the code
             # registry, then resolve every upload's use_case name to its row.
             await sync_metrics(db)
+            await db.flush()
+            # Prompt slots need their metric rows flushed above to point at.
+            await sync_prompts(db)
             await db.flush()
 
             use_case_ids = await use_case_repo.use_case_ids(db)

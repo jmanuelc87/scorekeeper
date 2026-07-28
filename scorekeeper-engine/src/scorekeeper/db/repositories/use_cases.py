@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import uuid
+from collections.abc import Iterable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -43,6 +44,31 @@ async def metric_names_for(session: AsyncSession, use_case_id: uuid.UUID) -> lis
         .order_by(MetricDefinition.name)
     )
     return list((await session.execute(stmt)).scalars())
+
+
+async def metric_names_for_many(
+    session: AsyncSession, use_case_ids: Iterable[uuid.UUID]
+) -> dict[uuid.UUID, list[str]]:
+    """Metric names for several use cases at once, each ordered by name.
+
+    The batched form of :func:`metric_names_for`, for the scoring runner resolving a
+    whole run's metric set up front instead of one query per scenario. Ordering matters
+    downstream: the runner gathers metric results in argument order, which is what keeps
+    a turn's ``MetricScore`` rows stable across runs.
+    """
+    keys = list(dict.fromkeys(use_case_ids))
+    if not keys:  # ``in_([])`` is a SQLAlchemy warning, and there is nothing to ask.
+        return {}
+    stmt = (
+        select(UseCaseMetric.use_case_id, MetricDefinition.name)
+        .join(MetricDefinition, UseCaseMetric.metric_id == MetricDefinition.id)
+        .where(UseCaseMetric.use_case_id.in_(keys))
+        .order_by(MetricDefinition.name)
+    )
+    grouped: dict[uuid.UUID, list[str]] = {key: [] for key in keys}
+    for use_case_id, metric_name in await session.execute(stmt):
+        grouped[use_case_id].append(metric_name)
+    return grouped
 
 
 async def list_with_metrics(session: AsyncSession) -> list[tuple[UseCase, list[str]]]:

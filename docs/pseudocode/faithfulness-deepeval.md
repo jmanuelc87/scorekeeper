@@ -70,21 +70,22 @@ FUNCTION deepeval_faithfulness(actual_output, retrieval_context, LLM, limit, inc
 Pull atomic, verifiable facts out of the retrieved context — the ground truth the
 claims will be checked against.
 
-- Prompt (`GENERATE_TRUTHS`): *"Extrae las verdades o hechos presentes en el
+- Prompt (`faithfulness_deepeval.generate_truths`): *"Extrae las verdades o hechos presentes en el
   contexto recuperado. Cada verdad debe ser un enunciado atómico y verificable
   tomado únicamente del contexto."* Returns `Truths(truths=[...], summary="")`.
 
 ### Step 2 — Extract claims from the output
 
 Break the answer into a list of independently-checkable claims. If **no claim**
-can be extracted there is nothing that could be unfaithful, so the metric
-**short-circuits to `score = 1.0`** with no verdict calls.
+can be extracted there is nothing to verify, so the metric **short-circuits to
+`score = NOT_APPLICABLE`** with no verdict calls — see
+[Not-applicable scores](../evaluation-metrics.md#not-applicable-scores).
 
 ### Step 3 — Per-claim verdict against the truths
 
 For each claim, ask the judge whether the truths **contradict** it.
 
-- Prompt (`VERIFY_DEEPEVAL`): *"¿Las siguientes verdades contradicen la
+- Prompt (`faithfulness_deepeval.verify`): *"¿Las siguientes verdades contradicen la
   afirmación? Asigna 0 SOLO si las verdades contradicen directamente la
   afirmación. Asigna 1 si la afirmación concuerda con las verdades o si no se
   menciona (no verificable)."*
@@ -107,7 +108,7 @@ what makes DeepEval more lenient than RAGAS.
 
 | Case | Result | Judge calls |
 | --- | --- | --- |
-| No claims extracted from the answer | `score = 1.0` | none |
+| No claims extracted from the answer | `score = NOT_APPLICABLE` — excluded from the averages, where the reference returns `1.0` | none |
 | No truths extracted from the context | `score = 0.0` (**fail closed**) | claims split only; no verdicts |
 | No claim contradicted | `score = 1.0` | truths + one verdict per claim |
 | Every claim contradicted | `score = 0.0` | truths + one verdict per claim |

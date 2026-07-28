@@ -49,7 +49,7 @@ This is a `MultiStepMetric`: one judge call per document, no single rubric.
 
 ## The NLI prompt
 
-`NLI_PROMPT` frames the judge as a strict NLI classifier. It spells out the three
+`hallucination.nli` frames the judge as a strict NLI classifier. It spells out the three
 labels, six judging rules (judge only from the premise; a *missing* detail is
 **neutral**, not a contradiction; a direct conflict in any stated attribute is a
 contradiction; be decisive; …), a JSON output shape, and three worked examples.
@@ -79,7 +79,7 @@ intended.
 
 | Case | Raw score | Normalized | Judge calls |
 | --- | --- | --- | --- |
-| No context (empty `retrieved_context`) | `0.0` (nothing to contradict) | `1.0` | none |
+| No context (empty `retrieved_context`) | `NOT_APPLICABLE` (nothing to contradict, nothing measured) | — excluded from the averages | none |
 | No document contradicted | `0.0` | `1.0` | one per document |
 | Every document contradicted | `1.0` | `0.0` | one per document |
 

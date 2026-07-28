@@ -65,7 +65,9 @@ scorekeeper-api = "scorekeeper.main:main"
 packages = ["src/scorekeeper"]
 
 [tool.pytest.ini_options]
-pythonpath = ["src"]
+# "tests" as well as "src": ``tests/seeded_prompts.py`` is a shared helper that reads the
+# shipped prompt text out of the prompt-catalog migration, and several suites import it.
+pythonpath = ["src", "tests"]
 testpaths = ["tests"]
 # The suite drives an AsyncSession throughout, so async tests are the norm — "auto"
 # saves decorating every one of them with @pytest.mark.asyncio.
