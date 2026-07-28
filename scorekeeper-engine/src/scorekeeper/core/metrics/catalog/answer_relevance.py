@@ -19,6 +19,7 @@ import numpy as np
 from pydantic import BaseModel
 
 from scorekeeper.core.metrics.base import (
+    NOT_APPLICABLE,
     MetricResult,
     MetricTrace,
     MultiStepMetric,
@@ -28,18 +29,9 @@ from scorekeeper.core.metrics.base import (
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
+from scorekeeper.core.metrics.prompts import PromptSlot
 from scorekeeper.core.metrics.registry import register
 from scorekeeper.core.metrics.scale import Unit
-
-# Reverse-generation instruction: from the answer ALONE, produce a question the
-# answer would be answering. The original question is not exposed so generation
-# is not biased toward it. (Prompt text stays Spanish — it is sent to the LLM.)
-GENERATE_QUESTION = """\
-Genera una única pregunta en español que la siguiente respuesta estaría \
-respondiendo. Devuelve solo la pregunta, sin explicaciones ni comentarios.
-respuesta: {response}
-"""
-
 
 class GeneratedQuestion(BaseModel):
     """A reverse-generated question produced from the answer."""
@@ -66,6 +58,16 @@ class AnswerRelevance(MultiStepMetric):
     category = MetricCategory.RAG
     scale = Unit()  # 0-1 (mean cosine, clamped to [0, 1])
     weight = 1.0
+    prompts = (
+        PromptSlot(
+            slug="generate_question",
+            description=(
+                "Generación inversa: a partir de la respuesta sola, produce la "
+                "pregunta que estaría respondiendo. La pregunta original no se "
+                "expone, para no sesgar la generación."
+            ),
+        ),
+    )
     # Number of questions to reverse-generate (step 1 of the algorithm). A plain
     # class attribute so it can be overridden per instance.
     n_questions: int = 3
@@ -78,10 +80,12 @@ class AnswerRelevance(MultiStepMetric):
         # question and cannot copy it when generating.
         answer_view = TurnView(prompt="", response=turn.response)
         judge_model = judge.model_for(JudgeStep.EXTRACT)
+        # Passed raw: the judge substitutes {response} from ``answer_view``.
+        instruction = self.prompt("generate_question")
         questions: list[str] = []
         for _ in range(self.n_questions):
             generated = judge.structured(
-                instruction=GENERATE_QUESTION,
+                instruction=instruction,
                 turn=answer_view,
                 schema=GeneratedQuestion,
                 step=JudgeStep.EXTRACT,
@@ -99,19 +103,22 @@ class AnswerRelevance(MultiStepMetric):
             )
         )
 
-        # With no usable questions there is nothing to compare: relevance is zero.
+        # With no usable questions there is nothing to compare: the metric does not
+        # apply to this turn.
         if not questions:
             steps.append(
                 TraceStep(
                     label="Relevancia media",
-                    summary="No se generaron preguntas; relevancia = 0.000.",
-                    entries=[TraceEntry(label="media", value=0.0)],
+                    summary=(
+                        "No se generaron preguntas; la métrica no aplica a este "
+                        "turno y queda fuera de los promedios."
+                    ),
                 )
             )
             return MetricResult(
                 metric_name=self.name,
-                raw_score=0.0,
-                normalized_score=self.normalize(0.0),
+                raw_score=NOT_APPLICABLE,
+                normalized_score=NOT_APPLICABLE,
                 trace=MetricTrace(steps=steps),
                 judge_model=judge_model,
                 rubric_version=self.rubric_version,

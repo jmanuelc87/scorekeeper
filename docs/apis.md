@@ -1,7 +1,8 @@
 # HTTP APIs
 
 The HTTP API (`scorekeeper.main` / `scorekeeper.api.v1`, run with `scorekeeper-api`) serves the results
-dashboard, triggers evaluations, composes the metric set of each use case, and manages the
+dashboard, triggers evaluations, composes the metric set of each use case, exposes the
+versioned prompt catalog, and manages the
 retrieval credential store. This page
 documents every endpoint; add new ones as their own `##` section below. For the models these
 endpoints read and write, see the [Data model](data-model.md); for how metrics are chosen and
@@ -21,6 +22,8 @@ scored, see [Evaluation metrics](evaluation-metrics.md); for the credential stor
 | `GET /api/v1/metrics`               | List the registered metrics a use case can be composed from. |
 | `POST /api/v1/use-cases`            | Create a use case: a name plus the set of metrics it is scored with. |
 | `GET /api/v1/use-cases`             | List every use case with its metric names. |
+| `GET /api/v1/prompts`               | List every prompt slot the metrics render, with the version currently active. |
+| `GET /api/v1/prompts/{prompt_id}`   | Fetch one prompt slot with its full version history. |
 | `GET /api/v1/auth-providers`        | List the retrieval credential store's provider rows (optional filters). |
 | `POST /api/v1/auth-providers`       | Create a credential provider row (write-only `private_key`, stored encrypted). |
 | `GET /api/v1/auth-providers/{id}`   | Fetch one credential provider by UUID. |
@@ -431,11 +434,16 @@ Returns one entry per turn (a scenario with no turns yields `[]`):
     "retrieved_context_source": null,
     "turn_score": 0.8,
     "metric_scores": [
-      {"metric_name": "utilidad", "score": 0.8, "judge_model": "claude-opus-4-8", "rubric_version": "v1"}
+      {"metric_name": "utilidad", "score": 0.8, "judge_model": "claude-opus-4-8", "rubric_version": "v1"},
+      {"metric_name": "hallucination", "score": null, "judge_model": null, "rubric_version": "v1"}
     ]
   }
 ]
 ```
+
+A `null` `score` means the metric did not apply to that turn — it had nothing to
+measure (no retrieved context, no claims), so it is also left out of the turn,
+scenario and platform averages.
 
 Like the other read paths, the per-metric structured `trace` is not surfaced here —
 read it via [`GET /api/v1/turns/{turn_id}/traces`](#get-apiv1turnsturn_idtraces) using each entry's
@@ -520,6 +528,93 @@ database — it is what an upload that names no use case lands on, so a run work
 the box without composing anything. It is kept in sync automatically: a metric added to
 the code catalog joins `default` on the next ingest. Create your own use case when you
 want a *narrower* set than "everything".
+
+## `GET /api/v1/prompts`
+
+List every **prompt slot** the registered metrics render, with the version runs bind.
+
+A slot is one prompt template a metric sends to the judge: `faithfulness_deepeval`
+declares two (truths extraction and the per-claim verdict), `answer_relevance` one. The
+slug and the required variables are code; the *text* is versioned data — see
+[Data model → Prompt catalog](data-model.md#prompt-catalog).
+
+The catalog is reconciled against the code registry on every call, so a slot declared by
+a metric is visible here immediately, without waiting for an upload.
+
+### Response `200`
+
+```json
+[
+  {
+    "id": "3f2b9e01-7c44-4a1e-9d2b-1a5c8e6f0d33",
+    "metric": "faithfulness_deepeval",
+    "slug": "verify",
+    "required_variables": ["truths", "claim"],
+    "description": "Veredicto por afirmación: 0 solo si las verdades la contradicen…",
+    "active_version": {
+      "id": "b71c0f5a-2d38-4e91-a0c7-5e9b3d1a8f42",
+      "version": 1,
+      "template": "¿Las siguientes verdades contradicen la afirmación? …",
+      "status": "published",
+      "is_active": true,
+      "changelog": null,
+      "created_by": "system",
+      "created_at": "2026-07-28T10:15:00Z",
+      "published_by": "system",
+      "published_at": "2026-07-28T10:15:00Z"
+    }
+  }
+]
+```
+
+Ordered by `metric` then `slug`. A metric declaring no slot does not appear.
+
+`active_version` is `null` when no published version is active for the slot. That is the
+state of a slot declared by a metric *after* the prompt-catalog migration: `sync_prompts`
+creates the row so the slot is visible, but it never invents text. Scoring refuses to run
+for that metric until a version is published — see
+[Data model → Prompt catalog](data-model.md#prompt-catalog).
+
+`required_variables` are the placeholders the **metric** fills before the call. A
+template may additionally use `{prompt}`, `{response}` and `{context}`, which the
+**judge** fills from the turn, and nothing else.
+
+## `GET /api/v1/prompts/{prompt_id}`
+
+One prompt slot with its full edit history, newest version first.
+
+### Response `200`
+
+```json
+{
+  "id": "3f2b9e01-7c44-4a1e-9d2b-1a5c8e6f0d33",
+  "metric": "faithfulness_deepeval",
+  "slug": "verify",
+  "required_variables": ["truths", "claim"],
+  "description": "Veredicto por afirmación…",
+  "versions": [
+    {"version": 5, "status": "published", "is_active": true,  "template": "…", "…": "…"},
+    {"version": 3, "status": "discarded", "is_active": false, "template": "…", "…": "…"},
+    {"version": 1, "status": "published", "is_active": false, "template": "…", "…": "…"}
+  ]
+}
+```
+
+Version numbers have **gaps**: the counter is assigned when a row is created, so a
+discarded draft keeps its number. That is the honest edit sequence, and it keeps
+`slug@version` unique and resolvable.
+
+### Errors
+
+| Status | When |
+|--------|------|
+| `404`  | No prompt with that id — including a malformed one. |
+
+> **Read-only for now, and never a delete.** Editing (draft → publish →
+> activate / discard) is the next slice; until then a version is created only by the
+> prompt-catalog migration. There will be no `DELETE`: a version a finished benchmark
+> points at is what makes that benchmark's scores readable. An unwanted draft is
+> discarded, an unwanted published version deactivated.
 
 ## Auth providers CRUD
 
@@ -748,6 +843,17 @@ curl -X POST http://localhost:8001/api/v1/evaluations \
 # 422 {"detail":"Caso(s) de uso desconocido(s): inexistente. Créalo con POST /use-cases."}
 ```
 
+Inspect the prompts the judge runs, then read one slot's history:
+
+```bash
+curl http://localhost:8001/api/v1/prompts
+# [{"metric":"answer_relevance","slug":"generate_question","required_variables":[],
+#   "active_version":{"version":1,"status":"published","is_active":true,"template":"…"}}, …]
+
+curl http://localhost:8001/api/v1/prompts/3f2b9e01-7c44-4a1e-9d2b-1a5c8e6f0d33
+# {"metric":"faithfulness_deepeval","slug":"verify","versions":[{"version":1, …}]}
+```
+
 Configure a SharePoint credential provider, then list it (note the key is not echoed back):
 
 ```bash
@@ -792,6 +898,11 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Retrieval orchestrator — `scorekeeper-engine/src/scorekeeper/core/retrieval/pipeline.py` (`RetrievalOrchestrator`)
 - Auth-provider CRUD service — `scorekeeper-engine/src/scorekeeper/core/retrieval/credentials/service.py`
 - Use-case composition service — `scorekeeper-engine/src/scorekeeper/core/services/use_cases.py`
+- Prompt catalog read service — `scorekeeper-engine/src/scorekeeper/core/services/prompts.py`;
+  its queries — `scorekeeper-engine/src/scorekeeper/db/repositories/prompts.py`
+- Prompt slot declarations & template validation — `scorekeeper-engine/src/scorekeeper/core/metrics/prompts.py`
+  (`PromptSlot`, `safe_format`, `validate_template`); each metric's slots live on its class in
+  `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/`
 - Celery app & tasks — `scorekeeper-engine/src/scorekeeper/celery_app.py`, `scorekeeper-engine/src/scorekeeper/tasks.py`
   (`run_pipeline_task` = retrieval then scoring; `enqueue_run`)
 - Parsing & message normalization — `scorekeeper-engine/src/scorekeeper/core/importer.py`
@@ -799,4 +910,5 @@ dedicated broker (e.g. Redis) instead of Postgres.
 - Browser capture client — `extension/` (see its [README](../extension/README.md))
 - Scoring — `scorekeeper-engine/src/scorekeeper/core/runner.py`
 - Metric selection — `scorekeeper-engine/src/scorekeeper/core/metrics/selection.py`
-  (`sync_metrics` mirrors the registry into `metrics`; `resolve` reads a use case's set)
+  (`sync_metrics` mirrors the registry into `metrics`; `sync_prompts` mirrors each metric's
+  prompt slots into `prompts`, seeding a published v1; `resolve` reads a use case's set)

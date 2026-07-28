@@ -16,6 +16,7 @@ registered here into the ``metrics`` table so those links have a key to point at
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import TypeVar
 
 from scorekeeper.core.metrics.base import Metric
@@ -49,8 +50,9 @@ class MetricRegistry:
             raise KeyError(f"Métrica desconocida: {name}") from None
 
     @classmethod
-    def create(cls, name: str) -> Metric:
-        return cls.get(name)()
+    def create(cls, name: str, templates: Mapping[str, str] | None = None) -> Metric:
+        """Instantiate ``name``, binding ``templates`` to its declared prompt slots."""
+        return cls.get(name)(templates)
 
     @classmethod
     def all(cls) -> list[type[Metric]]:

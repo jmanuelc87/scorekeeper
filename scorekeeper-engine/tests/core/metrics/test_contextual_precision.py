@@ -9,12 +9,13 @@ from __future__ import annotations
 
 import pytest
 
-from scorekeeper.core.metrics.base import TurnView
+from scorekeeper.core.metrics.base import NOT_APPLICABLE, TurnView
 from scorekeeper.core.metrics.catalog.contextual_precision import (
     ContextualPrecision,
     RelevanceVerdict,
 )
 from scorekeeper.core.retrieved_context import RetrievedContext
+from seeded_prompts import build
 
 
 def _verdicts(*relevant: bool):
@@ -38,7 +39,7 @@ def test_perfect_ranking_scores_one(make_judge) -> None:
     # Both nodes relevant → AP = (1/1 + 2/2) / 2 = 1.0.
     judge = make_judge(extractions=_verdicts(True, True), model="claude-x")
 
-    result = ContextualPrecision().evaluate(_turn("nodo A\n\nnodo B"), judge)
+    result = build(ContextualPrecision).evaluate(_turn("nodo A\n\nnodo B"), judge)
 
     assert result.metric_name == "contextual_precision"
     assert result.raw_score == pytest.approx(1.0)
@@ -58,11 +59,11 @@ def test_perfect_ranking_scores_one(make_judge) -> None:
 def test_relevant_first_beats_relevant_last(make_judge) -> None:
     # Same set, one relevant + one irrelevant node — order is the whole point.
     # relevant, then irrelevant → (1/1) / 1 = 1.0.
-    good_order = ContextualPrecision().evaluate(
+    good_order = build(ContextualPrecision).evaluate(
         _turn("nodo A\n\nnodo B"), make_judge(extractions=_verdicts(True, False))
     )
     # irrelevant, then relevant → (2/2) / 1 = 0.5 (relevant node buried at rank 2).
-    bad_order = ContextualPrecision().evaluate(
+    bad_order = build(ContextualPrecision).evaluate(
         _turn("nodo A\n\nnodo B"), make_judge(extractions=_verdicts(False, True))
     )
 
@@ -74,7 +75,7 @@ def test_average_precision_interleaved(make_judge) -> None:
     # verdicts [1, 0, 1]: k1 → 1/1, k2 skipped, k3 → 2/3; AP = (1 + 2/3) / 2.
     judge = make_judge(extractions=_verdicts(True, False, True))
 
-    result = ContextualPrecision().evaluate(_turn("a\n\nb\n\nc"), judge)
+    result = build(ContextualPrecision).evaluate(_turn("a\n\nb\n\nc"), judge)
 
     assert result.raw_score == pytest.approx((1.0 + 2 / 3) / 2)
     assert "2 de 3 nodos son relevantes" in result.trace.steps[-1].summary
@@ -83,7 +84,7 @@ def test_average_precision_interleaved(make_judge) -> None:
 def test_no_relevant_nodes_is_zero(make_judge) -> None:
     judge = make_judge(extractions=_verdicts(False, False))
 
-    result = ContextualPrecision().evaluate(_turn("a\n\nb"), judge)
+    result = build(ContextualPrecision).evaluate(_turn("a\n\nb"), judge)
 
     assert result.raw_score == 0.0
     assert result.normalized_score == 0.0
@@ -92,12 +93,15 @@ def test_no_relevant_nodes_is_zero(make_judge) -> None:
     assert "Ningún nodo recuperado es relevante" in result.trace.steps[-1].summary
 
 
-def test_no_context_is_zero_without_judge_calls(make_judge) -> None:
+def test_no_context_is_not_applicable_without_judge_calls(make_judge) -> None:
     judge = make_judge()
 
-    result = ContextualPrecision().evaluate(_turn(""), judge)
+    result = build(ContextualPrecision).evaluate(_turn(""), judge)
 
-    assert result.raw_score == 0.0
+    # No ranking to measure — not a zero-precision retrieval, so it stays out of
+    # every average.
+    assert result.raw_score == NOT_APPLICABLE
+    assert result.normalized_score == NOT_APPLICABLE
     assert judge.calls == []
     assert len(result.trace.steps) == 1
     assert "No hay nodos de contexto recuperado" in result.trace.steps[0].summary
@@ -105,7 +109,7 @@ def test_no_context_is_zero_without_judge_calls(make_judge) -> None:
 
 def test_strict_mode_collapses_imperfect_to_zero(make_judge) -> None:
     # AP would be 0.5, but strict_mode passes only a perfect ranking.
-    metric = ContextualPrecision()
+    metric = build(ContextualPrecision)
     metric.strict_mode = True
 
     result = metric.evaluate(
@@ -116,7 +120,7 @@ def test_strict_mode_collapses_imperfect_to_zero(make_judge) -> None:
 
 
 def test_strict_mode_keeps_perfect_score(make_judge) -> None:
-    metric = ContextualPrecision()
+    metric = build(ContextualPrecision)
     metric.strict_mode = True
 
     result = metric.evaluate(
@@ -140,7 +144,7 @@ def test_judges_against_expected_output_not_response(make_judge) -> None:
         )
 
     judge.structured = _spy
-    ContextualPrecision().evaluate(turn, judge)
+    build(ContextualPrecision).evaluate(turn, judge)
 
     (instruction, node_response), = seen
     # The ground truth reaches the judge; the assistant's actual answer does not.

@@ -21,14 +21,19 @@ from scorekeeper.core.metrics.base import (
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import JudgeVerdict
+from scorekeeper.core.metrics.prompts import PromptSlot, safe_format
 from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.core.metrics.scale import Unit
+from scorekeeper.core.metrics.selection import MissingPromptError, sync_prompts
 from scorekeeper.core.services.ingestion import UploadedFile, ingest_evaluation
 from scorekeeper.core.services.runs import get_run_summary, set_turn_selection, start_run
 from scorekeeper.core.services.scoring import score_run
 from scorekeeper.db.models import (
     BenchmarkRun,
     MetricScore,
+    Prompt,
+    PromptVersion,
+    RunPromptBinding,
     Turn,
 )
 
@@ -270,3 +275,136 @@ async def test_start_run_already_started_raises(session: AsyncSession, registry)
     # A second start is rejected so a run is never enqueued twice.
     with pytest.raises(ValueError):
         await start_run(run_id, session=session)
+
+
+# --- prompt binding -----------------------------------------------------------
+# Templates come from the database now, so a run must pin the versions it scores
+# under: scoring is a long job while the prompt API stays live, and resolving per
+# scenario would let an edit split one run's rollups across two rubrics.
+
+
+class ConPrompt(_FakeMetric):
+    """A fake metric that declares a slot, so binding has something to bind."""
+
+    name = "con_prompt"
+    prompts = (PromptSlot(slug="verify", required_variables=("claim",)),)
+
+    def evaluate(self, turn: TurnView, judge) -> MetricResult:
+        # Sends the *injected* template to the judge, not a class constant — which is
+        # what lets a test assert the stored text actually reaches the model.
+        self.rubric = safe_format(self.prompt("verify"), claim=turn.response)
+        return super().evaluate(turn, judge)
+
+
+@pytest.fixture
+async def registry_with_prompt(session: AsyncSession, compose_use_case):
+    saved = MetricRegistry.all()
+    MetricRegistry.clear()
+    MetricRegistry.add(ConPrompt)
+    await compose_use_case([ConPrompt.name])
+    try:
+        yield
+    finally:
+        MetricRegistry.clear()
+        for metric_cls in saved:
+            MetricRegistry.add(metric_cls)
+
+
+async def _publish(session: AsyncSession, template: str = "Afirmación: {claim}") -> None:
+    """Publish an active v1 for every materialized slot — what the migration does."""
+    await sync_prompts(session)
+    await session.flush()
+    for prompt in (await session.execute(select(Prompt))).scalars().all():
+        session.add(
+            PromptVersion(
+                prompt_id=prompt.id,
+                version=1,
+                template=template,
+                status="published",
+                is_active=True,
+            )
+        )
+    await session.commit()
+
+
+async def _ingest_selected(session: AsyncSession) -> str:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+    await set_turn_selection(
+        run_id, await _all_turn_ids(session, run_id), True, session=session
+    )
+    return run_id
+
+
+async def test_score_run_binds_the_versions_it_scored_under(
+    session: AsyncSession, registry_with_prompt
+) -> None:
+    run_id = await _ingest_selected(session)
+    await _publish(session)
+
+    await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+
+    bindings = (await session.execute(select(RunPromptBinding))).scalars().all()
+    active = (
+        await session.execute(select(PromptVersion.id).where(PromptVersion.is_active))
+    ).scalars().all()
+    assert [b.prompt_version_id for b in bindings] == list(active)
+    assert {str(b.run_id) for b in bindings} == {run_id}
+
+
+async def test_rescoring_replaces_bindings_rather_than_duplicating(
+    session: AsyncSession, registry_with_prompt
+) -> None:
+    """``uq_run_prompt_binding`` would reject a blind re-insert; re-scoring is supported."""
+    run_id = await _ingest_selected(session)
+    await _publish(session)
+    await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+
+    await score_run(run_id, session=session, judge=RecordingJudge(0.6))
+
+    count = (
+        await session.execute(select(func.count()).select_from(RunPromptBinding))
+    ).scalar_one()
+    assert count == 1
+
+
+async def test_score_run_injects_the_stored_template(
+    session: AsyncSession, registry_with_prompt
+) -> None:
+    """Editing the stored text changes what the judge receives — the point of the feature."""
+    run_id = await _ingest_selected(session)
+    await _publish(session, "EDITADA {claim}")
+    judge = RecordingJudge(0.8)
+    seen: list[str] = []
+    original = judge.score
+
+    def _record(*, rubric, turn, scale, rubric_version=None, step=None):
+        seen.append(rubric)
+        return original(rubric=rubric, turn=turn, scale=scale, rubric_version=rubric_version)
+
+    judge.score = _record
+
+    await score_run(run_id, session=session, judge=judge)
+
+    assert seen and all("EDITADA" in rubric for rubric in seen)
+
+
+async def test_score_run_fails_fast_when_a_slot_has_no_active_version(
+    session: AsyncSession, registry_with_prompt
+) -> None:
+    """Better a terminal ``fallido`` than a run that quietly scores nothing.
+
+    Left to ``Metric.prompt``, the error would surface on a judge worker thread where
+    skip-metric-continue logs a warning and drops the metric — the run would report
+    success having measured nothing.
+    """
+    run_id = await _ingest_selected(session)
+    await sync_prompts(session)
+    await session.commit()  # slots exist, but no version was ever published
+
+    with pytest.raises(MissingPromptError, match="con_prompt.verify"):
+        await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+
+    assert (await session.get(BenchmarkRun, uuid.UUID(run_id))).status == "fallido"
+    scores = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
+    assert scores == 0

@@ -24,6 +24,10 @@ Scores flow upward:
 - a scenario's `average_score` averages its turns' `turn_score`,
 - a platform's `average_score` averages its scenarios' `average_score`.
 
+Every one of those means skips children that carry no score: `NULL` (never scored)
+and the negative `NOT_APPLICABLE` sentinel a metric stores when it had nothing to
+measure. See [Not-applicable scores](evaluation-metrics.md#not-applicable-scores).
+
 `MetricScore.score` stores the **raw** score in the metric's own scale;
 normalization happens at rollup (`scorekeeper.core.metrics.rollup`). Because scale and
 weight are code metadata (not stored per score), recomputing an old run applies
@@ -45,6 +49,16 @@ to. The one exception is the reserved `default` set, which `sync_metrics` keeps
 pointed at **every** registered metric so an upload that names no use case still
 gets a full evaluation. The scoring runner reads a scenario's set back through
 its FK.
+
+The **prompt catalog** splits ownership the same way one level down, but more
+sharply. A metric declares its prompt *slots* in code — the slug and the
+placeholders it fills itself — and **no text at all**. The text is seeded by the
+prompt-catalog migration and versioned in **Prompt** / **PromptVersion**, and it
+reaches a metric by *injection*: `selection.resolve` reads the active version and
+passes it to the constructor. So `scorekeeper.core.metrics` still needs no
+database — a metric never queries for its own rubric, it is handed one. Which
+version a given benchmark scored under is recorded in **RunPromptBinding**. See
+[Prompt catalog](#prompt-catalog) below.
 
 ## ER diagram
 
@@ -148,6 +162,36 @@ erDiagram
         UUID metric_id FK
     }
 
+    Prompt {
+        UUID id PK
+        UUID metric_id FK
+        String slug UK
+        JSON required_variables
+        Text description
+        DateTime created_at
+    }
+
+    PromptVersion {
+        UUID id PK
+        UUID prompt_id FK
+        Integer version UK
+        Text template
+        String status
+        Boolean is_active
+        UUID supersedes_id FK
+        Text changelog
+        String created_by
+        DateTime created_at
+        String published_by
+        DateTime published_at
+    }
+
+    RunPromptBinding {
+        UUID id PK
+        UUID run_id FK
+        UUID prompt_version_id FK
+    }
+
     AuthProviderConfig {
         UUID id PK
         String provider UK
@@ -186,6 +230,11 @@ erDiagram
     UseCase ||--o{ ScenarioResult : "scores"
     UseCase ||--o{ UseCaseMetric : "selects"
     MetricDefinition ||--o{ UseCaseMetric : "selected by"
+    MetricDefinition ||--o{ Prompt : "declares"
+    Prompt ||--o{ PromptVersion : "edit history"
+    PromptVersion ||--o{ PromptVersion : "supersedes"
+    BenchmarkRun ||--o{ RunPromptBinding : "pinned at start"
+    PromptVersion ||--o{ RunPromptBinding : "scored under"
 ```
 
 `AuthProviderConfig` and `DocumentCacheEntry` are standalone tables (no FK into the run
@@ -307,7 +356,7 @@ An LLM-as-a-judge score for a single metric on a single turn. A turn has many.
 | `id` | UUID | Primary key. |
 | `turn_id` | UUID | FK → `turns.id`, `ON DELETE CASCADE`. |
 | `metric_name` | String(128) | Name of the evaluated metric. |
-| `score` | Float | Numeric score for the metric. |
+| `score` | Float | Numeric score for the metric, in the metric's own scale. Negative (`-1.0`, the `NOT_APPLICABLE` sentinel) when the metric had nothing to measure on this turn; the rollups skip it and the read APIs surface it as `null`. |
 | `judge_model` | String(128) | Model that produced the score, for reproducibility. |
 | `rubric_version` | String(64) | Version of the scoring rubric used. |
 
@@ -437,6 +486,164 @@ fetches the same URL.
 | `size_bytes` | Integer | Size of the cached blob. |
 | `fetched_at` | DateTime (tz) | When the blob was last (re)written (`onupdate` refreshes it). |
 
+## Prompt catalog
+
+> **Status: partly implemented.** The three tables, the prompt-slot declarations,
+> `sync_prompts`, the read-only `GET /prompts` endpoints, runtime resolution and
+> the `RunPromptBinding` writes are all in — editing a stored `PromptVersion`
+> changes what the judge receives on the next run. Still pending: the editing
+> endpoints (draft → publish → activate / discard), so today a version is created
+> only by the migration or by writing the table directly.
+
+The Spanish prompt texts the judge runs are editable at runtime and versioned,
+so a rubric can be tuned without a deploy while every past benchmark keeps a
+record of the exact text that produced it.
+
+**Every edit writes a new row.** `template` is write-once — no transition ever
+rewrites it, so a version a finished benchmark points at cannot change under it.
+A new edit lands as a `draft`, which nothing can score under; publishing
+validates it and makes it live. Rollback moves `is_active` back to an earlier
+published version rather than copying its text forward.
+
+```mermaid
+stateDiagram-v2
+    [*] --> draft: edit (always a new row)
+    draft --> draft: further edit supersedes prior draft
+    draft --> discarded: superseded or abandoned
+    draft --> published: validate → publish
+    published --> published: activate / rollback (is_active moves)
+```
+
+Version numbers are a per-prompt monotonic counter assigned at row creation, so
+a discarded draft consumes one and the *published* history has gaps (v1, v5,
+v9). That is the honest edit sequence, and it keeps
+`MetricScore.rubric_version` — derived as `slug@version` from the binding —
+unique and resolvable.
+
+**Resolution happens once per run, not per score.** `Metric.evaluate()` is
+synchronous and holds no session, so a template can never be fetched inside it;
+metrics are constructed in `selection.resolve()`, which is async and has the
+session. Binding there and pinning the resolved set onto the run at
+`score_run()` start also closes a correctness hole: scoring is a long Celery job
+while the prompt API stays live, and resolving per score would let an edit land
+mid-job and split one run's `average_score` rollups across two rubrics.
+
+### Prompt
+
+One prompt *slot* a metric renders (`table prompts`) — `faithfulness_deepeval`
+declares two (truths extraction and the per-claim verdict), `answer_relevance`
+one. A metric declares its slots as a `PromptSlot` tuple (`Metric.prompts`, see
+`core.metrics.prompts`), carrying the slug, the required variables and a
+description — and **no template**.
+
+`selection.sync_prompts` mirrors those declarations into `prompts` alongside
+`sync_metrics`, and refreshes `required_variables` / `description` on a slot that
+already exists (both are code, and a stale row lies to the editor). It never
+writes a `prompt_versions` row: the text is not code's to invent. A slot declared
+*after* the prompt-catalog migration therefore has no text, appears in
+`GET /prompts` with `active_version: null`, and scoring refuses to run for its
+metric until a migration or the publish API supplies one.
+
+The six slots that ship today:
+
+| Metric | Slug | `required_variables` |
+| --- | --- | --- |
+| `answer_relevance` | `generate_question` | — |
+| `contextual_precision` | `verdict` | `expected_output`, `node` |
+| `faithfulness_deepeval` | `generate_truths` | — |
+| `faithfulness_deepeval` | `verify` | `truths`, `claim` |
+| `faithfulness_ragas` | `verify` | `claim` |
+| `hallucination` | `nli` | `documento`, `response` |
+
+The two slots requiring nothing are the ones handed to the judge raw, so it
+substitutes `{response}` / `{context}` from the turn.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `metric_id` | UUID | FK → `metrics.id` (indexed). No `ON DELETE`: the default `NO ACTION` keeps a metric a prompt belongs to from being deleted out from under it. |
+| `slug` | String(128) | Slot name within the metric (`generate_truths`, `verify`). Unique together with `metric_id` (`uq_prompt_metric_slug`). |
+| `required_variables` | JSON / JSONB | The placeholder names the metric's own fill supplies (`["claim", "truths"]`). Code-owned, which is why it lives here and not on the version: a version must *satisfy* this contract, not declare one. |
+| `description` | Text | What the slot is for, shown in the editor. |
+| `created_at` | DateTime (tz) | When the slot was first synced. |
+
+### PromptVersion
+
+One edit of one prompt slot (`table prompt_versions`). Append-only: rows are
+never deleted and `template` is never updated — only `status` and `is_active`
+transition.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `prompt_id` | UUID | FK → `prompts.id`, `ON DELETE CASCADE` (indexed). |
+| `version` | Integer | Per-prompt monotonic counter, assigned at creation. Unique together with `prompt_id` (`uq_prompt_version`). Gaps are expected — a discarded draft keeps its number. |
+| `template` | Text | The Spanish prompt text. Write-once. |
+| `status` | String(16) | `draft`, `published` or `discarded`. |
+| `is_active` | Boolean | Whether this is the version runs bind. At most one per prompt (partial unique index on `prompt_id` where `status='published' AND is_active`), and a check constraint keeps it false unless `published`. |
+| `supersedes_id` | UUID | FK → `prompt_versions.id`, nullable. The version this edit was based on — the seed v1 has none. |
+| `changelog` | Text | Why the edit was made. |
+| `created_by` / `created_at` | String(128) / DateTime (tz) | Who wrote the draft, and when. |
+| `published_by` / `published_at` | String(128) / DateTime (tz) | Who published it, and when. `NULL` while `draft` or `discarded`. |
+
+At most one `draft` exists per prompt (partial unique index on `prompt_id` where
+`status='draft'`): a further edit supersedes the previous draft, marking it
+`discarded`. Both partial indexes work under SQLite as well as PostgreSQL, so
+the test suite's `Base.metadata.create_all` enforces them the same way Alembic
+does.
+
+**Validation runs at publish, not at draft save** — a draft you cannot save
+until it is correct is not a draft. A template has two audiences, so the rule
+(`core.metrics.prompts.validate_template`) is a two-sided containment:
+
+```
+required_variables ⊆ placeholders(template) ⊆ required_variables ∪ {prompt, response, context}
+```
+
+The metric fills its own `required_variables` before the call; the judge fills
+`{prompt}`/`{response}`/`{context}` from the turn afterwards
+(`judges.base._fill_placeholders`, see
+[Evaluation metrics](evaluation-metrics.md)). A missing required variable means
+the metric computed a value the prompt never shows the judge; anything else
+reaches the model as a literal `{foo}`. A judge variable may *also* be required —
+the hallucination prompt pre-fills `{response}` per document, and the judge's
+later pass over it is a no-op. Escaped `{{ }}` are not placeholders, so a prompt
+may embed a JSON example. Publishing additionally test-renders against a dummy
+`TurnView`.
+
+Metrics fill their variables with `prompts.safe_format`, not `str.format`, so an
+edited template that references a judge variable survives the metric's pass
+instead of raising `KeyError` inside the Celery worker mid-run.
+
+What validation cannot catch is semantic drift: an edit that inverts a rubric's
+scale renders fine and scores wrongly. That is what the version recorded on
+every `MetricScore` is for.
+
+### RunPromptBinding
+
+The prompt versions one benchmark run was scored under (`table
+run_prompt_bindings`) — resolved and written once at the start of `score_run()`,
+one row per prompt slot in play. Delete-then-insert, so re-scoring replaces the
+set rather than colliding with `uq_run_prompt_binding`; the bindings therefore
+mean "the versions the *latest* scoring used", matching how `MetricScore` rows
+are also replaced. The set is the superset of what *could* score — a scenario
+whose turns are all deselected still contributes its use case — which is what
+keeps "written once at the start" true, so an interrupted run still records what
+it was scoring under. Makes every score within a run comparable by
+construction, and lets an old run be read back against the exact text that
+produced it.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `run_id` | UUID | FK → `benchmark_runs.id`, `ON DELETE CASCADE` (indexed). |
+| `prompt_version_id` | UUID | FK → `prompt_versions.id` (indexed). No `ON DELETE`: a version a run was scored under is not deletable. Unique together with `run_id` (`uq_run_prompt_binding`). |
+
+Only `published` versions are bound. That is a service-level rule, not a
+constraint — the table itself is indifferent to status, which is what would let
+a future "test-run this draft before publishing" flow reuse it unchanged, with
+the run flagged as non-comparable.
+
 ## Cascade behavior
 
 The `BenchmarkRun` subtree uses `ON DELETE CASCADE` and SQLAlchemy
@@ -447,3 +654,9 @@ and each score's `MetricTrace`.
 The `SourceFile → BenchmarkRun` link uses `ON DELETE SET NULL` instead: deleting
 a source file leaves its runs and their results intact, only clearing their
 `source_file_id`.
+
+`RunPromptBinding` is part of that subtree — deleting a run drops its bindings —
+but the link *out* to `prompt_versions` is `NO ACTION`, so the versions
+themselves survive. Like `use_cases`, neither `prompts` nor `prompt_versions` is
+ever deleted and the API exposes no `DELETE`: an unwanted draft is `discarded`
+and an unwanted published version is deactivated, never removed.

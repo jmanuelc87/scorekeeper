@@ -10,7 +10,7 @@ registry.
 
 from __future__ import annotations
 
-from scorekeeper.core.metrics.base import TurnView
+from scorekeeper.core.metrics.base import NOT_APPLICABLE, TurnView
 from scorekeeper.core.metrics.catalog.faithfulness import (
     FaithfulnessDeepeval,
     FaithfulnessRagas,
@@ -18,6 +18,7 @@ from scorekeeper.core.metrics.catalog.faithfulness import (
     Truths,
 )
 from scorekeeper.core.metrics.judge import JudgeVerdict
+from seeded_prompts import build
 
 
 # --- RAGAS --------------------------------------------------------------------
@@ -39,7 +40,7 @@ def test_ragas_all_supported_is_one(make_judge) -> None:
             RagasEntailment(entailed=True, confidence=1.0, justification="Se deduce"),
         ],
     )
-    result = FaithfulnessRagas().evaluate(turn, judge)
+    result = build(FaithfulnessRagas).evaluate(turn, judge)
 
     assert result.metric_name == "faithfulness_ragas"
     assert result.raw_score == 1.0
@@ -65,7 +66,7 @@ def test_ragas_mixed_is_fraction_supported(make_judge) -> None:
             ),
         ],
     )
-    result = FaithfulnessRagas().evaluate(turn, judge)
+    result = build(FaithfulnessRagas).evaluate(turn, judge)
 
     # supported / n = 1 / 2
     assert result.raw_score == 0.5
@@ -101,7 +102,7 @@ def test_ragas_low_confidence_escalates_to_audit(make_judge) -> None:
             RagasEntailment(entailed=True, confidence=1.0, justification="Confirmado"),
         ],
     )
-    result = FaithfulnessRagas().evaluate(turn, judge)
+    result = build(FaithfulnessRagas).evaluate(turn, judge)
 
     # Audit verdict (entailed) wins → supported / n = 1 / 1.
     assert result.raw_score == 1.0
@@ -121,13 +122,15 @@ def test_ragas_low_confidence_escalates_to_audit(make_judge) -> None:
     assert entry.justification == "Confirmado"
 
 
-def test_ragas_no_statements_is_one(make_judge) -> None:
+def test_ragas_no_statements_is_not_applicable(make_judge) -> None:
     # Empty response → syntok yields no sentences → nothing to verify.
     turn = TurnView(prompt="¿Cómo reinicio el router?", response="")
     judge = make_judge()
-    result = FaithfulnessRagas().evaluate(turn, judge)
+    result = build(FaithfulnessRagas).evaluate(turn, judge)
 
-    assert result.raw_score == 1.0  # nothing to verify
+    # Nothing to verify is not perfect faithfulness — it is nothing measured.
+    assert result.raw_score == NOT_APPLICABLE
+    assert result.normalized_score == NOT_APPLICABLE
     assert result.judge_model is None
     # No sentences → the judge is never called at all.
     assert [kind for kind, _ in judge.calls] == []
@@ -146,7 +149,7 @@ def test_deepeval_no_contradiction_is_one(make_judge) -> None:
         extractions=[Truths(truths=["Verdad 1", "Verdad 2"], summary="Dos verdades")],
         verdicts=[JudgeVerdict(score=1, justification="Concuerda", model="m")],
     )
-    result = FaithfulnessDeepeval().evaluate(turn, judge)
+    result = build(FaithfulnessDeepeval).evaluate(turn, judge)
 
     assert result.metric_name == "faithfulness_deepeval"
     assert result.raw_score == 1.0
@@ -168,7 +171,7 @@ def test_deepeval_one_contradicted_lowers_score(make_judge) -> None:
             JudgeVerdict(score=1, justification="No se menciona", model="m"),
         ],
     )
-    result = FaithfulnessDeepeval().evaluate(turn, judge)
+    result = build(FaithfulnessDeepeval).evaluate(turn, judge)
 
     # not_contradicted / n = 2 / 3 (agreement and idk both pass; only the direct
     # contradiction fails).
@@ -191,7 +194,7 @@ def test_deepeval_empty_truths_is_zero(make_judge) -> None:
     judge = make_judge(
         extractions=[Truths(truths=[], summary="Sin verdades")],
     )
-    result = FaithfulnessDeepeval().evaluate(turn, judge)
+    result = build(FaithfulnessDeepeval).evaluate(turn, judge)
 
     assert result.raw_score == 0.0
     assert result.judge_model is None
@@ -206,9 +209,10 @@ def test_deepeval_no_claims_skips_truths(make_judge) -> None:
     # Empty response → no claims → truths extraction is skipped entirely.
     turn = TurnView(prompt="¿Cómo reinicio el router?", response="")
     judge = make_judge()
-    result = FaithfulnessDeepeval().evaluate(turn, judge)
+    result = build(FaithfulnessDeepeval).evaluate(turn, judge)
 
-    assert result.raw_score == 1.0
+    assert result.raw_score == NOT_APPLICABLE
+    assert result.normalized_score == NOT_APPLICABLE
     assert result.judge_model is None
     # No claims → neither truths extraction nor any verdict call is made.
     assert [kind for kind, _ in judge.calls] == []
@@ -232,7 +236,7 @@ def test_deepeval_pins_models_per_call(make_judge) -> None:
         ],
         model="claude-opus-4-8",  # the judge default, deliberately different from pins
     )
-    FaithfulnessDeepeval().evaluate(turn, judge)
+    build(FaithfulnessDeepeval).evaluate(turn, judge)
 
     # Call order is truths extraction (structured), then one verdict (score) per claim;
     # models are the explicit per-call pins, not judge.model_for's default.

@@ -55,9 +55,9 @@ FUNCTION ragas_faithfulness(q, a, c, LLM):
 ### Step 1 — Statement extraction from the answer
 
 Break the answer into a list of discrete, independently-checkable statements
-`S = [s_1, …, s_n]`. If no statement can be extracted there is nothing that could
-be unfaithful, so the metric **short-circuits to `F = 1.0`** with **no
-verification calls**.
+`S = [s_1, …, s_n]`. If no statement can be extracted there is nothing to verify,
+so the metric **short-circuits to `F = NOT_APPLICABLE`** with **no verification
+calls** — see [Not-applicable scores](../evaluation-metrics.md#not-applicable-scores).
 
 ### Step 2 — Verify each statement against the context
 
@@ -66,7 +66,7 @@ context*. This is **positive entailment**: a statement counts as supported only
 when the context actively backs it up. A statement the context neither supports
 nor contradicts does **not** count — silence is not support.
 
-- Prompt (`VERIFY_RAGAS`): *"¿Puede inferirse la siguiente afirmación a partir
+- Prompt (`faithfulness_ragas.verify`): *"¿Puede inferirse la siguiente afirmación a partir
   del contexto recuperado? Asigna 1 si la afirmación se deduce del contexto, o 0
   si no se deduce o lo contradice."*
 - Each verdict is on the `Boolean()` scale: `1` (entailed) or `0` (not entailed
@@ -87,7 +87,7 @@ Because each Boolean verdict is `0`/`1`, the mean of the verdicts is exactly
 
 | Case | Result | Judge calls |
 | --- | --- | --- |
-| No statements extracted from the answer | `F = 1.0` | none |
+| No statements extracted from the answer | `F = NOT_APPLICABLE` — excluded from the averages, where the reference returns `1.0` | none |
 | All statements entailed | `F = 1.0` | one per statement |
 | No statement entailed | `F = 0.0` | one per statement |
 
@@ -107,8 +107,9 @@ diverges in one place: it decomposes the answer into statements
 **deterministically** with `split_sentences()` (the `syntok` sentence segmenter)
 — *one sentence of the answer is one statement* — rather than with a judge call.
 Only Step 2 (per-statement verification) is left to the judge. The scoring
-(Steps 2–3), the positive-entailment requirement, and the no-statements
-short-circuit are otherwise identical to the pseudocode.
+(Steps 2–3) and the positive-entailment requirement are otherwise identical to the
+pseudocode; the no-statements case also short-circuits, but returns
+`NOT_APPLICABLE` (excluded from the rollups) where the reference returns `1.0`.
 
 ## Tests
 

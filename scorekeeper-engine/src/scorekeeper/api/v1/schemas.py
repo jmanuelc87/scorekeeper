@@ -119,10 +119,15 @@ class EvaluationResponse(BaseModel):
 
 
 class ScenarioTurnMetric(BaseModel):
-    """One metric's score on a turn (without its structured trace)."""
+    """One metric's score on a turn (without its structured trace).
+
+    ``score`` is ``null`` when the metric did not apply to the turn — it had
+    nothing to measure (no retrieved context, no claims), so it is also left out
+    of the turn, scenario and platform averages.
+    """
 
     metric_name: str
-    score: float
+    score: float | None = None
     judge_model: str | None = None
     rubric_version: str | None = None
 
@@ -224,3 +229,52 @@ class MetricRead(BaseModel):
     category: str
     weight: float
     rubric_version: str
+
+
+class PromptVersionRead(BaseModel):
+    """One edit of one prompt slot.
+
+    ``template`` is write-once, so a version is a permanent record of the text a
+    benchmark scored under. ``published_by``/``published_at`` are null while the
+    version is a draft or has been discarded.
+    """
+
+    id: str
+    version: int
+    template: str
+    status: str
+    is_active: bool
+    changelog: str | None
+    created_by: str | None
+    created_at: datetime
+    published_by: str | None
+    published_at: datetime | None
+
+
+class PromptRead(BaseModel):
+    """One prompt slot a metric renders, with the version runs currently bind."""
+
+    id: str
+    metric: str
+    slug: str
+    # The placeholders the metric fills itself; a template must use exactly these,
+    # plus optionally {prompt}, {response} and {context}, which the judge fills.
+    required_variables: list[str]
+    description: str
+    # Null when no published version is active for this slot.
+    active_version: PromptVersionRead | None
+
+
+class PromptDetailRead(BaseModel):
+    """One prompt slot with its full edit history, newest version first.
+
+    Version numbers have gaps: the counter is assigned at row creation, so a discarded
+    draft keeps its number and never appears as published.
+    """
+
+    id: str
+    metric: str
+    slug: str
+    required_variables: list[str]
+    description: str
+    versions: list[PromptVersionRead]

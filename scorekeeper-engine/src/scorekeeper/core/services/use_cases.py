@@ -22,7 +22,7 @@ from typing import Any
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.core.metrics.registry import MetricRegistry
-from scorekeeper.core.metrics.selection import sync_metrics
+from scorekeeper.core.metrics.selection import sync_metrics, sync_prompts
 from scorekeeper.db.connection import session_scope
 from scorekeeper.db.models import UseCase, UseCaseMetric
 from scorekeeper.db.repositories import use_cases as repo
@@ -101,6 +101,9 @@ async def create_use_case(
         # Materialize the catalog first: a metric added to the registry since the last
         # ingest has no ``metrics`` row yet, and it must be selectable here.
         await sync_metrics(db)
+        await db.flush()
+        # Prompt slots need their metric rows flushed above to point at.
+        await sync_prompts(db)
         await db.flush()
 
         if await repo.get_by_name(db, name) is not None:
