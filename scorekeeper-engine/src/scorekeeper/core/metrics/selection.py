@@ -170,6 +170,43 @@ async def active_templates(
         return {}
 
     stored = await prompt_repo.active_versions_for(session, names)
+    return _resolve_slots(stored, names)
+
+
+async def bound_templates(
+    session: AsyncSession, run_id: uuid.UUID, metric_names: Iterable[str]
+) -> dict[str, dict[str, PromptVersion]] | None:
+    """The versions ``run_id`` is already pinned to, or ``None`` when it has none yet.
+
+    The resume counterpart of :func:`active_templates`. A run is pinned once, at the
+    start; every later delivery reads the pinning back through here instead of resolving
+    the *active* versions again, so a prompt published mid-run cannot split one run's
+    rollups across two rubrics.
+
+    Validated through the same :func:`_resolve_slots` as the active path, and for the
+    same reason: a deploy that adds a slot to a metric mid-run would otherwise hand it a
+    partial template map, and the failure would surface inside a judge worker thread
+    where skip-metric-continue swallows it.
+    """
+    names = sorted(set(metric_names))
+    if not names:
+        return None
+
+    stored = await prompt_repo.bound_versions_for_run(session, run_id)
+    if not stored:
+        return None
+    return _resolve_slots(stored, names)
+
+
+def _resolve_slots(
+    stored: Mapping[tuple[str, str], PromptVersion], names: list[str]
+) -> dict[str, dict[str, PromptVersion]]:
+    """Group ``(metric, slug) -> version`` by metric, checking every declared slot is there.
+
+    Raises :class:`MissingPromptError` listing **every** unsatisfied slot at once, rather
+    than dying on the first: a fresh deployment that forgot to migrate wants one message
+    naming all of them.
+    """
     resolved: dict[str, dict[str, PromptVersion]] = {}
     missing: list[str] = []
     for name in names:

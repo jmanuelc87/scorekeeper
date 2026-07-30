@@ -106,6 +106,11 @@ async def _pin_prompts(
     deselected still contributes its use case. That keeps "written once at the start"
     true, which is the property that makes an interrupted run still record what it was
     scoring under. Raises ``MissingPromptError`` when a slot has no active version.
+
+    "Once" is enforced here: a run that already carries bindings is re-pinned to those,
+    not to whatever is active now. Otherwise a re-delivery — or a per-turn job — would
+    re-resolve, and a prompt published mid-run would split the run's rollups across two
+    rubrics, which is exactly what pinning exists to prevent.
     """
     use_case_ids = {
         scenario.use_case_id
@@ -114,6 +119,10 @@ async def _pin_prompts(
     }
     by_use_case = await use_case_repo.metric_names_for_many(db, use_case_ids)
     metric_names = {name for names in by_use_case.values() for name in names}
+
+    bound = await selection.bound_templates(db, run.id, metric_names)
+    if bound is not None:
+        return bound
 
     templates = await selection.active_templates(db, metric_names)
     await prompt_repo.replace_run_bindings(
