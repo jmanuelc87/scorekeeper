@@ -86,7 +86,7 @@ async def retrieve_run(
                         # survives the crash that caused the retry.
                         turn.attempts += 1
                         await db.commit()
-                        await _retrieve_turn(turn, orchestrator)
+                        await retrieve_turn(turn, orchestrator)
                     await db.commit()  # atomic-write unit: one scenario at a time
                 await _purge_cache(orchestrator, platform_exec)
         except Exception:
@@ -124,7 +124,7 @@ async def _purge_cache(
     logger.info("Plataforma %s: %d documento(s) liberado(s) de la caché", label, removed)
 
 
-async def _retrieve_turn(turn: Turn, pipeline: RetrievalPipeline) -> None:
+async def retrieve_turn(turn: Turn, pipeline: RetrievalPipeline) -> None:
     """Populate one turn's ``retrieved_documents`` from its raw context cell (best-effort)."""
     turn.retrieved_documents.clear()  # idempotent when a run is retried
     cell = (turn.retrieved_context_source or "").strip()

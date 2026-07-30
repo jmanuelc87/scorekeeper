@@ -1,10 +1,12 @@
 """The Celery application that runs evaluations off the request path.
 
 The HTTP API ingests an upload synchronously (parse + persist the run tree) and
-then enqueues a single ``scorekeeper.score_run`` task carrying only the ``run_id``;
-this worker consumes the queue and does the slow LLM-as-a-judge scoring. Clients
-poll ``BenchmarkRun.status`` instead of a Celery result, so no result backend is
-configured.
+then enqueues a single ``scorekeeper.run_chain`` task carrying only the ``run_id``.
+That task does not score the run: it enqueues the run's first turn, and each
+``scorekeeper.score_turn`` job scores one turn and enqueues the next (see
+:mod:`scorekeeper.tasks`). One job is therefore one turn, so a worker killed mid-run
+loses one turn's work rather than the run's. Clients poll ``BenchmarkRun.status``
+instead of a Celery result, so no result backend is configured.
 
 Broker: the app's own Postgres via kombu's SQLAlchemy transport (see
 ``Settings.broker_url``); kombu auto-creates its ``kombu_message`` / ``kombu_queue``

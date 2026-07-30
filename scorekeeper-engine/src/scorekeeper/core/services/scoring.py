@@ -74,7 +74,7 @@ async def score_run(
             # rather than inside a worker thread where skip-metric-continue would swallow
             # it. Inside the try so that failure still leaves the run in a terminal state
             # for pollers, like any other scoring failure.
-            templates = await _pin_prompts(db, run)
+            templates = await pin_prompts(db, run)
             await db.commit()
             # scores everything, commits
             await EvalRunner(db, judge, templates).run_benchmark(run)
@@ -87,13 +87,13 @@ async def score_run(
                 await db.commit()
             raise
 
-        run.status = _run_status(run)
+        run.status = run_status(run)
         await db.commit()
         logger.info("Run %s finalizado con estado %s", run.id, run.status)
         return summarize_run(run)
 
 
-async def _pin_prompts(
+async def pin_prompts(
     db: AsyncSession, run: BenchmarkRun
 ) -> dict[str, dict[str, PromptVersion]]:
     """Resolve the run's prompt versions and record them as its bindings.
@@ -170,7 +170,7 @@ async def _select_all_turns(db: AsyncSession, run_id: str) -> None:
     await db.commit()
 
 
-def _run_status(run: BenchmarkRun) -> str:
+def run_status(run: BenchmarkRun) -> str:
     """Roll scenario statuses up to a run-level status.
 
     ``fallido`` when nothing scored or every scenario failed, ``completado`` when

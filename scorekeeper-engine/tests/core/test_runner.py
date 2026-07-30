@@ -8,7 +8,7 @@ skip-on-error, roll-up, history wiring, idempotency — is asserted directly.
 from __future__ import annotations
 
 import threading
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import pytest
 from sqlalchemy import func, select
@@ -46,6 +46,7 @@ from scorekeeper.core.runner import (
     STATUS_FALLIDO,
     STATUS_PARCIAL,
     EvalRunner,
+    turn_delay_seconds,
 )
 
 USE_CASE = "soporte"
@@ -544,17 +545,53 @@ async def test_delay_paced_between_consecutive_turns(
 
 
 async def test_delay_disabled_when_max_non_positive(
-    session: AsyncSession, registry, real_turn_pacing
+    session: AsyncSession, registry, real_turn_pacing, monkeypatch
 ) -> None:
     await _select_metrics(session, ["utilidad"])
     _, _, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d")])
     slept = real_turn_pacing
+    monkeypatch.setattr(
+        "scorekeeper.core.runner.get_settings",
+        lambda: _DelaySettings(min_seconds=1.0, max_seconds=0.0),
+    )
 
-    runner = EvalRunner(session, RecordingJudge())
-    runner._turn_delay_max = 0.0
-    await runner.run_scenario(scenario)
+    await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
 
     assert slept == []
+
+
+class _DelaySettings(NamedTuple):
+    """Just the two fields ``turn_delay_seconds`` reads off ``Settings``."""
+
+    min_seconds: float
+    max_seconds: float
+
+    @property
+    def turn_delay_min_seconds(self) -> float:
+        return self.min_seconds
+
+    @property
+    def turn_delay_max_seconds(self) -> float:
+        return self.max_seconds
+
+
+def test_turn_delay_seconds_is_zero_when_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scorekeeper.core.runner.get_settings",
+        lambda: _DelaySettings(min_seconds=1.0, max_seconds=0.0),
+    )
+    assert turn_delay_seconds() == 0.0
+
+
+def test_turn_delay_seconds_draws_from_the_configured_window(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scorekeeper.core.runner.get_settings",
+        lambda: _DelaySettings(min_seconds=2.0, max_seconds=5.0),
+    )
+    monkeypatch.setattr(
+        "scorekeeper.core.runner.random.uniform", lambda low, high: (low, high)
+    )
+    assert turn_delay_seconds() == (2.0, 5.0)
 
 
 class _BarrierMetric(_JudgeMetric):

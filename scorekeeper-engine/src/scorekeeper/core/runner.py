@@ -78,6 +78,22 @@ STATUS_FALLIDO = "fallido"
 MAX_TURN_ATTEMPTS = 3
 
 
+def turn_delay_seconds() -> float:
+    """How long to wait before the next turn, drawn from the configured window.
+
+    Uniform over ``[turn_delay_min_seconds, turn_delay_max_seconds]``; ``0.0`` when the
+    upper bound is non-positive, which disables pacing. One source of truth for the
+    window: the in-process runner sleeps it (``EvalRunner._pace_between_turns``) while
+    the chained per-turn jobs hand it to Celery as a ``countdown`` instead.
+    """
+    settings = get_settings()
+    if settings.turn_delay_max_seconds <= 0:
+        return 0.0
+    low = max(0.0, settings.turn_delay_min_seconds)
+    high = max(low, settings.turn_delay_max_seconds)
+    return random.uniform(low, high)
+
+
 class EvalRunner:
     """Scores stored turns with each scenario's selected metrics.
 
@@ -99,9 +115,6 @@ class EvalRunner:
         # runner is a public entry point, and a caller starting at ``run_scenario``
         # must get the same pinning.
         self.templates = templates
-        settings = get_settings()
-        self._turn_delay_min = settings.turn_delay_min_seconds
-        self._turn_delay_max = settings.turn_delay_max_seconds
 
     # ---- Level 1: whole run -------------------------------------------------
     async def run_benchmark(self, run: BenchmarkRun) -> None:
@@ -184,7 +197,7 @@ class EvalRunner:
                 turn_scores.append(turn.turn_score)
             history.append((turn.prompt, turn.response))
         scenario.average_score = scenario_average(turn_scores)
-        scenario.status = _scenario_status(scenario)
+        scenario.status = scenario_status(scenario)
         await self.session.commit()
         logger.info(
             "Escenario %s finalizado: estado=%s, promedio=%s",
@@ -194,17 +207,13 @@ class EvalRunner:
         )
 
     async def _pace_between_turns(self) -> None:
-        """Pause a random interval between consecutive turns to spread out judge calls.
+        """Pause between consecutive turns to spread out judge calls.
 
-        The pause is drawn uniformly from the configured
-        ``[turn_delay_min_seconds, turn_delay_max_seconds]`` window; a non-positive
-        upper bound disables it.
+        The interval comes from :func:`turn_delay_seconds`; ``0.0`` means pacing is off.
         """
-        if self._turn_delay_max <= 0:
+        delay = turn_delay_seconds()
+        if not delay:
             return
-        low = max(0.0, self._turn_delay_min)
-        high = max(low, self._turn_delay_max)
-        delay = random.uniform(low, high)
         logger.debug("Pausa de %.2fs antes del siguiente turno", delay)
         await asyncio.sleep(delay)
 
@@ -358,7 +367,7 @@ class EvalRunner:
         )
 
 
-def _scenario_status(scenario: ScenarioResult) -> str:
+def scenario_status(scenario: ScenarioResult) -> str:
     """Classify a scored scenario as complete, partial, or fully failed.
 
     ``fallido`` when no turn scored, ``parcial`` when at least one turn failed to

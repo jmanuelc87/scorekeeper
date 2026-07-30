@@ -232,9 +232,10 @@ async def resolve(
     """Instantiate the metrics linked to ``use_case_id``, with their prompts bound.
 
     ``templates`` is the map :func:`active_templates` returns. Passing it in is how a
-    whole run is pinned to one set of versions — resolved once in ``score_run`` so an
-    edit landing mid-job cannot split a run's rollups across two rubrics. Omitted, this
-    resolves per call, which is fine for a caller scoring nothing.
+    whole run is pinned to one set of versions — resolved once when the run starts so an
+    edit landing mid-run cannot split its rollups across two rubrics. A per-turn job
+    reads that pinning back with :func:`bound_templates`. Omitted, this resolves per
+    call, which is fine for a caller scoring nothing.
 
     Raises ``KeyError`` (Spanish message) if a stored metric name is not in the code
     registry, and :class:`MissingPromptError` if a declared slot has no active version.

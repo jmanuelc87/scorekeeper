@@ -10,9 +10,7 @@ from openpyxl import Workbook
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper import tasks
 from scorekeeper.db.models import BenchmarkRun, Turn
-from scorekeeper.core.services import retrieval, scoring
 from scorekeeper.core.services import runs as run_service
 from scorekeeper.core.services.ingestion import UploadedFile, ingest_evaluation
 from scorekeeper.core.services.retrieval import retrieve_run
@@ -235,41 +233,5 @@ async def test_retrieve_run_survives_a_cache_cleanup_failure(session: AsyncSessi
     assert run.status == STATUS_EN_RECUPERACION
 
 
-# -- Celery wiring -------------------------------------------------------------------------
-
-
-def test_run_pipeline_task_runs_retrieval_before_scoring(monkeypatch) -> None:
-    # Deliberately a *sync* test: the Celery task is sync and drives the async pipeline
-    # through its own asyncio.run(), which cannot nest inside a running event loop.
-    order: list[str] = []
-
-    async def _retrieve(rid: str) -> None:
-        order.append("retrieve")
-
-    async def _score(rid: str) -> None:
-        order.append("score")
-
-    monkeypatch.setattr(retrieval, "retrieve_run", _retrieve)
-    monkeypatch.setattr(scoring, "score_run", _score)
-
-    tasks.run_pipeline_task("run-123")
-
-    assert order == ["retrieve", "score"]
-
-
-def test_worker_lost_requeues_the_task() -> None:
-    # acks_late alone lets Celery ack a job whose prefork child was killed; rejecting is
-    # what actually re-delivers it so the run can resume forward.
-    from scorekeeper.celery_app import celery_app
-
-    assert celery_app.conf.task_acks_late is True
-    assert celery_app.conf.task_reject_on_worker_lost is True
-
-
-def test_enqueue_run_delegates_to_task(monkeypatch) -> None:
-    captured: dict[str, str] = {}
-    monkeypatch.setattr(tasks.run_pipeline_task, "delay", lambda rid: captured.update(id=rid))
-
-    tasks.enqueue_run("run-abc")
-
-    assert captured == {"id": "run-abc"}
+# The Celery wiring is exercised in tests/test_tasks.py — retrieval no longer owns a task
+# of its own now that a run is a chain of per-turn jobs.
