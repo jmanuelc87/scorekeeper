@@ -26,9 +26,11 @@ def run_tree_options(*, metric_scores: bool = True, retrieval: bool = True):
     Under an ``AsyncSession`` an unloaded relationship is not a slow query but a
     ``MissingGreenlet``, so the tree is loaded up front rather than lazily.
 
-    ``MetricScore.trace`` is required, not an optimization: clearing
+    ``MetricScore.trace`` is required, not an optimization: removing a score from
     ``turn.metric_scores`` cascades delete-orphan into it, which the unit of work
-    resolves *at flush time* — the least obvious place to take a lazy load.
+    resolves *at flush time* — the least obvious place to take a lazy load. The
+    resume diff in ``core.runner.run_turn`` drops stale rows one at a time, so this
+    still holds.
 
     ``ScenarioResult.use_case`` comes along because ``run_scenario`` names it in its
     log line and metric selection reads its links.

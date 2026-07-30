@@ -69,6 +69,9 @@ class RecordingJudge:
         self.seen_turns: list[TurnView] = []
         self._lock = threading.Lock()
 
+    def model_for(self, step=None) -> str:
+        return "judge-test"
+
     def score(self, *, rubric, turn, scale, rubric_version=None, step=None) -> JudgeVerdict:
         with self._lock:
             self.seen_turns.append(turn)

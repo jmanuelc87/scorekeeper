@@ -52,6 +52,9 @@ class RecordingJudge:
         self.score_value = score_value
         self.model = model
 
+    def model_for(self, step=None) -> str:
+        return self.model
+
     def score(self, *, rubric, turn, scale, rubric_version=None, step=None) -> JudgeVerdict:
         return JudgeVerdict(score=self.score_value, justification="razón", model=self.model)
 

@@ -9,6 +9,7 @@ import pytest
 from openpyxl import Workbook
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from scorekeeper.db.models import BenchmarkRun, Turn
 from scorekeeper.core.services import runs as run_service
@@ -66,6 +67,24 @@ def _xlsx(header: list[str], rows: list[list[object]]) -> bytes:
     return buf.getvalue()
 
 
+async def _the_turn(session: AsyncSession) -> Turn:
+    """Re-read the run's single turn with its documents eagerly loaded.
+
+    The eager load is required, not tidiness: the identity map holds *weak* references,
+    so once ``retrieve_run`` returns and drops the tree it loaded, the turn can be
+    collected and a plain ``select(Turn)`` hands back a fresh instance whose
+    relationships are unloaded — a ``MissingGreenlet`` on the next attribute read, and
+    a flaky one, since whether it happens depends on when the collector runs.
+    """
+    return (
+        await session.execute(
+            select(Turn)
+            .options(selectinload(Turn.retrieved_documents))
+            .execution_options(populate_existing=True)
+        )
+    ).scalars().one()
+
+
 async def _ingest_one_turn_with_context(session: AsyncSession, cell: str) -> str:
     content = _xlsx(
         ["turn", "role", "content", "retrieved_context"],
@@ -88,7 +107,7 @@ async def test_retrieve_run_populates_documents_and_sets_status(session: AsyncSe
 
     await retrieve_run(run_id, session=session, pipeline=pipeline)
 
-    turn = (await session.execute(select(Turn))).scalars().one()
+    turn = await _the_turn(session)
     assert [d.content for d in turn.retrieved_documents] == ["md::manual (https://h/x.html)"]
     # Retrieval leaves the run in the retrieval phase; scoring advances it afterwards.
     run = await session.get(BenchmarkRun, uuid.UUID(run_id))
@@ -105,7 +124,7 @@ async def test_retrieve_run_skips_turns_without_source(session: AsyncSession) ->
 
     await retrieve_run(run_id, session=session, pipeline=pipeline)
 
-    turn = (await session.execute(select(Turn))).scalars().one()
+    turn = await _the_turn(session)
     assert turn.retrieved_documents == []
     assert pipeline.calls == []
 
@@ -123,7 +142,7 @@ async def test_retrieve_run_skips_unselected_turns(session: AsyncSession) -> Non
 
     await retrieve_run(run_id, session=session, pipeline=pipeline)
 
-    turn = (await session.execute(select(Turn))).scalars().one()
+    turn = await _the_turn(session)
     assert turn.retrieved_documents == []
     assert pipeline.calls == []
 
@@ -227,7 +246,7 @@ async def test_retrieve_run_survives_a_cache_cleanup_failure(session: AsyncSessi
     await retrieve_run(run_id, session=session, pipeline=_UnpurgeablePipeline())
 
     # The retrieved context is already persisted; cleanup trouble must not undo it.
-    turn = (await session.execute(select(Turn))).scalars().one()
+    turn = await _the_turn(session)
     assert len(turn.retrieved_documents) == 1
     run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     assert run.status == STATUS_EN_RECUPERACION
