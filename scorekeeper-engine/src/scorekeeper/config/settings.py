@@ -93,6 +93,18 @@ class Settings(BaseSettings):
     turn_delay_min_seconds: float = 0.5
     turn_delay_max_seconds: float = 2.0
 
+    # Backoff for judge calls the provider throttles or sheds (HTTP 429/503/529). The
+    # pause above is open-loop and per-process, so it cannot bound the aggregate request
+    # rate once a run is spread across workers, turns and concurrent metrics; this is the
+    # closed loop that can, since each caller reacts to the throttling it actually sees
+    # (see scorekeeper.core.metrics.judges.base.judge_call). Attempts count the first try,
+    # so 1 disables retrying. The wait is exponential with full jitter — jitter is what
+    # keeps concurrent callers from re-firing in lockstep — unless the provider sent a
+    # Retry-After, which wins; either way it is clamped to judge_retry_max_seconds.
+    judge_retry_max_attempts: int = 5
+    judge_retry_base_seconds: float = 1.0
+    judge_retry_max_seconds: float = 60.0
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
     @field_validator("judge_system_prompt", mode="after")
