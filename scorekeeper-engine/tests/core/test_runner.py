@@ -11,7 +11,7 @@ import threading
 from typing import ClassVar
 
 import pytest
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.db.repositories.runs import run_tree_options
@@ -70,6 +70,9 @@ class RecordingJudge:
         # Metrics within a turn now evaluate concurrently, so several threads may
         # call ``score`` at once — guard the record. (Turns stay sequential.)
         self._lock = threading.Lock()
+
+    def model_for(self, step=None) -> str:
+        return self.model
 
     def score(self, *, rubric, turn, scale, rubric_version=None, step=None) -> JudgeVerdict:
         with self._lock:
@@ -427,20 +430,26 @@ async def test_run_platform_rolls_up_average(session: AsyncSession, registry) ->
     assert platform_exec.finished_at is not None
 
 
-async def test_rescoring_is_idempotent(session: AsyncSession, registry) -> None:
+async def test_rescoring_a_completed_scenario_is_skipped(
+    session: AsyncSession, registry
+) -> None:
     await _select_metrics(session, ["utilidad", "correccion"])
     _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
-    runner = EvalRunner(session, RecordingJudge())
+    judge = RecordingJudge()
+    runner = EvalRunner(session, judge)
 
     await runner.run_scenario(scenario)
     await session.commit()
     count_1 = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
+    seen_1 = len(judge.seen_turns)
 
     await runner.run_scenario(scenario)
     await session.commit()
     count_2 = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
 
+    # No duplicate rows, and — the point of resumability — no second judge bill.
     assert count_1 == count_2 == 2
+    assert len(judge.seen_turns) == seen_1
 
 
 async def test_delay_paced_between_consecutive_turns(
@@ -543,14 +552,286 @@ async def test_token_usage_row_is_zero_when_judge_records_nothing(
 async def test_rescoring_updates_single_token_usage_row(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad"])
     _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
-    runner = EvalRunner(session, TokenRecordingJudge(input_tokens=5, output_tokens=2))
 
-    await runner.run_scenario(scenario)
+    await EvalRunner(
+        session, TokenRecordingJudge(input_tokens=5, output_tokens=2)
+    ).run_scenario(scenario)
     await session.commit()
-    await runner.run_scenario(scenario)
+
+    # A different judge model invalidates every key, so the second pass re-scores the
+    # turn outright — the branch that *replaces* the counts rather than adding to them.
+    _interrupt(scenario)
+    await EvalRunner(
+        session, TokenRecordingJudge(input_tokens=7, output_tokens=3, model="otro-juez")
+    ).run_scenario(scenario)
     await session.commit()
 
     # Re-scoring updates the existing row in place — still exactly one per turn.
     assert (await session.execute(select(func.count()).select_from(TurnTokenUsage))).scalar_one() == 1
     turn = scenario.turns[0]
+    assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (7, 3)
+
+
+# --- Metric-level resume ------------------------------------------------------
+
+
+def _interrupt(scenario: ScenarioResult) -> None:
+    """Put a scored scenario back where a crashed worker would have left it.
+
+    ``run_turn`` commits each score as it is written but ``run_scenario`` only commits
+    the roll-up at the end, so an interruption leaves the ``MetricScore`` rows on disk
+    and the scenario status untouched. Rewinding just the status reproduces that, and
+    is also what lifts the ``completado`` shortcut so the per-metric fingerprint — the
+    thing under test below — actually gets consulted.
+    """
+    scenario.status = "pending"
+
+
+async def test_unchanged_turn_issues_no_judge_calls(session: AsyncSession, registry) -> None:
+    await _select_metrics(session, ["utilidad", "correccion"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    judge = RecordingJudge()
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+    turn = scenario.turns[0]
+    before = {ms.metric_name: ms.id for ms in turn.metric_scores}
+    score_before = turn.turn_score
+
+    _interrupt(scenario)
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+
+    # Same rows, not replacements: the keys matched, so nothing was judged again.
+    assert {ms.metric_name: ms.id for ms in turn.metric_scores} == before
+    assert len(judge.seen_turns) == 2  # two metrics, one turn, one pass
+    assert turn.turn_score == score_before
+    assert scenario.status == STATUS_COMPLETADO
+
+
+@pytest.mark.parametrize("changed", ["response", "judge_model", "retrieved_context"])
+async def test_changed_input_forces_a_rescore(
+    session: AsyncSession, registry, changed: str
+) -> None:
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    judge = RecordingJudge()
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+    turn = scenario.turns[0]
+    key_before = turn.metric_scores[0].scoring_key
+
+    _interrupt(scenario)
+    if changed == "response":
+        turn.response = "una respuesta distinta"
+    elif changed == "retrieved_context":
+        turn.retrieved_documents.append(
+            RetrievedContextDocument(rank=0, name="a", document="d.pdf", content="uno")
+        )
+    await session.flush()
+    if changed == "judge_model":
+        judge = RecordingJudge(model="otro-juez")
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+
+    # Re-judged, and still exactly one row for the metric — replaced, not appended.
+    assert len(turn.metric_scores) == 1
+    assert turn.metric_scores[0].scoring_key != key_before
+    total = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
+    assert total == 1
+
+
+async def test_only_the_missing_metric_is_reevaluated(
+    session: AsyncSession, registry
+) -> None:
+    # The motivating case: a metric that failed last pass is retried while the metric
+    # that succeeded is reused, so the resumed run pays for one judge call, not two.
+    class Intermitente(_JudgeMetric):
+        name = "intermitente"
+        falla = True
+
+        def evaluate(self, turn: TurnView, judge) -> MetricResult:
+            if type(self).falla:
+                raise RuntimeError("fallo del juez")
+            return super().evaluate(turn, judge)
+
+    MetricRegistry.add(Intermitente)
+    await _select_metrics(session, ["utilidad", "intermitente"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    judge = RecordingJudge()
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+    turn = scenario.turns[0]
+    assert {ms.metric_name for ms in turn.metric_scores} == {"utilidad"}
+    utilidad_id = turn.metric_scores[0].id
+
+    Intermitente.falla = False
+    _interrupt(scenario)
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+
+    assert {ms.metric_name for ms in turn.metric_scores} == {"utilidad", "intermitente"}
+    by_name = {ms.metric_name: ms for ms in turn.metric_scores}
+    assert by_name["utilidad"].id == utilidad_id  # reused, not rewritten
+    # One call on the first pass (utilidad; intermitente raised before reaching the
+    # judge) plus one on the second (intermitente only).
+    assert len(judge.seen_turns) == 2
+
+
+async def test_legacy_null_scoring_key_is_rescored(session: AsyncSession, registry) -> None:
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    judge = RecordingJudge()
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+    turn = scenario.turns[0]
+    # A row written before the column existed carries no provenance.
+    turn.metric_scores[0].scoring_key = None
+    await session.flush()
+
+    _interrupt(scenario)
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+
+    assert len(judge.seen_turns) == 2  # NULL never matches, so it re-scored once
+    assert turn.metric_scores[0].scoring_key is not None
+
+
+async def test_row_for_an_undeclared_metric_is_dropped(
+    session: AsyncSession, registry
+) -> None:
+    await _select_metrics(session, ["utilidad", "correccion"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    judge = RecordingJudge(score_value=0.8)
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+    turn = scenario.turns[0]
+
+    # Unlink "correccion" from the use case: its stored score no longer belongs to
+    # the turn and must not keep feeding the roll-up.
+    metric_id = (
+        await session.execute(
+            select(MetricDefinition.id).where(MetricDefinition.name == "correccion")
+        )
+    ).scalar_one()
+    await session.execute(
+        delete(UseCaseMetric).where(UseCaseMetric.metric_id == metric_id)
+    )
+    _interrupt(scenario)
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+
+    assert {ms.metric_name for ms in turn.metric_scores} == {"utilidad"}
+    assert len(judge.seen_turns) == 2  # dropping a row costs no judge call
+    assert turn.turn_score == pytest.approx(0.8)
+
+
+async def test_duplicate_rows_for_one_metric_collapse(
+    session: AsyncSession, registry
+) -> None:
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    judge = RecordingJudge()
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+    turn = scenario.turns[0]
+    # Nothing in the schema prevents a duplicate; the diff has to heal it, since the
+    # roll-up would otherwise count the metric twice.
+    turn.metric_scores.append(
+        MetricScore(
+            metric_name="utilidad",
+            score=0.1,
+            scoring_key=turn.metric_scores[0].scoring_key,
+        )
+    )
+    await session.flush()
+
+    _interrupt(scenario)
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+
+    total = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
+    assert total == 1
+    assert len(judge.seen_turns) == 1  # the survivor's key still matched
+
+
+async def test_partial_resume_accumulates_token_usage(
+    session: AsyncSession, registry
+) -> None:
+    class Intermitente(_JudgeMetric):
+        name = "intermitente"
+        falla = True
+
+        def evaluate(self, turn: TurnView, judge) -> MetricResult:
+            if type(self).falla:
+                raise RuntimeError("fallo del juez")
+            return super().evaluate(turn, judge)
+
+    MetricRegistry.add(Intermitente)
+    await _select_metrics(session, ["utilidad", "intermitente"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    judge = TokenRecordingJudge(input_tokens=5, output_tokens=2)
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+    turn = scenario.turns[0]
     assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (5, 2)
+
+    Intermitente.falla = False
+    _interrupt(scenario)
+    await EvalRunner(session, judge).run_scenario(scenario)
+    await session.commit()
+
+    # The reused metric's tokens were really spent, so the resumed pass adds to the
+    # ledger instead of overwriting it — still one row per turn.
+    assert (await session.execute(select(func.count()).select_from(TurnTokenUsage))).scalar_one() == 1
+    assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (10, 4)
+
+
+async def test_full_reuse_leaves_token_usage_untouched(
+    session: AsyncSession, registry
+) -> None:
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+
+    await EvalRunner(
+        session, TokenRecordingJudge(input_tokens=5, output_tokens=2)
+    ).run_scenario(scenario)
+    await session.commit()
+
+    _interrupt(scenario)
+    # Same model, so every key still matches; this judge must never be called, and a
+    # zeroed snapshot must not overwrite what the first pass really spent.
+    await EvalRunner(
+        session, TokenRecordingJudge(input_tokens=999, output_tokens=999)
+    ).run_scenario(scenario)
+    await session.commit()
+
+    turn = scenario.turns[0]
+    assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (5, 2)
+
+
+async def test_no_pacing_when_every_turn_is_reused(
+    session: AsyncSession, registry, monkeypatch, real_turn_pacing
+) -> None:
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d"), ("e", "f")])
+    slept = real_turn_pacing
+    monkeypatch.setattr("scorekeeper.core.runner.random.uniform", lambda low, high: 0.123)
+    judge = RecordingJudge()
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+    assert slept == [0.123, 0.123]
+
+    _interrupt(scenario)
+    await EvalRunner(session, judge).run_scenario(scenario)
+
+    # A turn that reached no judge earns no pause, so a fully-resumed scenario is
+    # instant rather than sitting out the inter-turn delay for nothing.
+    assert slept == [0.123, 0.123]

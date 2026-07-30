@@ -276,6 +276,12 @@ class MetricScore(Base):
     score: Mapped[float] = mapped_column(Float)
     judge_model: Mapped[str | None] = mapped_column(String(128), default=None)
     rubric_version: Mapped[str | None] = mapped_column(String(64), default=None)
+    # sha256 of everything this score was produced from — rubric version, the prompt
+    # versions bound to the metric's slots, the judge models its steps resolved to, and
+    # the whole TurnView (see scorekeeper.core.metrics.fingerprint). Re-scoring reuses a
+    # row whose key still matches and re-evaluates one whose key does not. NULL on rows
+    # written before this column existed: they never match, so they re-score once.
+    scoring_key: Mapped[str | None] = mapped_column(String(64), default=None)
 
     turn: Mapped[Turn] = relationship(back_populates="metric_scores")
     # Structured record of what the metric produced for this turn, as its own 1:1
