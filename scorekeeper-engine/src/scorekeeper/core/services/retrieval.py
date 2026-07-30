@@ -17,7 +17,7 @@ from scorekeeper.config.settings import get_settings
 from scorekeeper.core.retrieval.pipeline import RetrievalOrchestrator
 from scorekeeper.core.retrieval.protocols import RetrievalPipeline
 from scorekeeper.core.retrieval.types import STATUS_EN_RECUPERACION, RetrievalSummary
-from scorekeeper.core.runner import STATUS_FALLIDO
+from scorekeeper.core.runner import MAX_TURN_ATTEMPTS, STATUS_FALLIDO
 from scorekeeper.core.services.serializers import summarize_run
 from scorekeeper.db.connection import session_scope
 from scorekeeper.db.models import PlatformExecution, RetrievedContextDocument, Turn
@@ -39,6 +39,11 @@ async def retrieve_run(
     per-document failure is recorded in the pipeline report (and dropped from the context)
     rather than raised. Commits **per scenario** so an interrupted job keeps finished scenarios;
     a hard phase failure marks the run ``fallido`` and re-raises.
+
+    Resumes forward: a turn that already has ``retrieved_documents`` was resolved by an
+    earlier delivery and is skipped, so a re-delivery costs at most the turn that was in
+    flight rather than re-fetching the whole run. Each started turn counts an attempt and
+    is abandoned past ``MAX_TURN_ATTEMPTS`` (see :mod:`scorekeeper.core.runner`).
 
     When a platform execution's turns are all retrieved, its downloaded documents are purged
     from the fetch cache (:func:`_purge_cache`) — the extracted markdown is persisted by then,
@@ -64,10 +69,24 @@ async def retrieve_run(
             for platform_exec in run.platform_executions:
                 for scenario in platform_exec.scenario_results:
                     for turn in scenario.turns:
-                        # Skip retrieval for turns that won't be scored; their
-                        # retrieved context is only used by their own metrics.
-                        if turn.is_selected:
-                            await _retrieve_turn(turn, orchestrator)
+                        # Skip retrieval for turns that won't be scored (their retrieved
+                        # context is only used by their own metrics) and for turns an
+                        # earlier delivery already resolved — that is what makes a
+                        # re-delivery resume forward instead of re-fetching everything.
+                        if not turn.is_selected or turn.retrieved_documents:
+                            continue
+                        if turn.attempts >= MAX_TURN_ATTEMPTS:
+                            logger.warning(
+                                "Turno %s abandonado tras %d intento(s)",
+                                turn.turn_number,
+                                turn.attempts,
+                            )
+                            continue
+                        # Commit before fetching: the count only bounds retries if it
+                        # survives the crash that caused the retry.
+                        turn.attempts += 1
+                        await db.commit()
+                        await _retrieve_turn(turn, orchestrator)
                     await db.commit()  # atomic-write unit: one scenario at a time
                 await _purge_cache(orchestrator, platform_exec)
         except Exception:

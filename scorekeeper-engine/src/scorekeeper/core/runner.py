@@ -26,6 +26,9 @@ Commit boundary: the **turn is the atomic unit of durability** — a turn's metr
 judge calls all run before its scores are written, then ``run_turn`` commits each
 ``MetricScore`` followed by the ``turn_score`` roll-up. An interruption mid-turn
 loses that turn's in-flight scores, but every earlier turn/scenario stays committed.
+It is also the unit of *resumption*: a re-delivered job skips every turn that already
+carries a ``turn_score``, so a crash costs one turn rather than the whole run, and the
+``attempts`` counter bounds how often a turn that keeps crashing is retried.
 The roll-ups commit at their own level as they are computed: the ``turn_score`` in
 ``run_turn``, the scenario ``average_score`` / ``status`` in ``run_scenario``, the
 platform ``average_score`` in ``run_platform``.
@@ -66,6 +69,13 @@ logger = logging.getLogger(__name__)
 STATUS_COMPLETADO = "completado"
 STATUS_PARCIAL = "parcial"
 STATUS_FALLIDO = "fallido"
+
+# How many times a turn may be *started* before it is abandoned. A turn that kills its
+# worker (the OOM killer) is redelivered by Celery, so without a cap it would block the
+# run forever. Note the arithmetic differs by phase model: while retrieval and scoring
+# are separate passes over the run, one healthy delivery burns two attempts (one each),
+# so a poison turn is dropped on its second or third delivery.
+MAX_TURN_ATTEMPTS = 3
 
 
 class EvalRunner:
@@ -137,6 +147,10 @@ class EvalRunner:
         see earlier exchanges. Consecutive turns are paced by a short random delay
         (see ``_pace_between_turns``).
 
+        Resumes forward: a turn that already has a ``turn_score`` is left alone (it was
+        scored by an earlier delivery of this job) but still counts towards the average,
+        so a redelivery after a crash costs at most the turn that was in flight.
+
         Individual metric scores are already committed as they are written (see
         ``run_turn``); this final commit persists the scenario roll-up
         (``average_score`` / ``status``).
@@ -151,13 +165,22 @@ class EvalRunner:
         )
         history: list[tuple[str, str]] = []
         turn_scores: list[float | None] = []
+        scored_any = False
         for turn in scenario.turns:
             # Only selected turns are scored, but every turn feeds the conversation
             # history so a later selected turn's judge sees the full exchange.
             if turn.is_selected:
-                if turn_scores:  # pace only between turns actually scored
-                    await self._pace_between_turns()
-                await self.run_turn(turn, metrics, history)
+                # Resume forward: a turn that already carries a score was done by an
+                # earlier delivery of this job, so re-judging it would just re-pay for
+                # it. Its score still counts towards the scenario average below.
+                if turn.turn_score is None:
+                    # Pace only between turns this pass actually judged — gating on
+                    # ``turn_scores`` instead would pause before the first turn of a
+                    # resumed scenario, which follows no judge call at all.
+                    if scored_any:
+                        await self._pace_between_turns()
+                    await self.run_turn(turn, metrics, history)
+                    scored_any = turn.turn_score is not None
                 turn_scores.append(turn.turn_score)
             history.append((turn.prompt, turn.response))
         scenario.average_score = scenario_average(turn_scores)
@@ -204,7 +227,22 @@ class EvalRunner:
         results, then commits the ``turn_score`` roll-up. The turn is the atomic-write
         unit: an interruption mid-turn loses that turn's in-flight scores, but earlier
         turns stay committed.
+
+        Counts an attempt (durably, before the first judge call) and returns without
+        scoring once ``MAX_TURN_ATTEMPTS`` is reached, so a turn that keeps killing its
+        worker is abandoned rather than retried forever. An abandoned turn keeps
+        ``turn_score`` ``None``, which the scenario roll-up already reads as ``parcial``.
         """
+        if turn.attempts >= MAX_TURN_ATTEMPTS:
+            logger.warning(
+                "Turno %s abandonado tras %d intento(s)", turn.turn_number, turn.attempts
+            )
+            return
+        # Commit before judging: the count only bounds retries if it survives the crash
+        # that caused the retry.
+        turn.attempts += 1
+        await self.session.commit()
+
         view = self._to_turn_view(turn, history or [])
         turn.metric_scores.clear()
         logger.info(

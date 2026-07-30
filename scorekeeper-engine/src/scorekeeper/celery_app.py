@@ -32,6 +32,11 @@ celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     task_acks_late=True,  # re-deliver the job if a worker dies mid-scoring
+    # acks_late alone is not enough: when the prefork *child* dies (the OOM killer),
+    # the parent raises WorkerLostError and acks the job anyway. Rejecting instead
+    # requeues it, and the redelivery resumes forward over the turns already done
+    # rather than re-paying for them (see core.runner / core.services.retrieval).
+    task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,  # long tasks -> fair, one-at-a-time dispatch
     task_track_started=True,
 )
