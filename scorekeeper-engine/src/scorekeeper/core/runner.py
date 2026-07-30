@@ -26,6 +26,9 @@ Commit boundary: the **turn is the atomic unit of durability** — a turn's metr
 judge calls all run before its scores are written, then ``run_turn`` commits each
 ``MetricScore`` followed by the ``turn_score`` roll-up. An interruption mid-turn
 loses that turn's in-flight scores, but every earlier turn/scenario stays committed.
+It is also the unit of *delivery* — ``services.chain`` scores one turn per Celery job —
+so a crash costs one turn rather than the whole run, and the ``attempts`` counter bounds
+how often a turn that keeps crashing is retried.
 The roll-ups commit at their own level as they are computed: the ``turn_score`` in
 ``run_turn``, the scenario ``average_score`` / ``status`` in ``run_scenario``, the
 platform ``average_score`` in ``run_platform``.
@@ -82,6 +85,29 @@ STATUS_FALLIDO = "fallido"
 # than name the embedding model, which the ``Judge`` seam does not expose.
 _FINGERPRINT_STEPS = (JudgeStep.EXTRACT, JudgeStep.VERIFY, JudgeStep.SCORE)
 
+# How many times a turn may be *started* before it is abandoned. A turn that kills its
+# worker (the OOM killer) is redelivered by Celery, so without a cap it would block the
+# run forever. Note the arithmetic differs by phase model: while retrieval and scoring
+# are separate passes over the run, one healthy delivery burns two attempts (one each),
+# so a poison turn is dropped on its second or third delivery.
+MAX_TURN_ATTEMPTS = 3
+
+
+def turn_delay_seconds() -> float:
+    """How long to wait before the next turn, drawn from the configured window.
+
+    Uniform over ``[turn_delay_min_seconds, turn_delay_max_seconds]``; ``0.0`` when the
+    upper bound is non-positive, which disables pacing. One source of truth for the
+    window: the in-process runner sleeps it (``EvalRunner._pace_between_turns``) while
+    the chained per-turn jobs hand it to Celery as a ``countdown`` instead.
+    """
+    settings = get_settings()
+    if settings.turn_delay_max_seconds <= 0:
+        return 0.0
+    low = max(0.0, settings.turn_delay_min_seconds)
+    high = max(low, settings.turn_delay_max_seconds)
+    return random.uniform(low, high)
+
 
 class EvalRunner:
     """Scores stored turns with each scenario's selected metrics.
@@ -104,9 +130,6 @@ class EvalRunner:
         # runner is a public entry point, and a caller starting at ``run_scenario``
         # must get the same pinning.
         self.templates = templates
-        settings = get_settings()
-        self._turn_delay_min = settings.turn_delay_min_seconds
-        self._turn_delay_max = settings.turn_delay_max_seconds
 
     # ---- Level 1: whole run -------------------------------------------------
     async def run_benchmark(self, run: BenchmarkRun) -> None:
@@ -203,7 +226,7 @@ class EvalRunner:
                 turn_scores.append(turn.turn_score)
             history.append((turn.prompt, turn.response))
         scenario.average_score = scenario_average(turn_scores)
-        scenario.status = _scenario_status(scenario)
+        scenario.status = scenario_status(scenario)
         await self.session.commit()
         logger.info(
             "Escenario %s finalizado: estado=%s, promedio=%s",
@@ -213,17 +236,13 @@ class EvalRunner:
         )
 
     async def _pace_between_turns(self) -> None:
-        """Pause a random interval between consecutive turns to spread out judge calls.
+        """Pause between consecutive turns to spread out judge calls.
 
-        The pause is drawn uniformly from the configured
-        ``[turn_delay_min_seconds, turn_delay_max_seconds]`` window; a non-positive
-        upper bound disables it.
+        The interval comes from :func:`turn_delay_seconds`; ``0.0`` means pacing is off.
         """
-        if self._turn_delay_max <= 0:
+        delay = turn_delay_seconds()
+        if not delay:
             return
-        low = max(0.0, self._turn_delay_min)
-        high = max(low, self._turn_delay_max)
-        delay = random.uniform(low, high)
         logger.debug("Pausa de %.2fs antes del siguiente turno", delay)
         await asyncio.sleep(delay)
 
@@ -257,6 +276,13 @@ class EvalRunner:
         unit: an interruption mid-turn loses that turn's in-flight scores, but earlier
         turns stay committed.
 
+        Counts an attempt (durably, before the first judge call) and returns without
+        scoring once ``MAX_TURN_ATTEMPTS`` is reached, so a turn that keeps killing its
+        worker is abandoned rather than retried forever. An abandoned turn keeps
+        ``turn_score`` ``None``, which the scenario roll-up already reads as ``parcial``.
+        Only a pass that reaches the judge counts: a turn resolved entirely from reused
+        rows never burned quota, so it never burns an attempt either.
+
         Returns whether any judge call was issued, so ``run_scenario`` can skip pacing
         for a turn it fully reused.
 
@@ -267,7 +293,14 @@ class EvalRunner:
         turn of that conversation; that is correct, since their judges saw it.
         """
         view = self._to_turn_view(turn, history or [])
-        versions = prompt_versions or {}
+        # ``run_scenario`` passes the ids it already flattened; a per-turn caller
+        # (``services.chain``) only pins them on the runner, so fall back to those —
+        # otherwise the same turn would fingerprint differently on each path.
+        versions = (
+            prompt_versions
+            if prompt_versions is not None
+            else _prompt_version_ids(self.templates or {})
+        )
         judge_models = {step.value: self.judge.model_for(step) for step in _FINGERPRINT_STEPS}
 
         keys: dict[str, str] = {}
@@ -310,7 +343,26 @@ class EvalRunner:
                 turn.turn_number,
                 len(keep),
             )
+            if turn.turn_score is None and keep:
+                # Every score committed but the roll-up did not — a crash landed between
+                # the two. Rebuild it from the reused rows: nothing else ever will, and
+                # the chain reads ``turn_score`` to decide a turn is done.
+                turn.turn_score = turn_score(turn.metric_scores)
+                await self.session.commit()
             return False
+
+        if pending:
+            if turn.attempts >= MAX_TURN_ATTEMPTS:
+                logger.warning(
+                    "Turno %s abandonado tras %d intento(s)",
+                    turn.turn_number,
+                    turn.attempts,
+                )
+                return False
+            # Commit before judging: the count only bounds retries if it survives the
+            # crash that caused the retry.
+            turn.attempts += 1
+            await self.session.commit()
 
         for score in stale:
             turn.metric_scores.remove(score)
@@ -467,7 +519,7 @@ def _prompt_version_ids(
     }
 
 
-def _scenario_status(scenario: ScenarioResult) -> str:
+def scenario_status(scenario: ScenarioResult) -> str:
     """Classify a scored scenario as complete, partial, or fully failed.
 
     ``fallido`` when no turn scored, ``parcial`` when at least one turn failed to

@@ -15,7 +15,7 @@ scored, see [Evaluation metrics](evaluation-metrics.md); for the credential stor
 | `POST /api/v1/evaluations`          | Ingest conversation `.xlsx` files for scoring (per-file platform, defaulting to the payload platform). Persists at `ingerido`; does **not** start scoring. |
 | `POST /api/v1/captures`             | Ingest conversations captured from a chat UI as JSON for scoring (the browser extension's entry point). Persists at `ingerido`; does **not** start scoring. |
 | `PATCH /api/v1/evaluations/{run_id}/turns/selection` | Select (or deselect) which of an ingested run's turns are scored — scoring is **opt-in per turn**. Must be called before `/api/v1/evaluations/{run_id}/start`. |
-| `POST /api/v1/evaluations/{run_id}/start` | Start scoring an ingested run: flip it from `ingerido` to `en_cola` and **enqueue** the pipeline. |
+| `POST /api/v1/evaluations/{run_id}/start` | Start scoring an ingested run: flip it from `ingerido` to `en_cola` and **enqueue** the per-turn chain. |
 | `GET /api/v1/evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /api/v1/runs`                  | Retrieve full scored run details, filtered and at a chosen granularity. |
 | `GET /api/v1/runs/{run_id}/scenarios` | Retrieve one run's scenario results as a flat list of rollups (optional `platform`/`status` filters). |
@@ -45,24 +45,39 @@ per metric per turn) are both slow, so they run **off the request path**. Ingest
 **decoupled from the start of scoring**: `POST /api/v1/evaluations` (and `POST /api/v1/captures`) parses the
 upload and persists the run tree synchronously at status `ingerido`, then returns `202` — it
 does **not** enqueue anything. Scoring is also **opt-in per turn**: an ingested turn's
-`Turn.is_selected` defaults to `false`, and both worker phases (retrieval and scoring) skip
-any turn that is not selected — so a run scored without selecting turns scores nothing. A
+`Turn.is_selected` defaults to `false`, and the worker never visits a turn that is not
+selected — so a run scored without selecting turns scores nothing. A
 client picks the subset with `PATCH /api/v1/evaluations/{run_id}/turns/selection` before starting.
 (An unselected turn is still fed to later selected turns' judge **history**, so the
 conversation the judge sees stays complete; it just isn't scored itself.) Scoring starts only
 when a client calls `POST /api/v1/evaluations/{run_id}/start`, which flips the run to `en_cola` and
 enqueues one Celery job. A separate **worker** process
-(`celery -A scorekeeper.celery_app:celery_app worker`)
-consumes the queue and runs the pipeline orchestrator `run_pipeline_task`: **retrieval first,
-then scoring** (`services.retrieval.retrieve_run` → `services.scoring.score_run`). The broker is the app's own
-Postgres (kombu's SQLAlchemy transport — no extra service); there is no Celery result backend,
-so clients track progress by polling `GET /api/v1/evaluations/{run_id}`, which reads
-`BenchmarkRun.status`.
+(`celery -A scorekeeper.celery_app:celery_app worker`) consumes the queue.
+
+The run is evaluated as a **chain of one-turn jobs**, not as a single long job.
+`run_chain_task` marks the run `en_proceso`, pins its prompt versions, and enqueues its
+first turn; each `score_turn_task` then retrieves and scores exactly one turn
+(`services.chain.advance_chain`) and enqueues the next, with the pacing delay handed to
+Celery as a `countdown` rather than slept inside the job. The last turn of a scenario rolls
+that scenario up, the last of a platform rolls the platform up, and the last of the run
+rolls the run up. The broker is the app's own Postgres (kombu's SQLAlchemy transport — no
+extra service); there is no Celery result backend, so clients track progress by polling
+`GET /api/v1/evaluations/{run_id}`, which reads `BenchmarkRun.status`.
+
+Why one turn per job: a killed worker loses one turn's work instead of the whole run. Every
+unit is skippable on re-delivery — a turn that already has a `turn_score`, or whose
+`retrieved_documents` are already populated, is left alone — so a re-delivered job resumes
+forward rather than restarting. `Turn.attempts` bounds how often a turn that keeps killing
+its worker is retried (`core.runner.MAX_TURN_ATTEMPTS`); past the cap it is abandoned with
+no score and the chain moves on. A duplicate delivery cannot run alongside the live chain:
+each job takes a run-scoped Postgres advisory lock first.
 
 Run status lifecycle: `ingerido` (persisted, not started) → `en_cola` (queued, after
-`/start`) → `en_recuperacion` (a worker is retrieving the turns' source documents) →
-`en_proceso` (a worker is scoring) → `completado` | `parcial` | `fallido` (terminal rollup;
-`fallido` also marks a run whose retrieval or scoring raised).
+`/start`) → `en_proceso` (a worker is retrieving and scoring the run's turns) →
+`completado` | `parcial` | `fallido` (terminal rollup; `fallido` also marks a run whose
+retrieval or scoring raised). `en_recuperacion` belongs to the in-process
+`services.scoring.run_evaluation` path, which retrieves the whole run as its own phase; the
+worker retrieves each turn inside `en_proceso`.
 
 ## `GET /health`
 
@@ -146,20 +161,27 @@ On the request (`ingest_evaluation`):
    `POST /api/v1/evaluations/{run_id}/start`.
 
 After `POST /api/v1/evaluations/{run_id}/start` flips the run to `en_cola` and enqueues the
-pipeline job (carrying just the `run_id`), the worker (`run_pipeline_task`, off the
-request path) processes **only the selected turns**:
+chain (carrying just the `run_id`), the worker processes **only the selected turns**, one
+job per turn, off the request path:
 
-4. **Retrieval** (`retrieve_run`): mark the run `en_recuperacion` and run the retrieval
-   pipeline over each **selected** turn's `retrieved_context_source`, populating
-   `retrieved_documents` (best-effort; commits **per scenario**). Unselected turns are
-   skipped (no retrieval work).
-5. **Scoring** (`score_run`): mark the run `en_proceso` and score with
-   `EvalRunner.run_benchmark` (one `MetricScore` per metric per **selected** turn, reading
-   the just-retrieved context), rolling scores up to scenario, platform, and run level. The
-   runner also commits **per scenario**, so partial progress survives an interruption.
-   Unselected turns are never scored (their `turn_score` stays `null`) but still feed the
-   conversation history the judge sees.
-6. Roll the run status up to `completado` / `parcial` / `fallido` and commit.
+4. **Start** (`run_chain_task` → `chain.start_chain`): mark the run `en_proceso` and pin
+   its prompt versions — both once, for the whole run, so an edit published mid-run cannot
+   split its rollups across two rubrics, and a slot with no active version fails before any
+   judge call. Then enqueue the run's first selected turn. A run with no selected turns is
+   finalized here and nothing is enqueued.
+5. **One turn** (`score_turn_task` → `chain.advance_chain`), repeated down the chain:
+   run the retrieval pipeline over that turn's `retrieved_context_source` into
+   `retrieved_documents` (best-effort, skipped if already populated), then score it with
+   `EvalRunner.run_turn` — one `MetricScore` per metric, reading the context this same job
+   just fetched — and write its `turn_score`. The conversation history the judge sees is
+   rebuilt from the stored scenario, so unselected turns still feed it even though they are
+   never scored (their `turn_score` stays `null`). Then enqueue the next turn, after the
+   pacing delay.
+6. **Roll-ups**, at the boundaries the chain crosses: the last selected turn of a scenario
+   writes its `average_score` / `status`, the last of a platform writes its `average_score`
+   and `finished_at`, and the last of the run rolls the status up to `completado` /
+   `parcial` / `fallido`. Scenarios with no selected turns are finalized in that last step,
+   since the chain never visits them.
 
 > **Prerequisites.** The database schema must already exist (`alembic upgrade head`)
 > and the configured judge must have a valid API key (see `scorekeeper.config.settings`). The
@@ -288,8 +310,9 @@ is frozen.
 ## `POST /api/v1/evaluations/{run_id}/start`
 
 Start scoring a previously-ingested run — the explicit trigger decoupled from
-ingestion. Flips the run from `ingerido` to `en_cola` and enqueues the Celery pipeline
-(retrieval + LLM scoring). This is the only way a run moves past `ingerido`. Only the
+ingestion. Flips the run from `ingerido` to `en_cola` and enqueues the Celery chain,
+which retrieves and scores one turn per job. This is the only way a run moves past
+`ingerido`. Only the
 turns selected via `PATCH /api/v1/evaluations/{run_id}/turns/selection` are retrieved and scored;
 if none were selected, the run completes without producing any scores.
 
@@ -314,7 +337,7 @@ Poll `GET /api/v1/evaluations/{run_id}` for progress and results.
 ## `GET /api/v1/evaluations/{run_id}`
 
 Poll a run's current status and summary. Read the `status` to know where the run
-is in its lifecycle (`ingerido → en_cola → en_recuperacion → en_proceso →
+is in its lifecycle (`ingerido → en_cola → en_proceso →
 completado|parcial|fallido`). A freshly ingested run stays at `ingerido` until
 `POST /api/v1/evaluations/{run_id}/start` is called.
 
@@ -334,8 +357,7 @@ completado|parcial|fallido`). A freshly ingested run stays at `ingerido` until
 
 - `status` — run lifecycle / rollup. `completado` (all scenarios scored), `parcial`
   (some failed), `fallido` (none scored or the retrieval/scoring job errored); `ingerido`
-  before `/start`, then `en_cola` / `en_recuperacion` / `en_proceso` while queued,
-  retrieving, or scoring.
+  before `/start`, then `en_cola` / `en_proceso` while queued or being scored.
 - `progress` — **turn-level** progress: `done` of `total` turns scored, with
   `ratio` = `done / total` (0.0–1.0) for a progress bar. A turn counts as done once
   its `turn_score` is set. The ratio climbs live while `en_proceso`; on
@@ -1174,7 +1196,9 @@ dedicated broker (e.g. Redis) instead of Postgres.
   (`PromptSlot`, `safe_format`, `validate_template` — the publish gate); each metric's slots live
   on its class in `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/`
 - Celery app & tasks — `scorekeeper-engine/src/scorekeeper/celery_app.py`, `scorekeeper-engine/src/scorekeeper/tasks.py`
-  (`run_pipeline_task` = retrieval then scoring; `enqueue_run`)
+  (`run_chain_task` starts a run, `score_turn_task` does one turn; `enqueue_run` /
+  `enqueue_turn`); the chain itself — `scorekeeper-engine/src/scorekeeper/core/services/chain.py`
+  (`start_chain`, `advance_chain`)
 - Parsing & message normalization — `scorekeeper-engine/src/scorekeeper/core/importer.py`
   (`parse_conversation`, `normalize_messages`)
 - Browser capture client — `extension/` (see its [README](../extension/README.md))

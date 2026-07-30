@@ -45,6 +45,26 @@ async def active_versions_for(
     return {(name, slug): version for name, slug, version in await session.execute(stmt)}
 
 
+async def bound_versions_for_run(
+    session: AsyncSession, run_id: uuid.UUID
+) -> dict[tuple[str, str], PromptVersion]:
+    """The versions ``run_id`` was pinned to, keyed like :func:`active_versions_for`.
+
+    The read side of :func:`replace_run_bindings`. Same ``(metric name, slug)`` key so a
+    caller resuming a run can substitute these for the active ones without caring which
+    it got — which is what stops a prompt published mid-run from re-pinning it.
+    Empty when the run has no bindings yet.
+    """
+    stmt = (
+        select(MetricDefinition.name, Prompt.slug, PromptVersion)
+        .join(Prompt, Prompt.metric_id == MetricDefinition.id)
+        .join(PromptVersion, PromptVersion.prompt_id == Prompt.id)
+        .join(RunPromptBinding, RunPromptBinding.prompt_version_id == PromptVersion.id)
+        .where(RunPromptBinding.run_id == run_id)
+    )
+    return {(name, slug): version for name, slug, version in await session.execute(stmt)}
+
+
 async def replace_run_bindings(
     session: AsyncSession, run_id: uuid.UUID, version_ids: Iterable[uuid.UUID]
 ) -> None:
