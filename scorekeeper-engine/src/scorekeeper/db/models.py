@@ -191,6 +191,13 @@ class Turn(Base):
     expected_output: Mapped[str | None] = mapped_column(Text, default=None)
     response_time_ms: Mapped[int | None] = mapped_column(Integer, default=None)
     turn_score: Mapped[float | None] = mapped_column(Float, default=None)
+    # How many times a worker has *begun* work on this turn (retrieval or scoring).
+    # Monotonic — never reset, so it doubles as an audit trail. A turn that reaches
+    # ``core.runner.MAX_TURN_ATTEMPTS`` is abandoned instead of retried forever, which
+    # is what stops a turn that kills its worker from blocking the run indefinitely.
+    attempts: Mapped[int] = mapped_column(
+        Integer, default=0, server_default="0", nullable=False
+    )
     # Raw ``retrieved_context`` cell (ranked source references) captured at ingest; the
     # retrieval pipeline (scorekeeper.core.retrieval) parses/fetches/extracts it into the
     # ``retrieved_documents`` child rows. None = the sheet had no context column.

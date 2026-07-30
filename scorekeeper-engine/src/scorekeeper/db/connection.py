@@ -6,9 +6,11 @@ Kept apart from :mod:`scorekeeper.db.models` so that importing the models — as
 
 from __future__ import annotations
 
+import uuid
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     async_sessionmaker,
@@ -43,6 +45,43 @@ async def session_scope(
         yield db
     finally:
         await db.close()
+
+
+@asynccontextmanager
+async def run_lock(session: AsyncSession, run_key: uuid.UUID) -> AsyncGenerator[bool]:
+    """Hold a run-scoped advisory lock for the block; yield whether it was acquired.
+
+    Single-flight for a run's chained per-turn jobs (``core.services.chain``): a duplicate
+    delivery must never judge the same turn as the live chain. A caller that gets ``False``
+    drops its delivery — the chain that holds the lock owns the work.
+
+    Two deliberate choices, both about *when* the lock is released:
+
+    * a **session-level** lock, not ``pg_try_advisory_xact_lock`` — a turn job commits
+      several times, and a transaction-scoped lock would be dropped at the first commit;
+    * its **own connection**, not the session's — an ``AsyncSession`` returns its
+      connection to the pool on every commit, which would take the lock with it.
+
+    Outside PostgreSQL there are no advisory locks, so this yields ``True`` and opens no
+    connection at all. That is not just a convenience for the SQLite test suite: those
+    tests share a single DBAPI connection through a ``StaticPool``, so opening a second
+    one here would deadlock rather than degrade.
+    """
+    bind = session.bind
+    if bind is None or bind.dialect.name != "postgresql":
+        yield True
+        return
+    # Postgres advisory keys are signed 64-bit; take the UUID's first 8 bytes.
+    key = int.from_bytes(run_key.bytes[:8], "big", signed=True)
+    async with bind.connect() as conn:
+        acquired = bool(
+            (await conn.execute(select(func.pg_try_advisory_lock(key)))).scalar_one()
+        )
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                await conn.execute(select(func.pg_advisory_unlock(key)))
 
 
 async def create_schema() -> None:

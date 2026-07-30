@@ -20,6 +20,7 @@ from sqlalchemy.ext.asyncio import (
 from sqlalchemy.pool import StaticPool
 
 from scorekeeper.db.models import Base, MetricDefinition, UseCase, UseCaseMetric
+from scorekeeper.core import runner
 from scorekeeper.core.runner import EvalRunner
 
 
@@ -96,8 +97,9 @@ def compose_use_case(session: AsyncSession):
     return _compose
 
 
-#: The genuine pacing method, captured before ``_no_turn_delay`` ever patches it.
+#: The genuine pacing seams, captured before ``_no_turn_delay`` ever patches them.
 _REAL_PACE_BETWEEN_TURNS = EvalRunner._pace_between_turns
+_REAL_TURN_DELAY_SECONDS = runner.turn_delay_seconds
 
 
 @pytest.fixture(autouse=True)
@@ -107,12 +109,18 @@ def _no_turn_delay(monkeypatch) -> None:
     Patches the method rather than ``asyncio.sleep`` — ``scorekeeper.core.runner.asyncio`` is
     the global asyncio module, so patching ``.sleep`` on it would also patch it for
     pytest-asyncio's own machinery.
+
+    Both seams are neutralized, because the two execution models pace differently: the
+    in-process runner *sleeps* the delay, while the chained per-turn jobs *return* it as
+    a Celery countdown. Left unpatched, the latter would hand back a real random interval
+    and any assertion on it would be flaky.
     """
 
     async def _instant(self: EvalRunner) -> None:
         return None
 
     monkeypatch.setattr(EvalRunner, "_pace_between_turns", _instant)
+    monkeypatch.setattr(runner, "turn_delay_seconds", lambda: 0.0)
 
 
 @pytest.fixture
@@ -127,6 +135,7 @@ def real_turn_pacing(monkeypatch) -> list[float]:
     async def _record(seconds: float) -> None:
         slept.append(seconds)
 
+    monkeypatch.setattr(runner, "turn_delay_seconds", _REAL_TURN_DELAY_SECONDS)
     monkeypatch.setattr(EvalRunner, "_pace_between_turns", _REAL_PACE_BETWEEN_TURNS)
     monkeypatch.setattr("asyncio.sleep", _record)
     return slept

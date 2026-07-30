@@ -10,9 +10,7 @@ from openpyxl import Workbook
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from scorekeeper import tasks
 from scorekeeper.db.models import BenchmarkRun, Turn
-from scorekeeper.core.services import retrieval, scoring
 from scorekeeper.core.services import runs as run_service
 from scorekeeper.core.services.ingestion import UploadedFile, ingest_evaluation
 from scorekeeper.core.services.retrieval import retrieve_run
@@ -26,7 +24,7 @@ from scorekeeper.core.retrieval.types import (
     SourceFormat,
     SourceRef,
 )
-from scorekeeper.core.runner import STATUS_FALLIDO
+from scorekeeper.core.runner import MAX_TURN_ATTEMPTS, STATUS_FALLIDO
 
 
 class _FakePipeline:
@@ -141,12 +139,43 @@ async def test_retrieve_run_hard_failure_marks_fallido(session: AsyncSession) ->
     assert run.status == STATUS_FALLIDO
 
 
-async def test_retrieve_run_is_idempotent(session: AsyncSession) -> None:
+async def test_retrieve_run_skips_turns_already_retrieved(session: AsyncSession) -> None:
+    # Resume-forward: a turn that already carries documents is left alone, so a
+    # re-delivery does not re-fetch the whole run.
     run_id = await _ingest_one_turn_with_context(session, "algo")
     await retrieve_run(run_id, session=session, pipeline=_FakePipeline())
-    await retrieve_run(run_id, session=session, pipeline=_FakePipeline())  # re-run
+
+    second = _FakePipeline()
+    await retrieve_run(run_id, session=session, pipeline=second)
+
+    assert second.calls == []  # the pipeline was never asked to resolve anything
     turn = (await session.execute(select(Turn))).scalars().one()
-    assert len(turn.retrieved_documents) == 1  # cleared + repopulated, not doubled
+    assert len(turn.retrieved_documents) == 1
+    assert turn.attempts == 1  # and the skipped visit burned no attempt
+
+
+async def test_retrieve_run_counts_an_attempt_per_turn(session: AsyncSession) -> None:
+    run_id = await _ingest_one_turn_with_context(session, "algo")
+
+    await retrieve_run(run_id, session=session, pipeline=_FakePipeline())
+
+    turn = (await session.execute(select(Turn))).scalars().one()
+    assert turn.attempts == 1
+
+
+async def test_retrieve_run_abandons_a_turn_at_the_attempt_cap(session: AsyncSession) -> None:
+    # A turn that keeps killing its worker during retrieval is dropped, not retried forever.
+    run_id = await _ingest_one_turn_with_context(session, "algo")
+    turn = (await session.execute(select(Turn))).scalars().one()
+    turn.attempts = MAX_TURN_ATTEMPTS
+    await session.commit()
+    pipeline = _FakePipeline()
+
+    await retrieve_run(run_id, session=session, pipeline=pipeline)
+
+    assert pipeline.calls == []
+    assert turn.retrieved_documents == []
+    assert turn.attempts == MAX_TURN_ATTEMPTS  # not bumped past the cap
 
 
 # -- cache cleanup -------------------------------------------------------------------------
@@ -204,32 +233,5 @@ async def test_retrieve_run_survives_a_cache_cleanup_failure(session: AsyncSessi
     assert run.status == STATUS_EN_RECUPERACION
 
 
-# -- Celery wiring -------------------------------------------------------------------------
-
-
-def test_run_pipeline_task_runs_retrieval_before_scoring(monkeypatch) -> None:
-    # Deliberately a *sync* test: the Celery task is sync and drives the async pipeline
-    # through its own asyncio.run(), which cannot nest inside a running event loop.
-    order: list[str] = []
-
-    async def _retrieve(rid: str) -> None:
-        order.append("retrieve")
-
-    async def _score(rid: str) -> None:
-        order.append("score")
-
-    monkeypatch.setattr(retrieval, "retrieve_run", _retrieve)
-    monkeypatch.setattr(scoring, "score_run", _score)
-
-    tasks.run_pipeline_task("run-123")
-
-    assert order == ["retrieve", "score"]
-
-
-def test_enqueue_run_delegates_to_task(monkeypatch) -> None:
-    captured: dict[str, str] = {}
-    monkeypatch.setattr(tasks.run_pipeline_task, "delay", lambda rid: captured.update(id=rid))
-
-    tasks.enqueue_run("run-abc")
-
-    assert captured == {"id": "run-abc"}
+# The Celery wiring is exercised in tests/test_tasks.py — retrieval no longer owns a task
+# of its own now that a run is a chain of per-turn jobs.

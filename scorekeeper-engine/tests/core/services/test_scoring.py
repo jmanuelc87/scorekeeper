@@ -352,20 +352,60 @@ async def test_score_run_binds_the_versions_it_scored_under(
     assert {str(b.run_id) for b in bindings} == {run_id}
 
 
-async def test_rescoring_replaces_bindings_rather_than_duplicating(
+async def test_rescoring_reuses_the_pinned_bindings(
     session: AsyncSession, registry_with_prompt
 ) -> None:
-    """``uq_run_prompt_binding`` would reject a blind re-insert; re-scoring is supported."""
+    """A run is pinned once. A version published mid-run must not re-pin it.
+
+    Pinning exists so one run's rollups come from one rubric. A re-delivery (or a
+    per-turn job) re-enters ``_pin_prompts``, so if that re-resolved the *active*
+    versions, an edit landing mid-run would split the run across two rubrics —
+    precisely what the pin is for.
+    """
     run_id = await _ingest_selected(session)
     await _publish(session)
     await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+    pinned = (await session.execute(select(RunPromptBinding))).scalars().one()
 
-    await score_run(run_id, session=session, judge=RecordingJudge(0.6))
+    # A newer version goes live while the run is under way.
+    for version in (await session.execute(select(PromptVersion))).scalars().all():
+        version.is_active = False
+    for prompt in (await session.execute(select(Prompt))).scalars().all():
+        session.add(
+            PromptVersion(
+                prompt_id=prompt.id,
+                version=2,
+                template="NUEVA {claim}",
+                status="published",
+                is_active=True,
+            )
+        )
+    await session.commit()
+
+    judge = RecordingJudge(0.6)
+    seen: list[str] = []
+    original = judge.score
+
+    def _record(*, rubric, turn, scale, rubric_version=None, step=None):
+        seen.append(rubric)
+        return original(rubric=rubric, turn=turn, scale=scale, rubric_version=rubric_version)
+
+    judge.score = _record
+    # Re-open the turns so the re-run actually judges rather than resuming forward.
+    for turn in (await session.execute(select(Turn))).scalars().all():
+        turn.turn_score = None
+        turn.attempts = 0
+    await session.commit()
+
+    await score_run(run_id, session=session, judge=judge)
 
     count = (
         await session.execute(select(func.count()).select_from(RunPromptBinding))
     ).scalar_one()
     assert count == 1
+    binding = (await session.execute(select(RunPromptBinding))).scalars().one()
+    assert binding.prompt_version_id == pinned.prompt_version_id  # still v1
+    assert seen and not any("NUEVA" in rubric for rubric in seen)
 
 
 async def test_score_run_injects_the_stored_template(

@@ -8,7 +8,7 @@ skip-on-error, roll-up, history wiring, idempotency — is asserted directly.
 from __future__ import annotations
 
 import threading
-from typing import ClassVar
+from typing import ClassVar, NamedTuple
 
 import pytest
 from sqlalchemy import func, select
@@ -41,10 +41,12 @@ from scorekeeper.core.metrics.judges.base import record_usage
 from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.core.metrics.scale import Unit
 from scorekeeper.core.runner import (
+    MAX_TURN_ATTEMPTS,
     STATUS_COMPLETADO,
     STATUS_FALLIDO,
     STATUS_PARCIAL,
     EvalRunner,
+    turn_delay_seconds,
 )
 
 USE_CASE = "soporte"
@@ -427,20 +429,104 @@ async def test_run_platform_rolls_up_average(session: AsyncSession, registry) ->
     assert platform_exec.finished_at is not None
 
 
-async def test_rescoring_is_idempotent(session: AsyncSession, registry) -> None:
+async def test_rescoring_skips_already_scored_turns(session: AsyncSession, registry) -> None:
+    # Resume-forward: the second pass is a no-op, not a re-score. This is what makes a
+    # re-delivered job cost at most the turn that was in flight.
     await _select_metrics(session, ["utilidad", "correccion"])
     _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
-    runner = EvalRunner(session, RecordingJudge())
+    judge = RecordingJudge()
+    runner = EvalRunner(session, judge)
 
     await runner.run_scenario(scenario)
     await session.commit()
     count_1 = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
+    judge.seen_turns.clear()
 
     await runner.run_scenario(scenario)
     await session.commit()
     count_2 = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
 
+    assert judge.seen_turns == []  # no judge call at all on the second pass
     assert count_1 == count_2 == 2
+    turn = scenario.turns[0]
+    assert turn.attempts == 1  # and no attempt burned re-visiting it
+
+
+async def test_clearing_turn_score_rescores(session: AsyncSession, registry) -> None:
+    # The escape hatch behind resume-forward: dropping the score is what re-opens a turn.
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    judge = RecordingJudge()
+    runner = EvalRunner(session, judge)
+
+    await runner.run_scenario(scenario)
+    await session.commit()
+    judge.seen_turns.clear()
+
+    scenario.turns[0].turn_score = None
+    await runner.run_scenario(scenario)
+    await session.commit()
+
+    assert [turn.prompt for turn in judge.seen_turns] == ["hola"]
+    assert scenario.turns[0].attempts == 2
+
+
+async def test_scenario_average_includes_previously_scored_turns(
+    session: AsyncSession, registry
+) -> None:
+    # A skipped turn must still weigh on the roll-up, or resuming would silently drop it.
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d")])
+    scenario.turns[0].turn_score = 0.2
+    await session.commit()
+
+    await EvalRunner(session, RecordingJudge(score_value=0.8)).run_scenario(scenario)
+
+    assert scenario.turns[0].turn_score == pytest.approx(0.2)  # untouched
+    assert scenario.average_score == pytest.approx(0.5)  # mean of 0.2 and 0.8
+
+
+async def test_run_turn_counts_an_attempt(session: AsyncSession, registry) -> None:
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+
+    await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
+
+    assert scenario.turns[0].attempts == 1
+
+
+async def test_run_turn_abandons_a_turn_at_the_attempt_cap(
+    session: AsyncSession, registry
+) -> None:
+    # A turn that keeps killing its worker is dropped rather than retried forever.
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    scenario.turns[0].attempts = MAX_TURN_ATTEMPTS
+    await session.commit()
+    judge = RecordingJudge()
+
+    await EvalRunner(session, judge).run_scenario(scenario)
+
+    assert judge.seen_turns == []
+    assert scenario.turns[0].turn_score is None
+    assert scenario.turns[0].attempts == MAX_TURN_ATTEMPTS  # not bumped past the cap
+    assert scenario.status == STATUS_FALLIDO  # nothing scored in this scenario
+
+
+async def test_no_pause_before_the_first_turn_of_a_resumed_scenario(
+    session: AsyncSession, registry, real_turn_pacing
+) -> None:
+    # Pacing spreads out judge calls, so it must follow one — a resumed scenario whose
+    # first turns are skipped has made no call to spread out.
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d")])
+    scenario.turns[0].turn_score = 0.5
+    await session.commit()
+    slept = real_turn_pacing
+
+    await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
+
+    assert slept == []
 
 
 async def test_delay_paced_between_consecutive_turns(
@@ -459,17 +545,53 @@ async def test_delay_paced_between_consecutive_turns(
 
 
 async def test_delay_disabled_when_max_non_positive(
-    session: AsyncSession, registry, real_turn_pacing
+    session: AsyncSession, registry, real_turn_pacing, monkeypatch
 ) -> None:
     await _select_metrics(session, ["utilidad"])
     _, _, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d")])
     slept = real_turn_pacing
+    monkeypatch.setattr(
+        "scorekeeper.core.runner.get_settings",
+        lambda: _DelaySettings(min_seconds=1.0, max_seconds=0.0),
+    )
 
-    runner = EvalRunner(session, RecordingJudge())
-    runner._turn_delay_max = 0.0
-    await runner.run_scenario(scenario)
+    await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
 
     assert slept == []
+
+
+class _DelaySettings(NamedTuple):
+    """Just the two fields ``turn_delay_seconds`` reads off ``Settings``."""
+
+    min_seconds: float
+    max_seconds: float
+
+    @property
+    def turn_delay_min_seconds(self) -> float:
+        return self.min_seconds
+
+    @property
+    def turn_delay_max_seconds(self) -> float:
+        return self.max_seconds
+
+
+def test_turn_delay_seconds_is_zero_when_disabled(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scorekeeper.core.runner.get_settings",
+        lambda: _DelaySettings(min_seconds=1.0, max_seconds=0.0),
+    )
+    assert turn_delay_seconds() == 0.0
+
+
+def test_turn_delay_seconds_draws_from_the_configured_window(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "scorekeeper.core.runner.get_settings",
+        lambda: _DelaySettings(min_seconds=2.0, max_seconds=5.0),
+    )
+    monkeypatch.setattr(
+        "scorekeeper.core.runner.random.uniform", lambda low, high: (low, high)
+    )
+    assert turn_delay_seconds() == (2.0, 5.0)
 
 
 class _BarrierMetric(_JudgeMetric):

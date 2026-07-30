@@ -170,6 +170,43 @@ async def active_templates(
         return {}
 
     stored = await prompt_repo.active_versions_for(session, names)
+    return _resolve_slots(stored, names)
+
+
+async def bound_templates(
+    session: AsyncSession, run_id: uuid.UUID, metric_names: Iterable[str]
+) -> dict[str, dict[str, PromptVersion]] | None:
+    """The versions ``run_id`` is already pinned to, or ``None`` when it has none yet.
+
+    The resume counterpart of :func:`active_templates`. A run is pinned once, at the
+    start; every later delivery reads the pinning back through here instead of resolving
+    the *active* versions again, so a prompt published mid-run cannot split one run's
+    rollups across two rubrics.
+
+    Validated through the same :func:`_resolve_slots` as the active path, and for the
+    same reason: a deploy that adds a slot to a metric mid-run would otherwise hand it a
+    partial template map, and the failure would surface inside a judge worker thread
+    where skip-metric-continue swallows it.
+    """
+    names = sorted(set(metric_names))
+    if not names:
+        return None
+
+    stored = await prompt_repo.bound_versions_for_run(session, run_id)
+    if not stored:
+        return None
+    return _resolve_slots(stored, names)
+
+
+def _resolve_slots(
+    stored: Mapping[tuple[str, str], PromptVersion], names: list[str]
+) -> dict[str, dict[str, PromptVersion]]:
+    """Group ``(metric, slug) -> version`` by metric, checking every declared slot is there.
+
+    Raises :class:`MissingPromptError` listing **every** unsatisfied slot at once, rather
+    than dying on the first: a fresh deployment that forgot to migrate wants one message
+    naming all of them.
+    """
     resolved: dict[str, dict[str, PromptVersion]] = {}
     missing: list[str] = []
     for name in names:
@@ -195,9 +232,10 @@ async def resolve(
     """Instantiate the metrics linked to ``use_case_id``, with their prompts bound.
 
     ``templates`` is the map :func:`active_templates` returns. Passing it in is how a
-    whole run is pinned to one set of versions — resolved once in ``score_run`` so an
-    edit landing mid-job cannot split a run's rollups across two rubrics. Omitted, this
-    resolves per call, which is fine for a caller scoring nothing.
+    whole run is pinned to one set of versions — resolved once when the run starts so an
+    edit landing mid-run cannot split its rollups across two rubrics. A per-turn job
+    reads that pinning back with :func:`bound_templates`. Omitted, this resolves per
+    call, which is fine for a caller scoring nothing.
 
     Raises ``KeyError`` (Spanish message) if a stored metric name is not in the code
     registry, and :class:`MissingPromptError` if a declared slot has no active version.
