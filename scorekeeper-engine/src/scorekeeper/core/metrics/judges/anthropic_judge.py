@@ -77,7 +77,10 @@ class AnthropicJudge:
         if client is None:
             import anthropic  # lazy: only needed when building a real client
 
-            client = anthropic.Anthropic(api_key=api_key)
+            # max_retries=0: retrying is owned by ``judge_call``, which backs off with
+            # jitter and honors Retry-After. Leaving the SDK's own retries on would
+            # multiply the two budgets and make the total wait impossible to reason about.
+            client = anthropic.Anthropic(api_key=api_key, max_retries=0)
         self._client: Any = client
 
     def _owns(self, model: str) -> bool:
@@ -135,15 +138,19 @@ class AnthropicJudge:
         spec = scale_spec(scale)
         model = self._resolve(step, model)
         content = f"{render_prompt(rubric, turn)}\n\n{spec.instruction_es}"
-        with judge_call(provider=PROVIDER, model=model, action="la puntuación"):
-            message = self._client.messages.parse(
+        message = judge_call(
+            lambda: self._client.messages.parse(
                 model=model,
                 max_tokens=self.max_tokens,
                 **self._thinking_kwargs(model),
                 system=self.system_prompt,
                 messages=[{"role": "user", "content": content}],
                 output_format=_ScoreResponse,
-            )
+            ),
+            provider=PROVIDER,
+            model=model,
+            action="la puntuación",
+        )
         # Recorded before the parse check: the tokens were spent even if the model
         # refused or returned output that does not satisfy the schema.
         self._record_usage(message)
@@ -169,8 +176,8 @@ class AnthropicJudge:
         model: str | None = None,
     ) -> T:
         model = self._resolve(step, model)
-        with judge_call(provider=PROVIDER, model=model, action="la extracción"):
-            message = self._client.messages.parse(
+        message = judge_call(
+            lambda: self._client.messages.parse(
                 model=model,
                 max_tokens=self.max_tokens,
                 **self._thinking_kwargs(model),
@@ -179,7 +186,11 @@ class AnthropicJudge:
                     {"role": "user", "content": render_prompt(instruction, turn)}
                 ],
                 output_format=schema,
-            )
+            ),
+            provider=PROVIDER,
+            model=model,
+            action="la extracción",
+        )
         self._record_usage(message)
         return require_parsed(
             message.parsed_output,

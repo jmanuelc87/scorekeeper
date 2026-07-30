@@ -23,9 +23,11 @@ from scorekeeper.core.metrics.judges import (
     OpenAIJudge,
     make_judge,
 )
+from scorekeeper.core.metrics.judges import base as judges_base
 from scorekeeper.core.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
     JudgeError,
+    RetryPolicy,
     StepModels,
     UsageAccumulator,
     _ScoreResponse,
@@ -46,22 +48,54 @@ class Claims(BaseModel):
 # --- Fake SDK clients ---------------------------------------------------------
 
 
+class _FailureScript:
+    """What a fake client raises on successive calls.
+
+    A single exception raises on *every* call. A list is consumed one entry per call,
+    where ``None`` means "this call succeeds" — which is how a test expresses "throttled
+    twice, then fine" and so can observe ``judge_call`` retrying.
+    """
+
+    def __init__(self, raises: Exception | list[Exception | None] | None) -> None:
+        self._raises = raises
+
+    def check(self) -> None:
+        if isinstance(self._raises, list):
+            failure = self._raises.pop(0) if self._raises else None
+        else:
+            failure = self._raises
+        if failure is not None:
+            raise failure
+
+
+def throttled(status: int = 429, retry_after: str | None = None) -> Exception:
+    """An SDK-shaped capacity error: a ``status_code``, plus ``Retry-After`` when given.
+
+    Hand-rolled rather than imported from a provider SDK, matching the rest of these
+    fakes — ``judge_call`` classifies by duck-typed ``status_code``, not by SDK class.
+    """
+    exc = RuntimeError(f"HTTP {status}")
+    exc.status_code = status  # type: ignore[attr-defined]
+    if retry_after is not None:
+        exc.response = SimpleNamespace(headers={"retry-after": retry_after})  # type: ignore[attr-defined]
+    return exc
+
+
 class FakeAnthropicMessages:
     def __init__(
         self,
         parsed: object,
-        raises: Exception | None = None,
+        raises: Exception | list[Exception | None] | None = None,
         usage: object | None = None,
     ) -> None:
         self._parsed = parsed
-        self._raises = raises
+        self._failures = _FailureScript(raises)
         self._usage = usage
         self.calls: list[dict] = []
 
     def parse(self, **kwargs):
         self.calls.append(kwargs)
-        if self._raises is not None:
-            raise self._raises
+        self._failures.check()
         attrs: dict[str, object] = {"parsed_output": self._parsed}
         # Only attach `usage` when configured, so tests that omit it exercise the
         # getattr-safe path (no usage recorded).
@@ -74,7 +108,7 @@ class FakeAnthropicClient:
     def __init__(
         self,
         parsed: object,
-        raises: Exception | None = None,
+        raises: Exception | list[Exception | None] | None = None,
         usage: object | None = None,
     ) -> None:
         self.messages = FakeAnthropicMessages(parsed, raises, usage)
@@ -86,14 +120,17 @@ class FakeCompletions:
         parsed: object,
         refusal: str | None = None,
         usage: object | None = None,
+        raises: Exception | list[Exception | None] | None = None,
     ) -> None:
         self._parsed = parsed
         self._refusal = refusal
         self._usage = usage
+        self._failures = _FailureScript(raises)
         self.calls: list[dict] = []
 
     def parse(self, **kwargs):
         self.calls.append(kwargs)
+        self._failures.check()
         message = type("Msg", (), {"parsed": self._parsed, "refusal": self._refusal})()
         choice = type("Choice", (), {"message": message})()
         attrs: dict[str, object] = {"choices": [choice]}
@@ -103,13 +140,20 @@ class FakeCompletions:
 
 
 class FakeEmbeddings:
-    def __init__(self, vectors: list[list[float]], usage: object | None = None) -> None:
+    def __init__(
+        self,
+        vectors: list[list[float]],
+        usage: object | None = None,
+        raises: Exception | list[Exception | None] | None = None,
+    ) -> None:
         self._vectors = vectors
         self._usage = usage
+        self._failures = _FailureScript(raises)
         self.calls: list[dict] = []
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
+        self._failures.check()
         data = [type("Emb", (), {"embedding": v})() for v in self._vectors]
         attrs: dict[str, object] = {"data": data}
         if self._usage is not None:
@@ -130,9 +174,11 @@ class FakeOpenAIClient:
         refusal: str | None = None,
         usage: object | None = None,
         embed_usage: object | None = None,
+        raises: Exception | list[Exception | None] | None = None,
+        embed_raises: Exception | list[Exception | None] | None = None,
     ) -> None:
-        self.chat = FakeChat(FakeCompletions(parsed, refusal, usage))
-        self.embeddings = FakeEmbeddings(embeddings or [], embed_usage)
+        self.chat = FakeChat(FakeCompletions(parsed, refusal, usage, raises))
+        self.embeddings = FakeEmbeddings(embeddings or [], embed_usage, embed_raises)
 
 
 # --- base helpers -------------------------------------------------------------
@@ -763,3 +809,250 @@ def test_usage_not_recorded_outside_a_collect_scope(turn: TurnView) -> None:
     judge = AnthropicJudge(model="claude-opus-4-8", client=client)
     verdict = judge.score(rubric="r", turn=turn, scale=Likert())  # no collect_usage
     assert verdict.score == 2.0
+
+
+# --- Retry / backoff on provider throttling -----------------------------------
+# The between-turn pause is per-process, so it cannot bound the aggregate request rate
+# once a run spreads across workers and concurrent metrics. ``judge_call`` is the
+# reactive half: each call backs off from the throttling it personally sees.
+
+
+@pytest.fixture
+def backoff_waits(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record the backoff waits instead of sleeping, with jitter pinned to its ceiling.
+
+    Patching ``base._sleep`` (an indirection that exists for exactly this) keeps the real
+    ``time.sleep`` untouched, and pinning ``random.uniform`` to the top of the window
+    makes the exponential growth assertable.
+    """
+    waits: list[float] = []
+    monkeypatch.setattr(judges_base, "_sleep", waits.append)
+    monkeypatch.setattr(judges_base.random, "uniform", lambda low, high: high)
+    return waits
+
+
+@pytest.fixture
+def set_policy(monkeypatch: pytest.MonkeyPatch):
+    """Pin the retry policy, so these tests do not depend on ambient settings/.env."""
+
+    def _set(max_attempts: int, base_seconds: float = 1.0, max_seconds: float = 60.0) -> None:
+        policy = RetryPolicy(max_attempts, base_seconds, max_seconds)
+        monkeypatch.setattr(judges_base, "retry_policy", lambda: policy)
+
+    return _set
+
+
+def test_throttled_call_is_retried_then_succeeds(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    set_policy(max_attempts=3)
+    client = FakeAnthropicClient(
+        _ScoreResponse(score=4.0, justification="bien"),
+        raises=[throttled(429), None],  # throttled once, then fine
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    verdict = judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert verdict.score == 4.0
+    assert len(client.messages.calls) == 2  # the retry really re-issued the call
+    assert backoff_waits == [1.0]
+
+
+def test_retries_are_exhausted_and_the_failure_is_wrapped(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    set_policy(max_attempts=4)
+    client = FakeAnthropicClient(None, raises=throttled(429))  # throttled forever
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError) as exc_info:
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert len(client.messages.calls) == 4  # max_attempts counts the first try
+    assert backoff_waits == [1.0, 2.0, 4.0]  # exponential, one wait per retry
+    assert "claude-opus-4-8" in str(exc_info.value)
+    assert exc_info.value.__cause__ is not None
+
+
+def test_backoff_is_clamped_to_the_configured_ceiling(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    # Without a ceiling the window doubles without bound and one judge call could hold
+    # its worker thread for hours.
+    set_policy(max_attempts=5, base_seconds=1.0, max_seconds=3.0)
+    client = FakeAnthropicClient(None, raises=throttled(429))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError):
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert backoff_waits == [1.0, 2.0, 3.0, 3.0]
+
+
+@pytest.mark.parametrize("status", [429, 503, 529])
+def test_every_capacity_status_is_retried(
+    turn: TurnView, backoff_waits: list[float], set_policy, status: int
+) -> None:
+    # 429 rate limit, 503 unavailable, 529 Anthropic overloaded_error — same failure
+    # class, same correct response.
+    set_policy(max_attempts=2)
+    client = FakeAnthropicClient(
+        _ScoreResponse(score=1.0, justification="ok"), raises=[throttled(status), None]
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    assert judge.score(rubric="Evalúa", turn=turn, scale=Likert()).score == 1.0
+    assert len(client.messages.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        pytest.param(throttled(400), id="bad-request"),
+        pytest.param(throttled(401), id="auth"),
+        # Classification is by status_code, not message text: an unrelated error that
+        # merely mentions a rate limit must stay permanent.
+        pytest.param(RuntimeError("429 rate limit"), id="no-status-code"),
+    ],
+)
+def test_permanent_failures_are_not_retried(
+    turn: TurnView, backoff_waits: list[float], set_policy, failure: Exception
+) -> None:
+    set_policy(max_attempts=5)
+    client = FakeAnthropicClient(None, raises=failure)
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError):
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert len(client.messages.calls) == 1  # failed once, gave up
+    assert backoff_waits == []
+
+
+def test_retry_after_header_wins_over_computed_backoff(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    set_policy(max_attempts=2, base_seconds=1.0, max_seconds=60.0)
+    client = FakeAnthropicClient(
+        _ScoreResponse(score=3.0, justification="ok"),
+        raises=[throttled(429, retry_after="30"), None],
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert backoff_waits == [30.0]  # the provider's own number, not the 1.0 window
+
+
+def test_retry_after_is_clamped_to_the_configured_ceiling(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    set_policy(max_attempts=2, base_seconds=1.0, max_seconds=60.0)
+    client = FakeAnthropicClient(
+        _ScoreResponse(score=3.0, justification="ok"),
+        raises=[throttled(429, retry_after="900"), None],
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert backoff_waits == [60.0]
+
+
+def test_unparseable_retry_after_falls_back_to_computed_backoff(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    # Retry-After may be an HTTP-date rather than seconds; that must not blow up.
+    set_policy(max_attempts=2, base_seconds=1.0)
+    client = FakeAnthropicClient(
+        _ScoreResponse(score=3.0, justification="ok"),
+        raises=[throttled(429, retry_after="Wed, 21 Oct 2026 07:28:00 GMT"), None],
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert backoff_waits == [1.0]
+
+
+def test_a_single_attempt_disables_retrying(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    set_policy(max_attempts=1)
+    client = FakeAnthropicClient(None, raises=throttled(429))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError):
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert len(client.messages.calls) == 1
+    assert backoff_waits == []
+
+
+def test_openai_score_and_embed_share_the_retry_seam(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    # Both OpenAI entry points route through judge_call, so both retry (and LMStudioJudge
+    # inherits them unchanged).
+    set_policy(max_attempts=2)
+    client = FakeOpenAIClient(
+        _ScoreResponse(score=2.0, justification="ok"),
+        embeddings=[[1.0, 0.0]],
+        raises=[throttled(429), None],
+        embed_raises=[throttled(503), None],
+    )
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
+
+    assert judge.score(rubric="Evalúa", turn=turn, scale=Likert()).score == 2.0
+    assert judge.embed(texts=["a"]) == [[1.0, 0.0]]
+    assert len(client.chat.completions.calls) == 2
+    assert len(client.embeddings.calls) == 2
+
+
+def test_usage_is_recorded_once_from_the_successful_attempt(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    # A throttled attempt spends no tokens, and usage is read after judge_call returns —
+    # so a retried call must not double-count.
+    set_policy(max_attempts=3)
+    client = FakeAnthropicClient(
+        _ScoreResponse(score=2.0, justification="ok"),
+        raises=[throttled(429), None],
+        usage=SimpleNamespace(input_tokens=10, output_tokens=4),
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+    acc = UsageAccumulator()
+    with collect_usage(acc):
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    snap = acc.snapshot()
+    assert (snap.input_tokens, snap.output_tokens) == (10, 4)
+
+
+def test_retry_policy_reads_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        judges_base,
+        "get_settings",
+        lambda: Settings(
+            judge_retry_max_attempts=7,
+            judge_retry_base_seconds=2.5,
+            judge_retry_max_seconds=90.0,
+        ),
+    )
+    assert judges_base.retry_policy() == RetryPolicy(7, 2.5, 90.0)
+
+
+def test_retry_policy_clamps_nonsensical_settings(monkeypatch: pytest.MonkeyPatch) -> None:
+    # max_attempts < 1 would make judge_call skip the call entirely rather than disable
+    # retrying, and negative waits are meaningless.
+    monkeypatch.setattr(
+        judges_base,
+        "get_settings",
+        lambda: Settings(
+            judge_retry_max_attempts=0,
+            judge_retry_base_seconds=-1.0,
+            judge_retry_max_seconds=-1.0,
+        ),
+    )
+    assert judges_base.retry_policy() == RetryPolicy(1, 0.0, 0.0)

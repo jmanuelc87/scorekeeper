@@ -63,7 +63,9 @@ class LMStudioJudge(OpenAIJudge):
             import openai  # lazy: only needed when building a real client
 
             # LM Studio ignores the API key, but the SDK requires a non-empty one.
-            client = openai.OpenAI(base_url=base_url, api_key=api_key)
+            # max_retries=0 for the same reason as the cloud judges: ``judge_call`` owns
+            # retrying, so the SDK must not add a second, invisible budget on top.
+            client = openai.OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
         # No step_models: resolution is overridden below to always use ``model``, so
         # per-step routing would be a no-op.
         super().__init__(

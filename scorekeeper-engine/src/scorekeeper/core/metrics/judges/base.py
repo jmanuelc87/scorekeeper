@@ -10,16 +10,22 @@ Anthropic and OpenAI judges stay thin wrappers over their respective clients.
 from __future__ import annotations
 
 import contextvars
+import logging
+import random
 import threading
+import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
 from typing import NamedTuple, TypeVar
 
 from pydantic import BaseModel
 
+from scorekeeper.config.settings import get_settings
 from scorekeeper.core.metrics.base import TurnView
 from scorekeeper.core.metrics.judge import JudgeStep
 from scorekeeper.core.metrics.scale import Boolean, Likert, Scale, Unit
+
+logger = logging.getLogger(__name__)
 
 # Default system prompt for every judge call. Overridable per judge (constructor
 # arg) or globally (``Settings.judge_system_prompt``). All scoring output is Spanish.
@@ -164,24 +170,138 @@ class JudgeError(RuntimeError):
     """
 
 
-@contextmanager
-def judge_call(*, provider: str, model: str, action: str) -> Generator[None]:
-    """Wrap an SDK call so any failure names the provider, model, and step.
+# --- Retry on provider throttling ---------------------------------------------
+# The between-turn pause (``runner.turn_delay_seconds``) is open-loop and per-process:
+# it cannot bound the aggregate request rate once a run is spread across Celery workers,
+# and within one turn every metric fans out concurrently and each may issue many calls.
+# The only pacing that survives that is *reactive* — each caller backs off from the
+# throttling it personally sees, which needs no shared state. Full jitter is what keeps
+# concurrent callers from re-firing in lockstep.
 
-    A raw SDK/transport exception (auth, rate limit, network, 400 for a bad
-    parameter) otherwise propagates with no hint of *which* judge call failed.
-    Re-raises ``JudgeError`` untouched (already descriptive) and wraps everything
-    else, chaining the original via ``from`` so the traceback is preserved.
+# Statuses that mean "capacity, come back later": 429 rate limit, 503 service
+# unavailable, 529 Anthropic ``overloaded_error``. Everything else (auth, 400 for a bad
+# parameter, a schema refusal) is a permanent failure that a retry only makes slower.
+RETRYABLE_STATUSES = frozenset({429, 503, 529})
+
+
+class RetryPolicy(NamedTuple):
+    """How many times a throttled judge call retries, and how long it waits."""
+
+    max_attempts: int  # counts the first try; 1 disables retrying
+    base_seconds: float
+    max_seconds: float
+
+
+def retry_policy() -> RetryPolicy:
+    """The configured backoff policy — one source of truth, like ``turn_delay_seconds``."""
+    settings = get_settings()
+    return RetryPolicy(
+        max_attempts=max(1, settings.judge_retry_max_attempts),
+        base_seconds=max(0.0, settings.judge_retry_base_seconds),
+        max_seconds=max(0.0, settings.judge_retry_max_seconds),
+    )
+
+
+def _is_capacity_error(exc: Exception) -> bool:
+    """Whether ``exc`` is a provider capacity failure worth retrying.
+
+    Duck-typed on ``status_code`` rather than on SDK exception classes: both
+    ``anthropic.APIStatusError`` and ``openai.APIStatusError`` expose it, and this module
+    stays SDK-free (importable without the optional extras). Classifying by status and
+    not by message text also means an unrelated error that merely *mentions* a rate limit
+    is still treated as permanent.
     """
+    return getattr(exc, "status_code", None) in RETRYABLE_STATUSES
+
+
+def _retry_after_seconds(exc: Exception) -> float | None:
+    """The provider's ``Retry-After`` hint in seconds, or ``None`` when it sent none.
+
+    ``getattr``-safe the whole way down: an exception without a ``response``, without
+    headers, or with a date-form (rather than seconds-form) value yields ``None`` and the
+    caller falls back to computed backoff.
+    """
+    headers = getattr(getattr(exc, "response", None), "headers", None)
+    if headers is None:
+        return None
     try:
-        yield
-    except JudgeError:
-        raise
-    except Exception as exc:
-        raise JudgeError(
-            f"Falló la llamada al juez de {provider} (modelo {model!r}) durante "
-            f"{action}: {type(exc).__name__}: {exc}"
-        ) from exc
+        seconds = float(headers.get("retry-after"))
+    except (AttributeError, TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _backoff_seconds(attempt: int, policy: RetryPolicy, exc: Exception) -> float:
+    """How long to wait before retry number ``attempt`` (0-based).
+
+    The provider's ``Retry-After`` wins when present — it is the one authoritative
+    number. Otherwise: exponential from ``base_seconds``, doubling per attempt, with
+    *full* jitter (uniform over the whole window, not just its tail) so N concurrent
+    callers that were throttled together do not retry together. Either way clamped to
+    ``max_seconds``, which bounds how long one judge call can hold its worker thread.
+    """
+    hinted = _retry_after_seconds(exc)
+    if hinted is not None:
+        return min(hinted, policy.max_seconds)
+    window = min(policy.base_seconds * (2**attempt), policy.max_seconds)
+    return random.uniform(0.0, window)
+
+
+def _sleep(seconds: float) -> None:
+    """Block for ``seconds``.
+
+    An indirection over ``time.sleep`` purely so tests can record the backoff waits
+    without really sleeping and without patching ``time.sleep`` globally. Blocking is
+    correct here: judge calls already run in an ``asyncio.to_thread`` worker (see
+    ``core.runner._evaluate_metrics``), never on the event loop.
+    """
+    time.sleep(seconds)
+
+
+def judge_call(operation: Callable[[], T], *, provider: str, model: str, action: str) -> T:
+    """Run ``operation``, retrying provider throttling and naming any other failure.
+
+    Takes a callable rather than being a context manager because a retry has to re-run
+    the call, and a ``with`` block's body cannot be re-entered. ``operation`` must be a
+    plain LLM request (no side effects), which is what makes replaying it safe.
+
+    A capacity failure (see :data:`RETRYABLE_STATUSES`) is slept off and retried up to
+    ``retry_policy().max_attempts``; anything else — and a capacity failure that outlives
+    the budget — is wrapped in ``JudgeError`` naming the provider, model, and step, since
+    a raw SDK/transport exception otherwise propagates with no hint of *which* judge call
+    failed. ``JudgeError`` is re-raised untouched (already descriptive), and the original
+    exception is chained via ``from`` so the traceback is preserved.
+    """
+    policy = retry_policy()
+    for attempt in range(policy.max_attempts):
+        try:
+            return operation()
+        except JudgeError:
+            raise
+        except Exception as exc:
+            remaining = policy.max_attempts - attempt - 1
+            if remaining and _is_capacity_error(exc):
+                delay = _backoff_seconds(attempt, policy, exc)
+                logger.warning(
+                    "Juez de %s (modelo %r) limitado durante %s: %s. "
+                    "Reintento %d/%d en %.2fs",
+                    provider,
+                    model,
+                    action,
+                    exc,
+                    attempt + 1,
+                    policy.max_attempts - 1,
+                    delay,
+                )
+                _sleep(delay)
+                continue
+            raise JudgeError(
+                f"Falló la llamada al juez de {provider} (modelo {model!r}) durante "
+                f"{action}: {type(exc).__name__}: {exc}"
+            ) from exc
+    # Unreachable: the loop either returns or raises on its last attempt (max_attempts is
+    # clamped to >= 1). Present so every path has a return for the type checker.
+    raise AssertionError("judge_call agotó el bucle de reintentos sin resultado")
 
 
 def require_parsed(
