@@ -131,7 +131,7 @@ async def ingest_evaluation(
     run-level ``platform`` fallback. Each file becomes one ``ScenarioResult`` (with its
     ``Turn`` rows) attached to its platform's execution. The run is committed with
     status ``ingerido`` (persisted, not yet started) and left unscored; a caller later
-    starts it via :func:`start_run` (which enqueues :func:`score_run`).
+    starts it via :func:`start_run` (which enqueues the per-turn evaluation chain).
 
     This is the fast, on-request half: parsing is synchronous so a malformed sheet is
     rejected here (as ``ValueError``) before anything is persisted. ``session`` defaults

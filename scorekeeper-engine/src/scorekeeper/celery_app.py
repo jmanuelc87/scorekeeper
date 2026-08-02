@@ -1,10 +1,12 @@
 """The Celery application that runs evaluations off the request path.
 
 The HTTP API ingests an upload synchronously (parse + persist the run tree) and
-then enqueues a single ``scorekeeper.score_run`` task carrying only the ``run_id``;
-this worker consumes the queue and does the slow LLM-as-a-judge scoring. Clients
-poll ``BenchmarkRun.status`` instead of a Celery result, so no result backend is
-configured.
+then enqueues a single ``scorekeeper.run_chain`` task carrying only the ``run_id``.
+That task does not score the run: it enqueues the run's first turn, and each
+``scorekeeper.score_turn`` job scores one turn and enqueues the next (see
+:mod:`scorekeeper.tasks`). One job is therefore one turn, so a worker killed mid-run
+loses one turn's work rather than the run's. Clients poll ``BenchmarkRun.status``
+instead of a Celery result, so no result backend is configured.
 
 Broker: the app's own Postgres via kombu's SQLAlchemy transport (see
 ``Settings.broker_url``); kombu auto-creates its ``kombu_message`` / ``kombu_queue``
@@ -32,6 +34,11 @@ celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],
     task_acks_late=True,  # re-deliver the job if a worker dies mid-scoring
+    # acks_late alone is not enough: when the prefork *child* dies (the OOM killer),
+    # the parent raises WorkerLostError and acks the job anyway. Rejecting instead
+    # requeues it, and the redelivery resumes forward over the turns already done
+    # rather than re-paying for them (see core.runner / core.services.retrieval).
+    task_reject_on_worker_lost=True,
     worker_prefetch_multiplier=1,  # long tasks -> fair, one-at-a-time dispatch
     task_track_started=True,
 )

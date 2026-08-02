@@ -34,6 +34,7 @@ from scorekeeper.db.models import (
     Prompt,
     PromptVersion,
     RunPromptBinding,
+    ScenarioResult,
     Turn,
 )
 
@@ -44,6 +45,9 @@ class RecordingJudge:
     def __init__(self, score_value: float = 0.8, model: str = "judge-test") -> None:
         self.score_value = score_value
         self.model = model
+
+    def model_for(self, step=None) -> str:
+        return self.model
 
     def score(self, *, rubric, turn, scale, rubric_version=None, step=None) -> JudgeVerdict:
         return JudgeVerdict(score=self.score_value, justification="razón", model=self.model)
@@ -352,20 +356,52 @@ async def test_score_run_binds_the_versions_it_scored_under(
     assert {str(b.run_id) for b in bindings} == {run_id}
 
 
-async def test_rescoring_replaces_bindings_rather_than_duplicating(
+async def test_rescoring_reuses_the_pinned_bindings(
     session: AsyncSession, registry_with_prompt
 ) -> None:
-    """``uq_run_prompt_binding`` would reject a blind re-insert; re-scoring is supported."""
+    """A run is pinned once. A version published mid-run must not re-pin it.
+
+    Pinning exists so one run's rollups come from one rubric. A re-delivery (or a
+    per-turn job) re-enters ``pin_prompts``, so if that re-resolved the *active*
+    versions, an edit landing mid-run would split the run across two rubrics —
+    precisely what the pin is for. ``uq_run_prompt_binding`` would also reject a blind
+    re-insert, so reusing the pin is what keeps re-scoring possible at all.
+    """
     run_id = await _ingest_selected(session)
     await _publish(session)
     await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+    pinned = (await session.execute(select(RunPromptBinding))).scalars().one()
 
-    await score_run(run_id, session=session, judge=RecordingJudge(0.6))
+    # A newer version goes live while the run is under way.
+    for version in (await session.execute(select(PromptVersion))).scalars().all():
+        version.is_active = False
+    for prompt in (await session.execute(select(Prompt))).scalars().all():
+        session.add(
+            PromptVersion(
+                prompt_id=prompt.id,
+                version=2,
+                template="NUEVA {claim}",
+                status="published",
+                is_active=True,
+            )
+        )
+    await session.commit()
+
+    # Re-open the scenario and swap the judge model, so the re-run really judges instead
+    # of reusing every score — otherwise nothing would reach a rubric to inspect.
+    await _rewind(session)
+    judge = RecordingJudge(0.6, model="otro-juez")
+    seen = _counting(judge)
+
+    await score_run(run_id, session=session, judge=judge)
 
     count = (
         await session.execute(select(func.count()).select_from(RunPromptBinding))
     ).scalar_one()
     assert count == 1
+    binding = (await session.execute(select(RunPromptBinding))).scalars().one()
+    assert binding.prompt_version_id == pinned.prompt_version_id  # still v1
+    assert seen and not any("NUEVA" in rubric for rubric in seen)
 
 
 async def test_score_run_injects_the_stored_template(
@@ -387,6 +423,98 @@ async def test_score_run_injects_the_stored_template(
     await score_run(run_id, session=session, judge=judge)
 
     assert seen and all("EDITADA" in rubric for rubric in seen)
+
+
+# --- resume -------------------------------------------------------------------
+
+
+def _counting(judge: RecordingJudge) -> list[str]:
+    """Patch ``judge.score`` to record every rubric it is handed, and return the log."""
+    seen: list[str] = []
+    original = judge.score
+
+    def _record(*, rubric, turn, scale, rubric_version=None, step=None):
+        seen.append(rubric)
+        return original(rubric=rubric, turn=turn, scale=scale, rubric_version=rubric_version)
+
+    judge.score = _record
+    return seen
+
+
+async def _rewind(session: AsyncSession) -> None:
+    """Undo the scenario status a finished run left behind.
+
+    Reproduces a worker that died after committing its scores but before the scenario
+    roll-up, which is the state a resumed run actually starts from — and the state in
+    which the per-metric fingerprint, rather than the ``completado`` shortcut, decides.
+    """
+    for scenario in (await session.execute(select(ScenarioResult))).scalars().all():
+        scenario.status = "pending"
+    await session.commit()
+
+
+async def test_second_score_run_calls_no_judge(
+    session: AsyncSession, registry_with_prompt
+) -> None:
+    run_id = await _ingest_selected(session)
+    await _publish(session)
+    await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+
+    judge = RecordingJudge(0.8)
+    seen = _counting(judge)
+    summary = await score_run(run_id, session=session, judge=judge)
+
+    # The whole point: a re-run over unchanged inputs re-pays nothing.
+    assert seen == []
+    assert summary["status"] == "completado"
+    scores = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
+    assert scores == 2
+
+
+async def test_a_repinned_prompt_version_forces_a_rescore(
+    session: AsyncSession, registry_with_prompt
+) -> None:
+    """Proves the prompt-version id reaches the key: pin -> run_scenario -> run_turn.
+
+    The binding is moved by hand because ``pin_prompts`` binds a run once: publishing v2
+    alone leaves this run scoring under the v1 it was pinned to, which is what
+    ``test_rescoring_reuses_the_pinned_bindings`` covers.
+    """
+    run_id = await _ingest_selected(session)
+    await _publish(session)
+    await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+    keys_before = {
+        ms.scoring_key for ms in (await session.execute(select(MetricScore))).scalars().all()
+    }
+
+    # Supersede v1 with a new active version, as the prompts API does…
+    successors: dict[uuid.UUID, PromptVersion] = {}
+    for version in (await session.execute(select(PromptVersion))).scalars().all():
+        version.is_active = False
+        successor = PromptVersion(
+            prompt_id=version.prompt_id,
+            version=2,
+            template="REVISADA {claim}",
+            status="published",
+            is_active=True,
+        )
+        session.add(successor)
+        successors[version.id] = successor
+    await session.flush()
+    # …and re-pin the run to it, the only way an already-bound run scores under new text.
+    for binding in (await session.execute(select(RunPromptBinding))).scalars().all():
+        binding.prompt_version_id = successors[binding.prompt_version_id].id
+    await session.commit()
+    await _rewind(session)
+
+    judge = RecordingJudge(0.6)
+    seen = _counting(judge)
+    await score_run(run_id, session=session, judge=judge)
+
+    assert seen and all("REVISADA" in rubric for rubric in seen)
+    scores = (await session.execute(select(MetricScore))).scalars().all()
+    assert len(scores) == 2  # replaced, not appended
+    assert {ms.scoring_key for ms in scores}.isdisjoint(keys_before)
 
 
 async def test_score_run_fails_fast_when_a_slot_has_no_active_version(

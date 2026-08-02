@@ -76,7 +76,10 @@ class OpenAIJudge:
         if client is None:
             import openai  # lazy: only needed when building a real client
 
-            client = openai.OpenAI(api_key=api_key)
+            # max_retries=0: retrying is owned by ``judge_call``, which backs off with
+            # jitter and honors Retry-After. Leaving the SDK's own retries on would
+            # multiply the two budgets and make the total wait impossible to reason about.
+            client = openai.OpenAI(api_key=api_key, max_retries=0)
         self._client: Any = client
 
     def _owns(self, model: str) -> bool:
@@ -126,7 +129,10 @@ class OpenAIJudge:
         spec = scale_spec(scale)
         model = self._resolve(step, model)
         content = f"{render_prompt(rubric, turn)}\n\n{spec.instruction_es}"
-        with judge_call(provider=self.provider, model=model, action="la puntuación"):
+
+        def _call() -> tuple[Any, Any]:
+            # Reading choices[0] inside the retried operation keeps an empty-choices
+            # IndexError wrapped as a JudgeError, exactly as the old ``with`` block did.
             completion = self._client.chat.completions.parse(
                 model=model,
                 messages=[
@@ -135,7 +141,11 @@ class OpenAIJudge:
                 ],
                 response_format=_ScoreResponse,
             )
-            message = completion.choices[0].message
+            return completion, completion.choices[0].message
+
+        completion, message = judge_call(
+            _call, provider=self.provider, model=model, action="la puntuación"
+        )
         # Recorded before the parse check: the tokens were spent even if the model
         # refused or returned output that does not satisfy the schema.
         self._record_chat_usage(completion)
@@ -162,7 +172,8 @@ class OpenAIJudge:
         model: str | None = None,
     ) -> T:
         model = self._resolve(step, model)
-        with judge_call(provider=self.provider, model=model, action="la extracción"):
+
+        def _call() -> tuple[Any, Any]:
             completion = self._client.chat.completions.parse(
                 model=model,
                 messages=[
@@ -171,7 +182,11 @@ class OpenAIJudge:
                 ],
                 response_format=schema,
             )
-            message = completion.choices[0].message
+            return completion, completion.choices[0].message
+
+        completion, message = judge_call(
+            _call, provider=self.provider, model=model, action="la extracción"
+        )
         self._record_chat_usage(completion)
         return require_parsed(
             message.parsed,
@@ -194,14 +209,12 @@ class OpenAIJudge:
             if model is not None
             else self.embedding_model
         )
-        with judge_call(
+        response = judge_call(
+            lambda: self._client.embeddings.create(model=embedding_model, input=texts),
             provider=self.provider,
             model=embedding_model,
             action="el cálculo de embeddings",
-        ):
-            response = self._client.embeddings.create(
-                model=embedding_model, input=texts
-            )
+        )
         # Embeddings usage carries only prompt_tokens (no completion side).
         usage = getattr(response, "usage", None)
         record_usage(input_tokens=getattr(usage, "prompt_tokens", None), output_tokens=None)

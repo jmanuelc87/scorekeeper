@@ -131,6 +131,7 @@ erDiagram
         Float score
         String judge_model
         String rubric_version
+        String scoring_key
     }
 
     MetricTrace {
@@ -359,6 +360,7 @@ An LLM-as-a-judge score for a single metric on a single turn. A turn has many.
 | `score` | Float | Numeric score for the metric, in the metric's own scale. Negative (`-1.0`, the `NOT_APPLICABLE` sentinel) when the metric had nothing to measure on this turn; the rollups skip it and the read APIs surface it as `null`. |
 | `judge_model` | String(128) | Model that produced the score, for reproducibility. |
 | `rubric_version` | String(64) | Version of the scoring rubric used. |
+| `scoring_key` | String(64) | sha256 fingerprint of everything that produced this score — rubric version, the prompt versions bound to the metric's slots, the judge models its steps resolved to, and the turn's full judge-visible input. Re-scoring reuses a row whose key still matches and re-judges one whose key does not, so a resumed run pays only for what actually changed. `null` on rows written before the column existed: they never match, so they re-score once. |
 
 Its structured trace lives in a separate `MetricTrace` entity (below), not a column.
 

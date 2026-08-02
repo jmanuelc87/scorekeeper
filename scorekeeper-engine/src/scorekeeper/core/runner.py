@@ -26,9 +26,20 @@ Commit boundary: the **turn is the atomic unit of durability** — a turn's metr
 judge calls all run before its scores are written, then ``run_turn`` commits each
 ``MetricScore`` followed by the ``turn_score`` roll-up. An interruption mid-turn
 loses that turn's in-flight scores, but every earlier turn/scenario stays committed.
+It is also the unit of *delivery* — ``services.chain`` scores one turn per Celery job —
+so a crash costs one turn rather than the whole run, and the ``attempts`` counter bounds
+how often a turn that keeps crashing is retried.
 The roll-ups commit at their own level as they are computed: the ``turn_score`` in
 ``run_turn``, the scenario ``average_score`` / ``status`` in ``run_scenario``, the
 platform ``average_score`` in ``run_platform``.
+
+**Resumable at metric granularity.** Scoring re-enters — a crashed Celery worker
+redelivers the whole job — and the judge bill is the expensive part, so a re-run
+must not re-pay for work that still holds. Every ``MetricScore`` carries a
+``scoring_key`` fingerprinting what produced it (see ``metrics.fingerprint``);
+``run_turn`` reuses the rows whose keys still match and judges only the rest, and
+``run_scenario`` skips a scenario already ``completado`` outright. A re-run over
+unchanged inputs therefore issues zero judge calls.
 """
 
 from __future__ import annotations
@@ -53,11 +64,12 @@ from scorekeeper.db.models import (
     _now,
 )
 from scorekeeper.core.metrics.base import Metric, MetricResult, TurnView
-from scorekeeper.core.metrics.judge import Judge
+from scorekeeper.core.metrics.fingerprint import scoring_key
+from scorekeeper.core.metrics.judge import Judge, JudgeStep
 from scorekeeper.core.metrics.judges import make_judge
 from scorekeeper.core.metrics.judges.base import UsageAccumulator, collect_usage
 from scorekeeper.core.metrics.rollup import platform_average, scenario_average, turn_score
-from scorekeeper.core.metrics.selection import resolve
+from scorekeeper.core.metrics.selection import active_templates, metrics_for, resolve
 from scorekeeper.core.retrieved_context import RetrievedContext
 
 logger = logging.getLogger(__name__)
@@ -66,6 +78,35 @@ logger = logging.getLogger(__name__)
 STATUS_COMPLETADO = "completado"
 STATUS_PARCIAL = "parcial"
 STATUS_FALLIDO = "fallido"
+
+# The chat steps whose model routing can change a score (``judges.base.StepModels``),
+# hashed into every ``scoring_key``. ``EMBED`` is absent on purpose: ``model_for``
+# resolves the *chat* default for it, so including it would duplicate ``SCORE`` rather
+# than name the embedding model, which the ``Judge`` seam does not expose.
+_FINGERPRINT_STEPS = (JudgeStep.EXTRACT, JudgeStep.VERIFY, JudgeStep.SCORE)
+
+# How many times a turn may be *started* before it is abandoned. A turn that kills its
+# worker (the OOM killer) is redelivered by Celery, so without a cap it would block the
+# run forever. Note the arithmetic differs by phase model: while retrieval and scoring
+# are separate passes over the run, one healthy delivery burns two attempts (one each),
+# so a poison turn is dropped on its second or third delivery.
+MAX_TURN_ATTEMPTS = 3
+
+
+def turn_delay_seconds() -> float:
+    """How long to wait before the next turn, drawn from the configured window.
+
+    Uniform over ``[turn_delay_min_seconds, turn_delay_max_seconds]``; ``0.0`` when the
+    upper bound is non-positive, which disables pacing. One source of truth for the
+    window: the in-process runner sleeps it (``EvalRunner._pace_between_turns``) while
+    the chained per-turn jobs hand it to Celery as a ``countdown`` instead.
+    """
+    settings = get_settings()
+    if settings.turn_delay_max_seconds <= 0:
+        return 0.0
+    low = max(0.0, settings.turn_delay_min_seconds)
+    high = max(low, settings.turn_delay_max_seconds)
+    return random.uniform(low, high)
 
 
 class EvalRunner:
@@ -89,9 +130,6 @@ class EvalRunner:
         # runner is a public entry point, and a caller starting at ``run_scenario``
         # must get the same pinning.
         self.templates = templates
-        settings = get_settings()
-        self._turn_delay_min = settings.turn_delay_min_seconds
-        self._turn_delay_max = settings.turn_delay_max_seconds
 
     # ---- Level 1: whole run -------------------------------------------------
     async def run_benchmark(self, run: BenchmarkRun) -> None:
@@ -135,13 +173,39 @@ class EvalRunner:
         Metric selection follows the scenario's use case (its ``use_case_metrics``
         links); the running conversation ``history`` is fed forward so later turns
         see earlier exchanges. Consecutive turns are paced by a short random delay
-        (see ``_pace_between_turns``).
+        (see ``_pace_between_turns``), but only after a turn that actually reached
+        the judge — a resumed turn costs no quota and so earns no pause.
+
+        A scenario already ``completado`` returns immediately: it has nothing left to
+        score, and its ``average_score`` / ``status`` are already persisted. Note the
+        cost of that shortcut — it *shadows* the per-metric fingerprint, so a
+        ``completado`` scenario will not re-score after a new prompt version is
+        published or the judge model is swapped, even though its keys no longer match.
+        The fingerprint remains the mechanism for ``parcial``/``fallido`` scenarios
+        and for a run interrupted mid-flight.
 
         Individual metric scores are already committed as they are written (see
         ``run_turn``); this final commit persists the scenario roll-up
         (``average_score`` / ``status``).
         """
-        metrics = await resolve(self.session, scenario.use_case_id, self.templates)
+        if scenario.status == STATUS_COMPLETADO:
+            logger.info(
+                "Escenario %s ya completado: se omite la puntuación.",
+                scenario.scenario_id,
+            )
+            return
+        templates = self.templates
+        if templates is None:
+            # A caller entering here directly rather than through ``score_run`` is not
+            # pinned; resolve the map ``score_run`` would have resolved so the
+            # fingerprint still sees which prompt versions scored this scenario. Not
+            # cached onto ``self.templates``: it covers only *this* scenario's metric
+            # names, and a partial map makes ``Metric.__init__`` raise for the next one.
+            templates = await active_templates(
+                self.session, await metrics_for(self.session, scenario.use_case_id)
+            )
+        metrics = await resolve(self.session, scenario.use_case_id, templates)
+        prompt_versions = _prompt_version_ids(templates)
         logger.info(
             "Escenario %s (use_case=%s): %d turno(s), métricas=%s",
             scenario.scenario_id,
@@ -151,17 +215,18 @@ class EvalRunner:
         )
         history: list[tuple[str, str]] = []
         turn_scores: list[float | None] = []
+        judged = False
         for turn in scenario.turns:
             # Only selected turns are scored, but every turn feeds the conversation
             # history so a later selected turn's judge sees the full exchange.
             if turn.is_selected:
-                if turn_scores:  # pace only between turns actually scored
+                if judged:  # pace only after a turn that actually called the judge
                     await self._pace_between_turns()
-                await self.run_turn(turn, metrics, history)
+                judged |= await self.run_turn(turn, metrics, history, prompt_versions)
                 turn_scores.append(turn.turn_score)
             history.append((turn.prompt, turn.response))
         scenario.average_score = scenario_average(turn_scores)
-        scenario.status = _scenario_status(scenario)
+        scenario.status = scenario_status(scenario)
         await self.session.commit()
         logger.info(
             "Escenario %s finalizado: estado=%s, promedio=%s",
@@ -171,17 +236,13 @@ class EvalRunner:
         )
 
     async def _pace_between_turns(self) -> None:
-        """Pause a random interval between consecutive turns to spread out judge calls.
+        """Pause between consecutive turns to spread out judge calls.
 
-        The pause is drawn uniformly from the configured
-        ``[turn_delay_min_seconds, turn_delay_max_seconds]`` window; a non-positive
-        upper bound disables it.
+        The interval comes from :func:`turn_delay_seconds`; ``0.0`` means pacing is off.
         """
-        if self._turn_delay_max <= 0:
+        delay = turn_delay_seconds()
+        if not delay:
             return
-        low = max(0.0, self._turn_delay_min)
-        high = max(low, self._turn_delay_max)
-        delay = random.uniform(low, high)
         logger.debug("Pausa de %.2fs antes del siguiente turno", delay)
         await asyncio.sleep(delay)
 
@@ -191,29 +252,135 @@ class EvalRunner:
         turn: Turn,
         metrics: list[Metric],
         history: list[tuple[str, str]] | None = None,
-    ) -> None:
-        """Evaluate every metric on one turn, persist scores, roll up the turn.
+        prompt_versions: Mapping[str, Mapping[str, str]] | None = None,
+    ) -> bool:
+        """Evaluate the metrics this turn is missing, persist them, roll up the turn.
 
-        The metrics evaluate concurrently — one worker thread per metric — since each is
-        an independent judge call; their results are then written back serially on the
-        event loop. A metric that raises is logged and skipped (skip-metric-continue); the
-        turn scores from the survivors. Existing scores are cleared first so a re-run
-        is idempotent (no duplicate ``MetricScore`` rows).
+        Resumable at metric granularity. Each declared metric's inputs — its rubric
+        version, the prompt versions bound to its slots, the judge models its steps
+        resolve to, and the whole ``TurnView`` — hash into a ``scoring_key``
+        (``metrics.fingerprint``); a stored score carrying that key is *reused
+        untouched* and costs nothing. Only the metrics with no matching row reach the
+        judge, and ``turn_score`` is recomputed over the union. A row is removed when
+        its key no longer matches, when the use case no longer declares its metric, or
+        when it duplicates another row for the same metric. A legacy row with a NULL
+        key never matches, so it re-scores once.
+
+        The pending metrics evaluate concurrently — one worker thread per metric —
+        since each is an independent judge call; their results are then written back
+        serially on the event loop. A metric that raises is logged and skipped
+        (skip-metric-continue), leaving no row, so the next pass retries it.
 
         Commits each ``MetricScore`` once the concurrent evaluation has gathered its
         results, then commits the ``turn_score`` roll-up. The turn is the atomic-write
         unit: an interruption mid-turn loses that turn's in-flight scores, but earlier
         turns stay committed.
+
+        Counts an attempt (durably, before the first judge call) and returns without
+        scoring once ``MAX_TURN_ATTEMPTS`` is reached, so a turn that keeps killing its
+        worker is abandoned rather than retried forever. An abandoned turn keeps
+        ``turn_score`` ``None``, which the scenario roll-up already reads as ``parcial``.
+        Only a pass that reaches the judge counts: a turn resolved entirely from reused
+        rows never burned quota, so it never burns an attempt either.
+
+        Returns whether any judge call was issued, so ``run_scenario`` can skip pacing
+        for a turn it fully reused.
+
+        Two consequences worth knowing. ``Metric.weight``/``scale`` are *not* in the
+        key — they are roll-up inputs, not judge inputs — so changing one does not
+        propagate into ``turn_score`` until something else forces a re-score. And
+        ``history`` is in the key, so editing one turn's text invalidates every later
+        turn of that conversation; that is correct, since their judges saw it.
         """
         view = self._to_turn_view(turn, history or [])
-        turn.metric_scores.clear()
+        # ``run_scenario`` passes the ids it already flattened; a per-turn caller
+        # (``services.chain``) only pins them on the runner, so fall back to those —
+        # otherwise the same turn would fingerprint differently on each path.
+        versions = (
+            prompt_versions
+            if prompt_versions is not None
+            else _prompt_version_ids(self.templates or {})
+        )
+        judge_models = {step.value: self.judge.model_for(step) for step in _FINGERPRINT_STEPS}
+
+        keys: dict[str, str] = {}
+        keep: dict[str, MetricScore] = {}
+        pending: list[Metric] = []
+        for metric in metrics:
+            # Computed for every declared metric, not just the pending ones: the write
+            # loop below indexes it by name, and ``_evaluate_metrics`` drops failures,
+            # so results cannot be zipped positionally against ``pending``.
+            keys[metric.name] = scoring_key(
+                metric,
+                view,
+                prompt_versions=versions.get(metric.name, {}),
+                judge_models=judge_models,
+            )
+            match = next(
+                (
+                    score
+                    for score in turn.metric_scores
+                    if score.metric_name == metric.name
+                    and score.scoring_key == keys[metric.name]
+                ),
+                None,
+            )
+            if match is None:
+                pending.append(metric)
+            else:
+                keep[metric.name] = match
+
+        # Everything the diff did not elect to keep: a stale key, a metric the use case
+        # no longer declares, or a second row for a metric that is kept. That last case
+        # is why this compares identity rather than name — ``clear()`` used to heal
+        # duplicates, and a leftover would be double-counted by the roll-up below.
+        stale = [
+            score for score in turn.metric_scores if keep.get(score.metric_name) is not score
+        ]
+        if not pending and not stale:
+            logger.info(
+                "Turno %s: sin cambios, se reutilizan %d puntuación(es)",
+                turn.turn_number,
+                len(keep),
+            )
+            if turn.turn_score is None and keep:
+                # Every score committed but the roll-up did not — a crash landed between
+                # the two. Rebuild it from the reused rows: nothing else ever will, and
+                # the chain reads ``turn_score`` to decide a turn is done.
+                turn.turn_score = turn_score(turn.metric_scores)
+                await self.session.commit()
+            return False
+
+        if pending:
+            if turn.attempts >= MAX_TURN_ATTEMPTS:
+                logger.warning(
+                    "Turno %s abandonado tras %d intento(s)",
+                    turn.turn_number,
+                    turn.attempts,
+                )
+                return False
+            # Commit before judging: the count only bounds retries if it survives the
+            # crash that caused the retry.
+            turn.attempts += 1
+            await self.session.commit()
+
+        for score in stale:
+            turn.metric_scores.remove(score)
+        # Land the deletes (and their cascaded traces) before the judge calls: it keeps
+        # a pending delete set from riding across minutes of LLM latency, and a crash
+        # mid-judge then leaves the stale rows gone rather than resurrecting them.
+        await self.session.flush()
+
         logger.info(
-            "Turno %s: evaluando %d métrica(s) en paralelo", turn.turn_number, len(metrics)
+            "Turno %s: evaluando %d métrica(s) en paralelo, %d reutilizada(s)",
+            turn.turn_number,
+            len(pending),
+            len(keep),
         )
         # One accumulator for the whole turn — every metric thread adds each judge
         # call's tokens to it (see _evaluate_metrics), so the snapshot is the turn total.
         usage = UsageAccumulator()
-        for result in await self._evaluate_metrics(view, metrics, turn.turn_number, usage):
+        for result in await self._evaluate_metrics(view, pending, turn.turn_number, usage):
             turn.metric_scores.append(
                 MetricScore(
                     metric_name=result.metric_name,
@@ -221,6 +388,7 @@ class EvalRunner:
                     trace=MetricTrace(steps=result.trace.model_dump()["steps"]),
                     judge_model=result.judge_model,
                     rubric_version=result.rubric_version,
+                    scoring_key=keys[result.metric_name],
                 )
             )
             await self.session.commit()  # persist each surviving metric's score
@@ -231,14 +399,17 @@ class EvalRunner:
                 result.raw_score,
             )
         turn.turn_score = turn_score(turn.metric_scores)
-        self._record_turn_usage(turn, usage)
+        if pending:  # nothing was judged when only stale rows were dropped
+            self._record_turn_usage(turn, usage, accumulate=bool(keep))
         await self.session.commit()
         logger.info(
-            "Turno %s puntuado: turn_score=%s (%d métrica(s) exitosa(s))",
+            "Turno %s puntuado: turn_score=%s (%d métrica(s), %d nueva(s))",
             turn.turn_number,
             turn.turn_score,
             len(turn.metric_scores),
+            len(pending),
         )
+        return bool(pending)
 
     async def _evaluate_metrics(
         self,
@@ -286,11 +457,22 @@ class EvalRunner:
         return results
 
     @staticmethod
-    def _record_turn_usage(turn: Turn, usage: UsageAccumulator) -> None:
+    def _record_turn_usage(turn: Turn, usage: UsageAccumulator, *, accumulate: bool) -> None:
         """Persist the turn's summed token usage as its 1:1 ``TurnTokenUsage`` row.
 
-        Updates the existing row in place when re-scoring (keeps a single row per
-        turn, avoiding the unique-constraint churn of delete-then-insert).
+        Updates the existing row in place rather than delete-then-insert, keeping a
+        single row per turn. The row should describe the tokens behind the scores
+        *currently* stored on the turn, which is what ``accumulate`` selects: a partial
+        resume (``True``) only re-paid for the metrics it re-scored, and the reused
+        scores' tokens were really spent, so they stay on the ledger; a full re-score
+        (``False``) replaces, because the old tokens bought scores that no longer exist
+        and adding them would double-count discarded work. ``run_turn`` skips this call
+        entirely when it judged nothing, so a zeroed snapshot can never erase a real
+        record.
+
+        One imprecision this cannot avoid without per-metric attribution: on a *mixed*
+        turn the stale metric's old tokens ride along, over-counting — the safe
+        direction for a cost ledger.
         """
         snapshot = usage.snapshot()
         if turn.token_usage is None:
@@ -298,6 +480,9 @@ class EvalRunner:
                 input_tokens=snapshot.input_tokens,
                 output_tokens=snapshot.output_tokens,
             )
+        elif accumulate:
+            turn.token_usage.input_tokens += snapshot.input_tokens
+            turn.token_usage.output_tokens += snapshot.output_tokens
         else:
             turn.token_usage.input_tokens = snapshot.input_tokens
             turn.token_usage.output_tokens = snapshot.output_tokens
@@ -320,7 +505,21 @@ class EvalRunner:
         )
 
 
-def _scenario_status(scenario: ScenarioResult) -> str:
+def _prompt_version_ids(
+    templates: Mapping[str, dict[str, PromptVersion]],
+) -> dict[str, dict[str, str]]:
+    """Flatten pinned prompt versions to ``metric name -> slot slug -> version id``.
+
+    The fingerprint lives in the ORM-free metrics package, so the ids reach it as
+    strings rather than as ``PromptVersion`` rows.
+    """
+    return {
+        name: {slug: str(version.id) for slug, version in slots.items()}
+        for name, slots in templates.items()
+    }
+
+
+def scenario_status(scenario: ScenarioResult) -> str:
     """Classify a scored scenario as complete, partial, or fully failed.
 
     ``fallido`` when no turn scored, ``parcial`` when at least one turn failed to

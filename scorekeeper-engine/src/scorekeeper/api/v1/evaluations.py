@@ -103,8 +103,8 @@ async def create_evaluation(
 async def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
     """Start scoring a previously-ingested run (the trigger decoupled from ingestion).
 
-    Flips a run from ``ingerido`` to ``en_cola`` and enqueues the Celery pipeline
-    (retrieval + LLM scoring). Returns ``202`` with ``status`` ``en_cola``; poll
+    Flips a run from ``ingerido`` to ``en_cola`` and enqueues the Celery chain, which
+    retrieves and scores one turn per job. Returns ``202`` with ``status`` ``en_cola``; poll
     ``GET /evaluations/{run_id}`` for progress. ``404`` when the ``run_id`` is unknown,
     ``409`` when the run is not in the ``ingerido`` state (already started), so a run is
     never enqueued twice.
@@ -158,10 +158,12 @@ async def select_turns(run_id: str, payload: TurnSelectionRequest) -> TurnSelect
 async def get_evaluation(run_id: str) -> EvaluationResponse:
     """Return a run's current status and summary (poll this after ``POST``).
 
-    ``status`` walks ``ingerido → en_cola → en_recuperacion → en_proceso →
-    completado|parcial|fallido``; it stays at ``ingerido`` until
-    ``POST /evaluations/{run_id}/start`` enqueues it. The platform's ``average_score``
-    stays ``null`` until scoring finishes. ``404`` when the ``run_id`` is unknown.
+    ``status`` walks ``ingerido → en_cola → en_proceso → completado|parcial|fallido``;
+    it stays at ``ingerido`` until ``POST /evaluations/{run_id}/start`` enqueues it.
+    (``en_recuperacion`` belongs to the in-process ``run_evaluation`` path, which
+    retrieves the whole run as its own phase; the worker retrieves each turn inside
+    ``en_proceso``.) The platform's ``average_score`` stays ``null`` until scoring
+    finishes. ``404`` when the ``run_id`` is unknown.
     """
     summary = await run_service.get_run_summary(run_id)
     if summary is None:
