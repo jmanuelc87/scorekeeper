@@ -1,6 +1,24 @@
 # Scorekeeper
 
-Scorekeeper is a prototype server that benchmarks platforms and AI Agents by loading each conversation (user and model interactions) from a browser extension storing every turn, and scoring each turn with an LLM-as-a-judge. Per-turn metric scores roll up into scenario- and platform-level averages. All scenarios, prompts, and evaluation outputs currently are in spanish.
+## Qué es
+
+Scorekeeper es un sistema que evalúa automáticamente la calidad de las conversaciones que las personas mantienen con asistentes de inteligencia artificial como Copilot, Gemini y Claude. En lugar de que alguien revise manualmente cientos de conversaciones para juzgar qué tan buenas son las respuestas, el sistema usa otra inteligencia artificial como "juez" que lee cada intercambio y le asigna una calificación, de forma parecida a como un evaluador humano calificaría un examen, pero de manera automática, consistente y a gran escala.
+
+## Qué hace
+
+- **Reúne las conversaciones**: se cargan desde un archivo Excel o se capturan con un clic desde una extensión de navegador mientras se usa el asistente, sin exportar ni subir nada manualmente.
+- **Organiza el contenido**: convierte cada archivo o captura en una secuencia clara de preguntas y respuestas, identificando quién dijo qué, sin importar el formato o idioma del archivo original.
+- **Permite decidir qué revisar**: antes de calificar, se elige qué preguntas y respuestas evaluar y bajo qué criterios de calidad.
+- **Verifica las fuentes citadas**: cuando una respuesta menciona un documento o página web como respaldo, el sistema lo descarga y revisa si la respuesta realmente se apoya en esa información o la contradice.
+- **Califica cada respuesta**: evalúa si contesta lo preguntado, si usa bien la información disponible y si no inventa datos, dejando siempre una breve justificación de la nota.
+- **Calcula promedios en cascada**: combina las notas de cada intercambio en un puntaje por conversación, y estos en un puntaje por plataforma, permitiendo comparar Copilot, Gemini y Claude entre sí.
+- **Permite seguimiento en tiempo real**: se puede consultar el avance de una evaluación, revisar el detalle de cada conversación calificada y entender por qué se otorgó cada nota, incluyendo el costo de IA que tomó evaluarla.
+- **Es resistente a fallos**: si el proceso se interrumpe, retoma el trabajo justo donde quedó, sin repetir tareas ya hechas ni gastar de más.
+- **Protege el acceso a información sensible**: guarda de forma segura las credenciales para consultar fuentes protegidas, y mantiene un historial de versiones de las instrucciones que usa el juez de IA, para que los resultados sean comparables entre sí.
+
+## Propuesta de valor
+
+Scorekeeper permite a una organización responder, con evidencia y no solo con impresiones, qué asistente de IA funciona mejor. Reemplaza la revisión manual —lenta, costosa y subjetiva— por un proceso automático, consistente y auditable, donde cada calificación puede rastrearse hasta su justificación. Esto permite decidir qué plataforma adoptar o mantener, detectar rápidamente respuestas de baja calidad o mal fundamentadas, y controlar el costo del proceso de evaluación. Al capturar conversaciones directamente desde el navegador y procesar grandes volúmenes sin intervención humana, reduce el esfuerzo operativo y acelera la mejora continua de los asistentes de IA usados por la organización.
 
 ## Run everything with Docker
 
