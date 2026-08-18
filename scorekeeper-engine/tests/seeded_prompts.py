@@ -1,9 +1,9 @@
-"""Read the shipped prompt text out of the prompt-catalog migration.
+"""Read the shipped prompt text out of the seeding migrations.
 
-The Spanish templates live in exactly one place — ``migrations/versions/…_add_prompt_
-catalog.py`` — and the suite never runs Alembic (``tests/conftest.py`` builds its schema
-with ``Base.metadata.create_all``). So the suite reaches the text the only way left:
-importing the migration module directly.
+The Spanish templates live only in ``migrations/versions/`` — the prompt catalog itself,
+plus every later revision that seeds new text — and the suite never runs Alembic
+(``tests/conftest.py`` builds its schema with ``Base.metadata.create_all``). So the suite
+reaches the text the only way left: importing those migration modules directly.
 
 That is deliberate, not a workaround. It is what lets the tests exercise the *real*
 prompts rather than hand-written stand-ins, and it is what keeps the migration honest —
@@ -21,31 +21,41 @@ import importlib.util
 from pathlib import Path
 from typing import Any
 
-# ``migrations/`` has no __init__.py and is outside pythonpath, so load it by path.
-_MIGRATION = (
-    Path(__file__).resolve().parents[1]
-    / "migrations"
-    / "versions"
-    / "c1a5e7d3f0b6_add_prompt_catalog.py"
+# ``migrations/`` has no __init__.py and is outside pythonpath, so load each by path.
+# In revision order: a later revision may only add slots the earlier one did not seed.
+_VERSIONS = Path(__file__).resolve().parents[1] / "migrations" / "versions"
+_MIGRATIONS = (
+    "c1a5e7d3f0b6_add_prompt_catalog.py",
+    "d7f2b6c1a840_add_quality_metric_rubrics.py",
 )
 
 
-def _load() -> Any:
-    spec = importlib.util.spec_from_file_location("_prompt_catalog_migration", _MIGRATION)
+def _load(filename: str) -> Any:
+    path = _VERSIONS / filename
+    spec = importlib.util.spec_from_file_location(f"_seed_migration_{path.stem}", path)
     if spec is None or spec.loader is None:  # pragma: no cover - packaging accident
-        raise RuntimeError(f"No se pudo cargar la migración {_MIGRATION}")
+        raise RuntimeError(f"No se pudo cargar la migración {path}")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
 
 
-_module = _load()
+_modules = [_load(filename) for filename in _MIGRATIONS]
 
-#: The seed rows, exactly as the migration will insert them.
-SEEDED_PROMPTS: tuple[dict[str, Any], ...] = _module.SEEDED_PROMPTS
+#: The loaded seeding migrations, in revision order, for tests about one of them.
+MODULES = tuple(_modules)
 
-#: The migration's own insert, callable against a test connection.
-seed_prompts = _module._seed_prompts
+#: The seed rows, exactly as the migrations will insert them.
+SEEDED_PROMPTS: tuple[dict[str, Any], ...] = tuple(
+    seed for module in _modules for seed in module.SEEDED_PROMPTS
+)
+
+
+def seed_prompts(bind) -> None:
+    """Run every migration's own insert, in revision order, against ``bind``."""
+    for module in _modules:
+        module._seed_prompts(bind)
+
 
 #: ``(metric name, slug) -> template``.
 BY_SLOT: dict[tuple[str, str], str] = {

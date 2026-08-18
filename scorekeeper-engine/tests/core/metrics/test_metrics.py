@@ -8,28 +8,31 @@ from __future__ import annotations
 
 import pytest
 
-from scorekeeper.core.metrics.base import Metric, SingleRubricMetric, TurnView
+from scorekeeper.core.metrics.base import RUBRIC_SLOT, Metric, SingleRubricMetric, TurnView
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import JudgeVerdict
+from scorekeeper.core.metrics.prompts import PromptSlot
 from scorekeeper.core.metrics.registry import MetricRegistry, register
 from scorekeeper.core.metrics.scale import Boolean, Inverted, Likert, Unit
 
 
 class _EjemploLikert(SingleRubricMetric):
-    """Minimal single-rubric metric — the catalog has none, so define one here to
-    exercise ``SingleRubricMetric.evaluate`` and Likert normalization."""
+    """Minimal single-rubric metric on a 1-5 scale — the catalog's are all 0-100, so
+    define one here to exercise ``SingleRubricMetric.evaluate`` and Likert normalization."""
 
     name = "_ejemplo_likert"
     category = MetricCategory.RAG
     scale = Likert()  # 1-5
-    rubric = "Evalúa (1-5): {prompt} {response}"
+    prompts = (PromptSlot(slug=RUBRIC_SLOT, description="Rúbrica de ejemplo."),)
 
 
 def test_single_rubric_maps_verdict_to_result(turn: TurnView, make_judge) -> None:
     judge = make_judge(
         verdicts=[JudgeVerdict(score=4, justification="Correcto en general", model="claude-x")]
     )
-    result = _EjemploLikert().evaluate(turn, judge)
+    result = _EjemploLikert({RUBRIC_SLOT: "Evalúa (1-5): {prompt} {response}"}).evaluate(
+        turn, judge
+    )
 
     assert result.metric_name == "_ejemplo_likert"
     assert result.raw_score == 4
@@ -78,7 +81,6 @@ def test_decorator_registers_the_class(registered_metrics) -> None:
     class NewMetric(SingleRubricMetric):
         name = "new_metric"
         scale = Likert()
-        rubric = "..."
 
     # The decorator returns the class unchanged, so subclass attributes survive it.
     assert MetricRegistry.get("new_metric") is NewMetric
