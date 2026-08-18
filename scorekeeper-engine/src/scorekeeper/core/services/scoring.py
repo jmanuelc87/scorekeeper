@@ -143,31 +143,17 @@ async def run_evaluation(
 ) -> dict[str, Any]:
     """Ingest ``files``, retrieve their context, and score them under ``platform`` in one call.
 
-    The synchronous path: :func:`ingest_evaluation` → select every turn → :func:`retrieve_run`
-    → :func:`score_run` on the same session. Because scoring is opt-in per turn (only
-    ``Turn.is_selected`` turns are evaluated by the worker), this convenience selects all
-    turns so it evaluates the whole file — the HTTP API instead ingests inline, lets the
-    caller pick a subset via the selection endpoint, then enqueues the retrieval+scoring
-    orchestrator onto the Celery worker. ``pipeline`` is injectable so tests avoid
-    network/LLM calls.
+    The synchronous path: :func:`ingest_evaluation` → :func:`retrieve_run` →
+    :func:`score_run` on the same session, so it evaluates the whole file — an ingested
+    turn is selected by default, and this path never deselects any. The HTTP API instead
+    ingests inline, lets the caller drop turns via the selection endpoint, then enqueues
+    the retrieval+scoring orchestrator onto the Celery worker. ``pipeline`` is injectable
+    so tests avoid network/LLM calls.
     """
     async with session_scope(session) as db:
         run_id = await ingestion.ingest_evaluation(platform, files, session=db)
-        await _select_all_turns(db, run_id)
         await retrieval.retrieve_run(run_id, session=db, pipeline=pipeline)
         return await score_run(run_id, session=db, judge=judge)
-
-
-async def _select_all_turns(db: AsyncSession, run_id: str) -> None:
-    """Mark every turn of a run selected for scoring (the "evaluate everything" default)."""
-    run = await run_repo.get_run_tree(db, run_id, metric_scores=False, retrieval=False)
-    if run is None:
-        return
-    for platform_exec in run.platform_executions:
-        for scenario in platform_exec.scenario_results:
-            for turn in scenario.turns:
-                turn.is_selected = True
-    await db.commit()
 
 
 def run_status(run: BenchmarkRun) -> str:

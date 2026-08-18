@@ -11,10 +11,11 @@ All rubrics, prompts and justifications are in Spanish.
 
 > **The prompt text is not in these modules.** Each metric declares only its prompt
 > *slots* — referred to below as `metric.slug`, e.g. `faithfulness_ragas.verify`. The
-> text itself lives in `prompt_versions`, seeded by the prompt-catalog migration and
-> injected at resolution, so the wording described here is the shipped default and may
-> have been edited since. `GET /api/v1/prompts` shows what is actually live. See
-> [Evaluation metrics → Prompt slots](evaluation-metrics.md#prompt-slots).
+> text itself lives in `prompt_versions`, seeded by a migration and injected at
+> resolution, so the wording described here is the shipped default and may have been
+> edited since. `GET /api/v1/prompts` shows what is actually live. See
+> [Evaluation metrics → Prompt slots](evaluation-metrics.md#prompt-slots). That holds
+> for the whole rubric of a single-rubric metric too: it is just the `rubric` slot.
 
 | Metric (`name`) | Category | Scale | Weight | Higher means |
 | --- | --- | --- | --- | --- |
@@ -23,14 +24,26 @@ All rubrics, prompts and justifications are in Spanish.
 | [`faithfulness_ragas`](#faithfulness_ragas) | `rag` | `Unit()` 0–1 | 1.0 | more answer statements entailed by context (better) |
 | [`faithfulness_deepeval`](#faithfulness_deepeval) | `rag` | `Unit()` 0–1 | 1.0 | fewer answer claims contradicted by context (better) |
 | [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination — worse raw score, but `Inverted` normalizes it to higher-is-better faithfulness |
+| [`relevancia`](#relevancia) | `calidad` | `Likert(0, 100)` | 1.0 | the answer addresses the query more directly (better) |
+| [`precision`](#precision) | `calidad` | `Likert(0, 100)` | 1.0 | fewer factual errors (better) |
+| [`completitud`](#completitud) | `calidad` | `Likert(0, 100)` | 1.0 | more of the question's relevant aspects covered (better) |
+| [`claridad`](#claridad) | `calidad` | `Likert(0, 100)` | 1.0 | easier to understand (better) |
+| [`razonamiento_logico`](#razonamiento_logico) | `calidad` | `Likert(0, 100)` | 1.0 | sounder logic and better-justified conclusions (better) |
+| [`contextualizacion`](#contextualizacion) | `calidad` | `Likert(0, 100)` | 1.0 | the scenario's context is understood and integrated (better) |
+| [`accionabilidad`](#accionabilidad) | `calidad` | `Likert(0, 100)` | 1.0 | more practically applicable and executable (better) |
+| [`estructura`](#estructura) | `calidad` | `Likert(0, 100)` | 1.0 | better organized and formatted (better) |
+| [`profundidad_analitica`](#profundidad_analitica) | `calidad` | `Likert(0, 100)` | 1.0 | deeper analysis of the topic (better) |
+| [`coherencia_multiturno`](#coherencia_multiturno) | `calidad` | `Likert(0, 100)` | 1.0 | more consistent across the conversation's turns (better) |
 
 Which use case scores which metric is not shown here — it is data, not a property of the
 metric (see below).
 
-Every metric here is a `MultiStepMetric` — it orchestrates several `Judge` calls
-and records what each step produced as a structured `MetricTrace` (`steps` → typed
-`entries`), persisted on the `metric_traces` table (1:1 with `MetricScore`). None
-import an LLM SDK: they depend only on the `Judge` seam.
+Two shapes are represented. The five `rag`/`seguridad` metrics are `MultiStepMetric`s —
+each orchestrates several `Judge` calls and records what every step produced as a
+structured `MetricTrace` (`steps` → typed `entries`), persisted on the `metric_traces`
+table (1:1 with `MetricScore`). The ten [`calidad` metrics](#calidad-the-ten-rubric-metrics)
+are `SingleRubricMetric`s: one rubric, one judge call, a one-step trace. None import an
+LLM SDK — they depend only on the `Judge` seam.
 
 A metric does not declare which use cases it applies to — that mapping is user data,
 composed through `POST /use-cases` (see [Evaluation metrics → Per-use-case
@@ -425,3 +438,157 @@ selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 no-contradiction / partial-contradiction / no-context cases, and the
 one-`structured`-call-per-document contract. No database and no live LLM: a stub
 judge serves scripted `NLIJudgment` values through `structured()`.
+
+## `calidad` — the ten rubric metrics
+
+**Ten facets of answer quality, each scored 0–100 by one judge call against one
+Spanish rubric.**
+
+`scorekeeper-engine/src/scorekeeper/core/metrics/catalog/{relevancia,precision,completitud,claridad,razonamiento_logico,contextualizacion,accionabilidad,estructura,profundidad_analitica,coherencia_multiturno}.py`
+— one module per metric.
+
+Unlike the `rag`/`seguridad` metrics above, these are `SingleRubricMetric`s: the class is
+pure declaration (`name`, `category = MetricCategory.CALIDAD`, `scale = Likert(0.0, 100.0)`,
+`weight = 1.0`, one `rubric` prompt slot) and `SingleRubricMetric.evaluate` does the rest.
+They measure the answer as a piece of communication, so — unlike the RAG metrics — none of
+them require retrieved context, an expected output, or any other field beyond the turn
+itself.
+
+```
+raw_score      = the judge's 0-100 verdict, clamped into the scale
+normalized     = raw / 100          # Likert(0, 100), higher is better
+```
+
+The judge is told the range automatically (`judges.base.scale_spec` renders
+"Asigna una puntuación entre 0 y 100" for any `Likert`) and clamps whatever the model
+returns back into it, so a model answering `120` or `-3` cannot corrupt a rollup.
+
+### Shared mechanics
+
+- **One call.** `evaluate` makes a single `judge.score(..., step=JudgeStep.SCORE)` call
+  with the metric's rubric, on the model that step routes to — the decisive scoring step,
+  not the cheap extraction tier.
+- **The trace** is one `TraceStep` ("Puntuación") holding one `TraceEntry`: the metric
+  name, the numeric `value`, the judge's Spanish `justification`, and the model in
+  `metadata`.
+- **No short-circuit.** There is no `NOT_APPLICABLE` path — every turn has a prompt and a
+  response, which is all these rubrics need, so all ten always produce a score.
+- **The rubric is the whole prompt.** Each declares exactly one slot, `<metric>.rubric`,
+  with no required variables: the templates interpolate nothing, because `judges.base`
+  appends the full turn — turn number, prior history, retrieved context, prompt and
+  response — beneath every instruction it sends. That is also why
+  `coherencia_multiturno` works without orchestrating anything: the history it judges
+  arrives with the turn.
+- **Domain-neutral wording.** The rubrics name no sector. The scenario's own context
+  reaches the judge with the turn, so pinning a domain into the rubric text would only
+  duplicate it.
+
+### The rubrics
+
+Every template states the facet under evaluation, then five bands — `90-100`, `70-89`,
+`50-69`, `30-49`, `0-29` — and asks for a score plus a brief Spanish justification. The
+ten are listed [at the end of this section](#relevancia).
+
+The full Spanish text is seeded by migration `d7f2b6c1a840`, which also inserts the ten
+`metrics` rows the prompts' foreign key needs — the app has never run `sync_metrics` at
+migrate time. Its inserts are conditional on the name and slug, so it is safe to re-run
+and on a database whose app already booted. Edit the live text through the prompt API,
+not the migration.
+
+### Inputs
+
+- **Query:** `TurnView.prompt`.
+- **Answer:** `TurnView.response`.
+- **History:** `TurnView.history` — appended by the judge to every call, and what
+  `coherencia_multiturno` scores.
+- **Retrieved context:** appended when present, but no rubric requires it.
+
+### Use cases
+
+Like every metric, these belong to no use case until one lists them — except the reserved
+`default`, which `sync_metrics` links to every registered metric on startup, so all ten
+join it with no migration. A use case scoring quality only:
+
+```http
+POST /api/v1/use-cases
+{"name": "calidad", "metrics": ["relevancia", "precision", "completitud", "claridad",
+                                "razonamiento_logico", "contextualizacion", "accionabilidad",
+                                "estructura", "profundidad_analitica", "coherencia_multiturno"]}
+```
+
+(see [Evaluation metrics → Per-use-case
+selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
+
+### Notes
+
+- Adding ten metrics to `default` multiplies the judge calls a full run makes. A narrower
+  use case is the lever if that matters for cost.
+- `rubric_version` stays `"v1"` on all ten; the *text* is versioned separately in
+  `prompt_versions`, and the active version's id is part of each score's
+  [scoring key](evaluation-metrics.md), so publishing a new rubric re-judges the turns
+  it applies to rather than reusing stale scores.
+- `judge_model` is the model `score()` reports, unlike the `structured()`-based metrics
+  above which cannot surface one.
+
+### Tests
+
+`scorekeeper-engine/tests/core/metrics/test_quality_metrics.py` — the declaration of all
+ten (category, `Likert(0, 100)`, exactly one `rubric` slot with no required variables),
+scoring a turn with the **shipped** Spanish rubric through a stub judge (80 → `0.8`, one
+`JudgeStep.SCORE` call), and that each seeded template really states its 0–100 bands.
+`tests/core/metrics/test_migration_prompts.py` additionally holds the new slots to the
+seed↔slot contract and covers the migration's conditional insert. No database and no live
+LLM.
+
+### `relevancia`
+
+**How directly the answer addresses the user's query.** `90-100`: addresses it fully, all
+of it pertinent. `0-29`: barely relevant, or does not address the query at all.
+
+### `precision`
+
+**Accuracy of the facts, data and information given.** `90-100`: fully accurate and
+verifiable, no factual errors. `0-29`: fundamentally incorrect or unverifiable.
+
+### `completitud`
+
+**How much of the question's relevant scope the answer covers.** `90-100`: exhaustive —
+every main and secondary aspect. `0-29`: very little of the topic covered.
+
+### `claridad`
+
+**Ease of comprehension and quality of the writing.** `90-100`: extremely clear, well
+structured, precise language. `0-29`: confusing, disorganized, near unreadable.
+
+### `razonamiento_logico`
+
+**Quality of the logic, argument coherence and justification of conclusions.** `90-100`:
+sound reasoning, well-justified arguments, valid conclusions. `0-29`: fallacious or
+logically incoherent.
+
+### `contextualizacion`
+
+**Grasp and effective use of the context given in the query and the scenario.** `90-100`:
+deep understanding, expertly integrated. `0-29`: ignores or misunderstands the context.
+
+### `accionabilidad`
+
+**Practical, executable usefulness of the information.** `90-100`: highly actionable, with
+clear implementation steps. `0-29`: not applicable, no practical direction.
+
+### `estructura`
+
+**Organization, formatting and logical presentation of the information.** `90-100`: clear
+sections, headings or lists where appropriate. `0-29`: practically no organization.
+
+### `profundidad_analitica`
+
+**Depth of analysis and exploration of the topic.** `90-100`: deep and insightful, explores
+multiple dimensions. `0-29`: minimal or absent analysis.
+
+### `coherencia_multiturno`
+
+**Consistency and coherence across the conversation's turns.** `90-100`: perfectly
+coherent, thematically consistent throughout. `0-29`: incoherent, contradicts earlier
+turns. The prior exchanges it judges arrive in `TurnView.history`, which the judge appends
+to the rubric — the metric orchestrates nothing itself.

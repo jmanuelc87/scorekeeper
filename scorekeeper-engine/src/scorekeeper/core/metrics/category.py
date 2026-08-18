@@ -10,3 +10,4 @@ class MetricCategory(StrEnum):
 
     RAG = "rag"
     SEGURIDAD = "seguridad"
+    CALIDAD = "calidad"

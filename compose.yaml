@@ -43,9 +43,11 @@ services:
     # Consumes the evaluation queue and runs the LLM scoring off the API's request
     # path. Broker is Postgres (kombu SQLAlchemy transport); no ports to expose.
     command:
-      ["celery", "-A", "scorekeeper.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+      ["celery", "-A", "scorekeeper.celery_app:celery_app", "worker", "--loglevel=info", "--concurrency=3"]
     env_file: scorekeeper-engine/.env
     environment: *backend-environment
+    deploy:
+      replicas: 3
     depends_on:
       database:
         condition: service_healthy

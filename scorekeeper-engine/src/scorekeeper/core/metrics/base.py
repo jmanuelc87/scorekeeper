@@ -8,7 +8,9 @@ SQLAlchemy ``Turn`` — so the whole package is testable with no database.
 Two shapes cover the space:
 
 * ``SingleRubricMetric`` — one Spanish rubric → one judge call → one score. A
-  concrete metric is then pure declaration (name/category/scale/weight/rubric).
+  concrete metric is then pure declaration (name/category/scale/weight) plus its
+  ``rubric`` prompt slot, whose text — like every other template — lives in
+  ``prompt_versions`` and is injected at construction.
 * ``MultiStepMetric`` — override ``evaluate()`` to orchestrate several judge
   calls (extract → verify → aggregate) and record what each step produced as a
   structured :class:`MetricTrace` (steps → typed entries), so lists stay arrays
@@ -30,6 +32,10 @@ from scorekeeper.core.metrics.judge import Judge, JudgeStep
 from scorekeeper.core.metrics.prompts import PromptSlot
 from scorekeeper.core.metrics.scale import Scale
 from scorekeeper.core.retrieved_context import RetrievedContext
+
+
+RUBRIC_SLOT = "rubric"
+"""Slug of the prompt slot a :class:`SingleRubricMetric` scores with."""
 
 
 NOT_APPLICABLE = -1.0
@@ -236,13 +242,17 @@ class Metric(ABC):
 
 
 class SingleRubricMetric(Metric):
-    """One Spanish rubric, one judge call. Concrete subclasses just declare."""
+    """One Spanish rubric, one judge call. Concrete subclasses just declare.
 
-    rubric: ClassVar[str]  # Spanish prompt template
+    The rubric is read from the :data:`RUBRIC_SLOT` prompt slot, so a subclass must
+    declare it (``prompts = (PromptSlot(slug=RUBRIC_SLOT, description=…),)``) and the
+    text is owned by ``prompt_versions`` like every other template — editable and
+    versioned at runtime, and part of the scoring fingerprint.
+    """
 
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
         verdict = judge.score(
-            rubric=self.rubric,
+            rubric=self.prompt(RUBRIC_SLOT),
             turn=turn,
             scale=self.scale,
             rubric_version=self.rubric_version,

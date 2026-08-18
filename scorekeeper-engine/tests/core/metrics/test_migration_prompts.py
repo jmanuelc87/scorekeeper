@@ -22,7 +22,7 @@ from scorekeeper.core.metrics import catalog  # noqa: F401  (populate the regist
 from scorekeeper.core.metrics.prompts import PromptTemplateError, validate_template
 from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.db.models import MetricDefinition, Prompt, PromptVersion
-from seeded_prompts import SEEDED_PROMPTS, seed_prompts
+from seeded_prompts import MODULES, SEEDED_PROMPTS, seed_prompts
 
 
 def _declared_slots():
@@ -131,3 +131,34 @@ async def test_seed_rejects_a_metric_with_no_row(session: AsyncSession) -> None:
     """Registry drift must fail loudly, not leave a prompt the runner will demand."""
     with pytest.raises(RuntimeError, match="No existe fila"):
         await session.run_sync(lambda s: seed_prompts(s.connection()))
+
+
+# --- the rubric seed's own conditions ------------------------------------------
+# d7f2b6c1a840 writes into tables that already hold rows, so unlike the catalog seed
+# it must create the metric rows it needs and skip a slot that is already stored.
+
+_RUBRICS = MODULES[-1]
+
+
+async def test_rubric_seed_creates_its_own_metric_rows(session: AsyncSession) -> None:
+    """No app has run ``sync_metrics`` at migrate time, so the FK targets must be inserted."""
+    await session.run_sync(lambda s: _RUBRICS._seed_prompts(s.connection()))
+    await session.commit()
+
+    names = {seed["metric"] for seed in _RUBRICS.SEEDED_PROMPTS}
+    stored = set((await session.execute(select(MetricDefinition.name))).scalars())
+    assert names <= stored
+
+
+async def test_rubric_seed_is_idempotent(session: AsyncSession) -> None:
+    """A database whose app already booted has the metric rows; re-seeding must not duplicate."""
+    for name in sorted({seed["metric"] for seed in _RUBRICS.SEEDED_PROMPTS}):
+        session.add(MetricDefinition(name=name))
+    await session.commit()
+
+    for _ in range(2):
+        await session.run_sync(lambda s: _RUBRICS._seed_prompts(s.connection()))
+        await session.commit()
+
+    prompts = (await session.execute(select(func.count()).select_from(Prompt))).scalar_one()
+    assert prompts == len(_RUBRICS.SEEDED_PROMPTS)
