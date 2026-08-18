@@ -120,8 +120,11 @@ Two ready-made shapes cover almost everything.
 
 ### `SingleRubricMetric` — one rubric, one judge call
 
-The common case. Declare a Spanish `rubric` and the metadata; the base class does
-the rest.
+The common case. Declare the metadata and the `rubric` prompt slot; the base class does
+the rest — one `judge.score()` call on `JudgeStep.SCORE`, wrapped as a one-step trace.
+The Spanish text is *not* in the class: like every template it lives in
+`prompt_versions` and is injected at construction, and `evaluate` reads it back with
+`self.prompt(RUBRIC_SLOT)` (see [Prompt slots](#prompt-slots)).
 
 ```python
 @register
@@ -130,7 +133,7 @@ class Correccion(SingleRubricMetric):
     category = MetricCategory.RAG
     scale = Likert()          # 1-5
     weight = 2.0
-    rubric = RUBRICA_CORRECCION   # Spanish prompt template
+    prompts = (PromptSlot(slug=RUBRIC_SLOT, description="Corrección de la respuesta."),)
 ```
 
 ### `MultiStepMetric` — orchestrate several judge calls
@@ -193,8 +196,8 @@ at rollup, so the stored value stays interpretable in the rubric's own terms.
 ### Categories
 
 `MetricCategory` (`scorekeeper.core.metrics.category`) is a data-only `StrEnum`
-used for grouping and dashboards. It currently defines a single value, `RAG`;
-add categories here as needed — they carry no behavior.
+used for grouping and dashboards. It currently defines `RAG`, `SEGURIDAD` and
+`CALIDAD`; add categories here as needed — they carry no behavior.
 
 ### The Judge seam
 
@@ -390,8 +393,9 @@ So a template may use its required variables plus those three, and nothing else 
 
 1. Create a module `scorekeeper-engine/src/scorekeeper/core/metrics/catalog/<nombre>.py`.
 2. Subclass `SingleRubricMetric` (one rubric) or `MultiStepMetric` (several
-   steps). Set `name`, `category`, `scale`, `weight`, and — for single-rubric —
-   the Spanish `rubric`.
+   steps). Set `name`, `category`, `scale` and `weight`; a single-rubric metric
+   declares its rubric as the `RUBRIC_SLOT` prompt slot, whose text is seeded by
+   migration, not written in the class.
 3. Decorate it with `@register`.
 4. Import the module in `catalog/__init__.py` so it registers on import.
 5. Link it to the use cases that should score it via `POST /use-cases` — no code
@@ -402,30 +406,37 @@ So a template may use its required variables plus those three, and nothing else 
 7. Add a unit test (see below).
 
 ```python
-# scorekeeper-engine/src/scorekeeper/core/metrics/catalog/claridad.py
-from scorekeeper.core.metrics.base import SingleRubricMetric
+# scorekeeper-engine/src/scorekeeper/core/metrics/catalog/concision.py
+from scorekeeper.core.metrics.base import RUBRIC_SLOT, SingleRubricMetric
 from scorekeeper.core.metrics.category import MetricCategory
+from scorekeeper.core.metrics.prompts import PromptSlot
 from scorekeeper.core.metrics.registry import register
 from scorekeeper.core.metrics.scale import Likert
 
-RUBRICA_CLARIDAD = """\
-Evalúa la CLARIDAD de la respuesta (1-5): {prompt} {response}
-Devuelve la puntuación y una justificación breve en español.
-"""
 
 @register
-class Claridad(SingleRubricMetric):
-    name = "claridad"
-    category = MetricCategory.RAG
+class Concision(SingleRubricMetric):
+    name = "concision"
+    category = MetricCategory.CALIDAD
     scale = Likert()
     weight = 1.0
-    rubric = RUBRICA_CLARIDAD
+    prompts = (
+        PromptSlot(
+            slug=RUBRIC_SLOT,
+            description="Economía de la respuesta: dice lo necesario sin relleno.",
+        ),
+    )
 ```
 
 ```python
 # scorekeeper-engine/src/scorekeeper/core/metrics/catalog/__init__.py
-from scorekeeper.core.metrics.catalog import claridad  # noqa: F401
+from scorekeeper.core.metrics.catalog import concision  # noqa: F401
 ```
+
+Then seed the rubric's Spanish text in a migration — the class carries none, and
+scoring refuses to start for a slot with no active published version. `d7f2b6c1a840`
+is the worked example (see the [ten `calidad`
+metrics](metrics-catalog.md#calidad--the-ten-rubric-metrics)).
 
 ## Testing
 
