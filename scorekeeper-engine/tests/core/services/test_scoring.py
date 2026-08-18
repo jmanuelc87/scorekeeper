@@ -160,13 +160,13 @@ async def test_score_run_end_to_end(session: AsyncSession, registry) -> None:
 
 
 async def test_score_run_only_scores_selected_turns(session: AsyncSession, registry) -> None:
-    # Select only the first of the two ingested turns; scoring must skip the other.
+    # Ingest selects both turns; deselect the second, and scoring must skip it.
     files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
     run_id = await ingest_evaluation("claude", files, session=session)
-    first_turn = (
-        (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().first()
+    second_turn = (
+        (await session.execute(select(Turn).order_by(Turn.turn_number))).scalars().all()[1]
     )
-    await set_turn_selection(run_id, [str(first_turn.id)], True, session=session)
+    await set_turn_selection(run_id, [str(second_turn.id)], False, session=session)
 
     await score_run(run_id, session=session, judge=RecordingJudge(0.8))
 
@@ -213,12 +213,13 @@ async def test_set_turn_selection_ignores_foreign_and_bad_ids(
     updated = await set_turn_selection(
         run_id,
         ["not-a-uuid", "00000000-0000-0000-0000-000000000000"],
-        True,
+        False,
         session=session,
     )
 
     assert updated == 0
-    assert not any(
+    # Nothing was touched: the run's own turns keep the selected state ingest gave them.
+    assert all(
         t.is_selected for t in (await session.execute(select(Turn))).scalars().all()
     )
 

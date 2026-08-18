@@ -14,7 +14,7 @@ scored, see [Evaluation metrics](evaluation-metrics.md); for the credential stor
 | `GET /health`                | Liveness probe. |
 | `POST /api/v1/evaluations`          | Ingest conversation `.xlsx` files for scoring (per-file platform, defaulting to the payload platform). Persists at `ingerido`; does **not** start scoring. |
 | `POST /api/v1/captures`             | Ingest conversations captured from a chat UI as JSON for scoring (the browser extension's entry point). Persists at `ingerido`; does **not** start scoring. |
-| `PATCH /api/v1/evaluations/{run_id}/turns/selection` | Select (or deselect) which of an ingested run's turns are scored — scoring is **opt-in per turn**. Must be called before `/api/v1/evaluations/{run_id}/start`. |
+| `PATCH /api/v1/evaluations/{run_id}/turns/selection` | Deselect (or re-select) which of an ingested run's turns are scored — scoring is **opt-out per turn**, so this is only needed to narrow a run. Must be called before `/api/v1/evaluations/{run_id}/start`. |
 | `POST /api/v1/evaluations/{run_id}/start` | Start scoring an ingested run: flip it from `ingerido` to `en_cola` and **enqueue** the per-turn chain. |
 | `GET /api/v1/evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /api/v1/runs`                  | Retrieve full scored run details, filtered and at a chosen granularity. |
@@ -44,10 +44,10 @@ Retrieval (fetching/extracting each turn's source documents) and scoring (the LL
 per metric per turn) are both slow, so they run **off the request path**. Ingestion is also
 **decoupled from the start of scoring**: `POST /api/v1/evaluations` (and `POST /api/v1/captures`) parses the
 upload and persists the run tree synchronously at status `ingerido`, then returns `202` — it
-does **not** enqueue anything. Scoring is also **opt-in per turn**: an ingested turn's
-`Turn.is_selected` defaults to `false`, and the worker never visits a turn that is not
-selected — so a run scored without selecting turns scores nothing. A
-client picks the subset with `PATCH /api/v1/evaluations/{run_id}/turns/selection` before starting.
+does **not** enqueue anything. Scoring is **opt-out per turn**: an ingested turn's
+`Turn.is_selected` defaults to `true`, and the worker never visits a turn that is not
+selected — so a run started as ingested evaluates every turn. A client narrows that set
+with `PATCH /api/v1/evaluations/{run_id}/turns/selection` before starting.
 (An unselected turn is still fed to later selected turns' judge **history**, so the
 conversation the judge sees stays complete; it just isn't scored itself.) Scoring starts only
 when a client calls `POST /api/v1/evaluations/{run_id}/start`, which flips the run to `en_cola` and
@@ -156,9 +156,9 @@ On the request (`ingest_evaluation`):
    **not** interpreted here; the retrieval pipeline handles it in the worker.
 3. Build and commit the `BenchmarkRun → PlatformExecution → ScenarioResult → Turn`
    tree — one `PlatformExecution` per distinct platform — with status `ingerido`. Every
-   `Turn` lands with `is_selected = false`. Nothing is enqueued; the run waits for a client
-   to select turns (`PATCH /api/v1/evaluations/{run_id}/turns/selection`) and call
-   `POST /api/v1/evaluations/{run_id}/start`.
+   `Turn` lands with `is_selected = true`. Nothing is enqueued; the run waits for a client to
+   call `POST /api/v1/evaluations/{run_id}/start`, optionally dropping turns first with
+   `PATCH /api/v1/evaluations/{run_id}/turns/selection`.
 
 After `POST /api/v1/evaluations/{run_id}/start` flips the run to `en_cola` and enqueues the
 chain (carrying just the `run_id`), the worker processes **only the selected turns**, one
@@ -271,11 +271,12 @@ Identical to `POST /api/v1/evaluations` — the run is persisted at `ingerido`. 
 
 ## `PATCH /api/v1/evaluations/{run_id}/turns/selection`
 
-Select (or deselect) which of an ingested run's turns are scored. Scoring is **opt-in per
-turn**: a freshly ingested turn is not selected (`Turn.is_selected = false`), and the worker
-skips unselected turns in **both** retrieval and scoring — so a run started without selecting
-any turn scores nothing. Call this to pick the subset to evaluate **before**
-`POST /api/v1/evaluations/{run_id}/start`.
+Deselect (or re-select) which of an ingested run's turns are scored. Scoring is **opt-out per
+turn**: a freshly ingested turn is selected (`Turn.is_selected = true`), and the worker skips
+unselected turns in **both** retrieval and scoring — so a run started untouched evaluates
+everything. Call this to narrow the set **before**
+`POST /api/v1/evaluations/{run_id}/start`; a run that should score every turn needs no call
+at all.
 
 The `run_id` is the one returned by `POST /api/v1/evaluations` or `POST /api/v1/captures`; the turn ids are
 the `turn_id`s discoverable from [`GET /api/v1/scenarios/{scenario_id}/turns`](#get-apiv1scenariosscenario_idturns)
@@ -996,12 +997,13 @@ curl -X POST http://localhost:8001/api/v1/evaluations \
 # {"run_id":"b1f2…","status":"ingerido"}
 ```
 
-Select which turns to score (opt-in; do this before starting) → returns how many were flagged:
+Optionally drop turns from the run (everything is scored otherwise; do this before starting)
+→ returns how many were flagged:
 
 ```bash
 curl -X PATCH http://localhost:8001/api/v1/evaluations/b1f2…/turns/selection \
   -H 'Content-Type: application/json' \
-  -d '{"turn_ids": ["7c9e…", "8d0f…"], "is_selected": true}'
+  -d '{"turn_ids": ["7c9e…", "8d0f…"], "is_selected": false}'
 # {"run_id":"b1f2…","updated":2}
 ```
 

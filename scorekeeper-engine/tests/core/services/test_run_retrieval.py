@@ -137,7 +137,10 @@ async def test_retrieve_run_skips_unselected_turns(session: AsyncSession) -> Non
         [[1, "user", "pregunta", "manual (https://h/x.html)"], [1, "model", "respuesta", ""]],
     )
     files = [UploadedFile(filename="esc.xlsx", content=content, scenario_id="esc")]
-    run_id = await ingest_evaluation("claude", files, session=session)  # left unselected
+    run_id = await ingest_evaluation("claude", files, session=session)
+    # Ingest selects every turn, so deselect this one to get the case under test.
+    turn_id = str((await session.execute(select(Turn.id))).scalars().one())
+    await run_service.set_turn_selection(run_id, [turn_id], False, session=session)
     pipeline = _FakePipeline()
 
     await retrieve_run(run_id, session=session, pipeline=pipeline)

@@ -130,10 +130,12 @@ async def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
 async def select_turns(run_id: str, payload: TurnSelectionRequest) -> TurnSelectionResponse:
     """Mark a subset of a run's turns as selected (or not) for scoring.
 
-    Scoring is opt-in per turn: only turns flagged ``is_selected`` are evaluated by
-    the worker. Call this before ``POST /evaluations/{run_id}/start`` to pick the
-    subset. Turn ids that don't belong to the run are ignored; the response reports
-    how many turns were actually updated. ``404`` when the ``run_id`` is unknown,
+    Scoring is opt-out per turn: an ingested turn arrives selected, and only turns
+    flagged ``is_selected`` are evaluated by the worker. Call this before
+    ``POST /evaluations/{run_id}/start`` to narrow the run — with
+    ``is_selected: false`` to skip turns, or ``true`` to put one back. Turn ids that
+    don't belong to the run are ignored; the response reports how many turns were
+    actually updated. ``404`` when the ``run_id`` is unknown,
     ``409`` when the run has already left the ``ingerido`` state (already started).
     """
     try:
