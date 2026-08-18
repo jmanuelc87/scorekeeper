@@ -314,7 +314,7 @@ def _seed_prompts(bind=None) -> None:
     already run ``sync_metrics``: a metric name that exists is reused, and a prompt slot
     that exists is left alone (its text may have been edited already).
 
-    **Requires online mode** (``alembic upgrade heads``, what the compose ``migrate``
+    **Requires online mode** (``alembic upgrade head``, what the compose ``migrate``
     service runs) — it cannot be rendered with ``--sql``: the ``SELECT``s below have
     nothing to return offline, and SQLAlchemy has no literal renderer for the JSON value
     ``required_variables`` needs.
