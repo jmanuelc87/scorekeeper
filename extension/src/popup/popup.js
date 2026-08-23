@@ -7,16 +7,22 @@
  */
 
 import {
+  captureLabels,
   getSettings,
+  newestRun,
   normalizeChatUrl,
   RUNS_KEY,
+  runCaptures,
+  runScenarioIds,
   STATUS_LABELS,
   slugify,
-  timestamp,
 } from "../config.js";
 
 /** Extension page listing every run; opened from the header link. */
 const EVALUATIONS_PAGE = "src/evaluations/evaluations.html";
+
+/** Window the send button coalesces repeat presses over, in ms. */
+const SUBMIT_DEBOUNCE_MS = 700;
 
 const ui = {
   detection: document.getElementById("detection"),
@@ -24,11 +30,15 @@ const ui = {
   platform: document.getElementById("platform"),
   model: document.getElementById("model"),
   scenario: document.getElementById("scenario"),
+  scenarioList: document.getElementById("scenarioList"),
+  runLabel: document.getElementById("runLabel"),
+  runLabelList: document.getElementById("runLabelList"),
   useCase: document.getElementById("useCase"),
   submit: document.getElementById("submit"),
   error: document.getElementById("error"),
   run: document.getElementById("run"),
   runStatus: document.getElementById("runStatus"),
+  runLabelValue: document.getElementById("runLabelValue"),
   runScenario: document.getElementById("runScenario"),
   runModel: document.getElementById("runModel"),
   runProgress: document.getElementById("runProgress"),
@@ -46,6 +56,8 @@ let activeTabId = null;
 let activeTabUrl = null;
 /** The run shown in the detail panel (the open chat's run), or `null`. */
 let detailRunId = null;
+/** Pending debounced send, or `null` when none is armed. */
+let submitTimer = null;
 
 ui.options.addEventListener("click", (event) => {
   event.preventDefault();
@@ -59,7 +71,15 @@ ui.evaluations.addEventListener("click", (event) => {
 
 ui.form.addEventListener("submit", (event) => {
   event.preventDefault();
-  void submit();
+  // Coalesce repeat presses: the send fires once, SUBMIT_DEBOUNCE_MS after the last
+  // one. The button is disabled on the first press so the wait cannot read as a dead
+  // click — and so a second press cannot push the timer further out.
+  clearTimeout(submitTimer);
+  ui.submit.disabled = true;
+  submitTimer = setTimeout(() => {
+    submitTimer = null;
+    void submit();
+  }, SUBMIT_DEBOUNCE_MS);
 });
 
 // The detail panel's refresh re-polls the open chat's run.
@@ -85,10 +105,11 @@ async function init() {
   }
   activeTabId = tab.id;
   activeTabUrl = tab.url ?? null;
-  // Render once the tab URL is known, so the open chat's detail panel appears.
-  void send({ type: "state" })
-    .then(render)
-    .catch(() => {});
+  // Render once the tab URL is known, so the open chat's detail panel appears. The
+  // history is also what the lote field is prefilled from and what both datalists
+  // are built from, so it is awaited here rather than left to resolve on its own.
+  const runs = await send({ type: "state" }).catch(() => []);
+  render(runs);
 
   let capture;
   try {
@@ -123,6 +144,9 @@ async function init() {
   // Blank when the chat does not name its model (or the adapter declares none) —
   // the field stays editable so it can be supplied by hand.
   ui.model.value = capture.model ?? "";
+  // The lote carries over between captures, the scenario id does not — see
+  // defaultScenarioId(). Blank when the last capture named no lote.
+  ui.runLabel.value = newestRun(runs)?.runLabel ?? "";
   ui.scenario.value = defaultScenarioId(capture);
   ui.useCase.value = settings.useCase;
   ui.submit.disabled = false;
@@ -130,10 +154,17 @@ async function init() {
   ui.scenario.select();
 }
 
-/** A unique, readable scenario id: the chat's title plus the capture time. */
+/**
+ * The scenario id to start from: a slug of the chat's own title.
+ *
+ * Not the previous capture's id any more. Within a lote the batch name is what
+ * repeats and the scenario is what changes, so offering the last scenario back
+ * would be wrong on most captures. Reusing one — to compare a second platform on
+ * the same task — stays one gesture: every id in the history is on the field's
+ * datalist, and the field opens focused and selected.
+ */
 function defaultScenarioId(capture) {
-  const title = slugify(capture.title ?? "");
-  return [title || capture.adapter.id, timestamp()].join("-");
+  return slugify(capture.title ?? "") || capture.adapter.id;
 }
 
 async function submit() {
@@ -149,6 +180,7 @@ async function submit() {
         platform: ui.platform.value.trim(),
         model: ui.model.value.trim(),
         scenarioId: ui.scenario.value.trim(),
+        runLabel: ui.runLabel.value.trim(),
         useCase: ui.useCase.value.trim(),
       },
     });
@@ -169,17 +201,27 @@ async function submit() {
 function render(runs) {
   if (!Array.isArray(runs)) return;
 
+  renderDatalists(runs);
+
   const current = normalizeChatUrl(activeTabUrl);
-  const run = current ? runs.find((entry) => normalizeChatUrl(entry.sourceUrl) === current) : null;
+  const run = current
+    ? runs.find((entry) =>
+        runCaptures(entry).some((item) => normalizeChatUrl(item.sourceUrl) === current),
+      )
+    : null;
 
   detailRunId = run?.runId ?? null;
   ui.run.hidden = !run;
   if (!run) return;
 
+  const captures = runCaptures(run);
+  const labels = captureLabels(captures);
   ui.runStatus.textContent = STATUS_LABELS[run.status] ?? run.status;
   ui.runStatus.dataset.status = run.status;
-  ui.runScenario.textContent = `${run.scenarioId} · ${run.platform}`;
-  ui.runModel.textContent = run.model || "—";
+  ui.runLabelValue.textContent = run.runLabel || "—";
+  // Every scenario the run holds: with a lote it groups more than one.
+  ui.runScenario.textContent = [...runScenarioIds(run), ...labels].join(" · ");
+  ui.runModel.textContent = formatModels(captures, labels);
   ui.runId.textContent = run.runId;
   ui.runProgress.textContent = formatProgress(run);
   ui.runAverage.textContent = formatAverages(run);
@@ -193,7 +235,31 @@ function formatProgress(run) {
     : "—";
 }
 
-// One entry per platform in the run; a capture only ever submits one.
+/**
+ * The scenario ids and lote names already used as the two fields' autocomplete
+ * lists — how a second platform gets sent under the scenario the first one opened,
+ * and how another scenario joins a lote already under way.
+ */
+function renderDatalists(runs) {
+  fillDatalist(ui.scenarioList, runs.flatMap(runScenarioIds));
+  fillDatalist(ui.runLabelList, runs.map((run) => run.runLabel).filter(Boolean));
+}
+
+function fillDatalist(list, values) {
+  list.replaceChildren(
+    ...[...new Set(values)].map((value) =>
+      Object.assign(document.createElement("option"), { value }),
+    ),
+  );
+}
+
+/** Name the platform beside its model once a run holds more than one capture. */
+function formatModels(captures, labels) {
+  if (captures.length <= 1) return captures[0]?.model || "—";
+  return captures.map((item, index) => `${labels[index]}: ${item.model || "—"}`).join(" · ");
+}
+
+// One entry per platform execution scored under the run.
 function formatAverages(run) {
   const averages = (run.platforms ?? [])
     .filter((entry) => entry.average_score !== null)

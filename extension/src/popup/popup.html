@@ -18,6 +18,22 @@
 
     <form id="form">
       <label>
+        Lote
+        <input id="runLabel" name="runLabel" autocomplete="off" list="runLabelList" />
+        <!-- Filled from the batch names already in the run history, so several
+             escenarios can be sent under one lote. -->
+        <datalist id="runLabelList"></datalist>
+        <small>Agrupa varios escenarios en una evaluación; déjalo vacío si no lo usas.</small>
+      </label>
+      <label>
+        Escenario
+        <input id="scenario" name="scenario" required autocomplete="off" list="scenarioList" />
+        <!-- Filled from the scenario ids already in the run history, so the same id
+             can be reused to compare another platform under one escenario. -->
+        <datalist id="scenarioList"></datalist>
+        <small>Reutiliza el mismo id para comparar varias plataformas en un escenario.</small>
+      </label>
+      <label>
         Plataforma
         <input id="platform" name="platform" required autocomplete="off" />
       </label>
@@ -25,10 +41,6 @@
         Modelo
         <input id="model" name="model" autocomplete="off" />
         <small>Se detecta cuando el chat lo muestra; déjalo vacío si no lo sabes.</small>
-      </label>
-      <label>
-        Escenario
-        <input id="scenario" name="scenario" required autocomplete="off" />
       </label>
       <label>
         Caso de uso
@@ -47,6 +59,8 @@
       <dl>
         <dt>Estado</dt>
         <dd><span id="runStatus" class="badge"></span></dd>
+        <dt>Lote</dt>
+        <dd id="runLabelValue">—</dd>
         <dt>Escenario</dt>
         <dd id="runScenario"></dd>
         <dt>Modelo</dt>

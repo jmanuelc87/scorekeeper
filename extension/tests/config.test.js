@@ -10,14 +10,17 @@
 
 import { beforeEach, describe, expect, it } from "vitest";
 import {
+  captureLabels,
   DEFAULTS,
   getRuns,
   getSettings,
+  newestRun,
   normalizeChatUrl,
   originPattern,
   RUNS_KEY,
+  runCaptures,
+  runScenarioIds,
   slugify,
-  timestamp,
   trimSlash,
   upsertRun,
 } from "../src/config.js";
@@ -111,9 +114,101 @@ describe("slugify", () => {
   });
 });
 
-describe("timestamp", () => {
-  it("renders a sortable zero-padded local stamp", () => {
-    expect(timestamp(new Date(2026, 0, 5, 9, 7))).toBe("2026-01-05-09-07");
+describe("captureLabels", () => {
+  it("leaves a platform captured once as its bare name", () => {
+    expect(captureLabels([{ platform: "copilot" }, { platform: "gemini" }])).toEqual([
+      "copilot",
+      "gemini",
+    ]);
+  });
+
+  it("numbers a platform the run holds twice, since the API appends both", () => {
+    expect(
+      captureLabels([{ platform: "copilot" }, { platform: "gemini" }, { platform: "copilot" }]),
+    ).toEqual(["copilot #1", "gemini", "copilot #2"]);
+  });
+
+  it("has one label per capture, in order", () => {
+    const captures = [{ platform: "claude" }, { platform: "claude" }];
+    expect(captureLabels(captures)).toHaveLength(captures.length);
+  });
+});
+
+describe("runCaptures", () => {
+  it("returns the captures of a run that holds several platform executions", () => {
+    const captures = [{ platform: "copilot" }, { platform: "gemini" }];
+    expect(runCaptures({ runId: "r1", captures })).toBe(captures);
+  });
+
+  it("reads a pre-multi-capture entry back as a single capture", () => {
+    expect(
+      runCaptures({
+        runId: "r1",
+        platform: "claude",
+        model: "Opus",
+        turns: 4,
+        sourceUrl: "https://claude.ai/chat/abc",
+      }),
+    ).toEqual([
+      { platform: "claude", model: "Opus", turns: 4, sourceUrl: "https://claude.ai/chat/abc" },
+    ]);
+  });
+
+  it("is empty when the run names no capture at all", () => {
+    expect(runCaptures({ runId: "r1" })).toEqual([]);
+    expect(runCaptures(null)).toEqual([]);
+  });
+});
+
+describe("runScenarioIds", () => {
+  it("lists every scenario a lote grouped under one run, in capture order", () => {
+    expect(
+      runScenarioIds({
+        runId: "r1",
+        scenarioId: "s-01",
+        captures: [{ scenarioId: "s-01" }, { scenarioId: "s-02" }],
+      }),
+    ).toEqual(["s-01", "s-02"]);
+  });
+
+  it("dedupes the scenario captured from several platforms", () => {
+    expect(
+      runScenarioIds({ runId: "r1", captures: [{ scenarioId: "s-01" }, { scenarioId: "s-01" }] }),
+    ).toEqual(["s-01"]);
+  });
+
+  it("falls back to the run's own id for captures written before it moved", () => {
+    expect(
+      runScenarioIds({ runId: "r1", scenarioId: "s-01", captures: [{ platform: "copilot" }] }),
+    ).toEqual(["s-01"]);
+  });
+
+  it("reads a pre-captures entry, and is empty when no scenario is named", () => {
+    expect(runScenarioIds({ runId: "r1", scenarioId: "s-01", platform: "claude" })).toEqual([
+      "s-01",
+    ]);
+    expect(runScenarioIds({ runId: "r1" })).toEqual([]);
+    expect(runScenarioIds(null)).toEqual([]);
+  });
+});
+
+describe("newestRun", () => {
+  it("picks the most recently updated run, not the first stored", () => {
+    const runs = [
+      { runId: "a", updatedAt: "2026-08-20T10:00:00.000Z" },
+      { runId: "b", updatedAt: "2026-08-20T12:00:00.000Z" },
+    ];
+    expect(newestRun(runs).runId).toBe("b");
+  });
+
+  it("tolerates an entry with no updatedAt rather than preferring it", () => {
+    const runs = [{ runId: "a" }, { runId: "b", updatedAt: "2026-08-20T12:00:00.000Z" }];
+    expect(newestRun(runs).runId).toBe("b");
+  });
+
+  it("is null with no runs", () => {
+    expect(newestRun([])).toBeNull();
+    expect(newestRun(undefined)).toBeNull();
   });
 });
 

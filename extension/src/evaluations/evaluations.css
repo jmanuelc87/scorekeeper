@@ -87,6 +87,7 @@ tbody tr:first-child td {
   border-top: 0;
 }
 
+.cell-label,
 .cell-scenario {
   max-width: 16rem;
   overflow: hidden;

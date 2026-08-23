@@ -45,9 +45,29 @@ match somebody else's live markup, so the check for those is still opening a rea
    rendering — only what is in the DOM gets captured, so scroll up if the app
    virtualizes long threads.
 2. Click the extension icon. The popup reports how many messages it found and
-   pre-fills the platform, the model answering (when the chat names it), a scenario
-   id (page title + timestamp) and the default use case.
+   pre-fills the lote of the last capture, the platform, the model answering (when
+   the chat names it), a scenario id and the default use case.
 3. Adjust the metadata and press **Enviar a Scorekeeper**.
+
+The **Escenario** field is what groups captures *within* one scenario: send two chats
+under the same scenario id and they land in one scenario, one platform execution
+each — which is the whole point, since the extension only ever reads the tab in front
+of it. The field is pre-filled with a slug of the chat title, i.e. as a **new**
+scenario; every id already in the run history is offered as autocomplete, so the id a
+first platform opened is picked back up by typing (the field opens focused and
+selected, so it is one gesture either way).
+
+The **Lote** field is what groups several *scenarios* into one evaluation run. It is
+free text, optional, sent as the payload's `run_label`, and every capture that names
+the same lote joins the same run — `{lote: "lote-agosto", escenario: "S-01"}` and
+`{lote: "lote-agosto", escenario: "S-02"}` are two scenarios of one run. Left empty it
+is sent as `null` and the API groups by scenario id alone, exactly as before. It is
+pre-filled with the lote of the most recently updated run and autocompleted from every
+lote in the history, so it is the field that *persists* across captures while the
+scenario id is the one that changes.
+
+The API only reuses a scenario while its run has not started scoring. Once scoring
+begins, the same id typed again opens a **new** run rather than joining the old one.
 
 On a page that is not a supported chat — or a supported chat with no conversation
 open — the popup states why instead, and **Enviar a Scorekeeper** stays disabled.
@@ -121,18 +141,50 @@ and the popup comes up blank until you reload the page.
 
 The captured turns reach the same database rows as an `.xlsx` upload: the API
 normalizes them through `scorekeeper.importer.normalize_messages` and ingests
-them with `ingest_evaluation`, so one capture is one `ScenarioResult` with its
-`Turn` rows. See [`docs/apis.md`](../docs/apis.md) for `POST /api/v1/captures`.
+them with `ingest_evaluation`, so one capture is one `PlatformExecution` — the platform
+it was captured from, plus its `Turn` rows — hanging off a `ScenarioResult` named by the
+scenario id you typed. Capture the *same* scenario id from another chat platform and the
+two land under one scenario, side by side — the second capture joins the first one's
+run instead of opening its own, for as long as that run has not started scoring. The
+optional top-level `run_label` widens that to a batch: captures sharing a label join
+one run whatever scenario they name. See [`docs/apis.md`](../docs/apis.md) for
+`POST /api/v1/captures`.
 
 ## Run history & the two surfaces
 
-Every submit appends a run to a single `runs` list in `chrome.storage.local`
+Every submit writes a run into a single `runs` list in `chrome.storage.local`
 (newest first, capped at 25, oldest dropped). Each entry carries what the two UI
-surfaces need without another API call: `runId`, `scenarioId`, `platform`, `model`,
-`status`, `progress`, per-platform averages, `sourceUrl` (the chat it came from)
-and any transient `error`. The helpers that own this shape live in
-`src/config.js` (`getRuns`, `getRun`, `upsertRun`); a pre-history single `lastRun`
-key is folded into the list once on first read, so upgrading loses nothing.
+surfaces need without another API call: `runId`, `runLabel` (the lote, or `null`),
+`useCase`, `status`, `progress`, per-platform averages and any transient `error`, plus
+a `captures` list with one record per platform execution sent under it — `scenarioId`,
+`platform`, `model`, `turns` and `sourceUrl` (the chat it came from).
+
+The scenario id sits on each **capture**, not on the run: a run reached through a lote
+holds several scenarios, so only the capture knows which one it named. The entry still
+carries the `scenarioId` that opened it at the top level, for entries read by older
+code; `runScenarioIds` (`src/config.js`) is what the surfaces call, and it reads both
+shapes — per-capture ids when they are there, the run's single id otherwise — so
+neither the popup panel nor the table claims a run is one scenario when it is several.
+
+That list is why a submit *merges* rather than replaces: when the API answers with a
+run id the history already holds — the scenario or the lote was reused — the new
+capture is appended to the existing entry. Overwriting it would drop the platform it was
+already tracking and leave the UI naming one chat for a run holding several.
+
+The append is unconditional, with no dedupe of any kind: the API adds one
+`PlatformExecution` per capture, so sending the *same* chat twice really does give
+the scenario two executions. Folding those into one record here would under-report
+what the run holds. `captureLabels` (`src/config.js`) is what keeps that readable —
+a platform captured once shows as `copilot`, one captured twice as `copilot #1` and
+`copilot #2` — so a repeated platform reads as two executions rather than as a
+rendering bug.
+
+The helpers that own this shape live in `src/config.js` (`getRuns`, `getRun`,
+`upsertRun`, `runCaptures`, `runScenarioIds`, `captureLabels`, `newestRun` — which
+picks the most recently updated entry, since a poll cycle re-prepends the list and
+leaves `runs[0]` meaning nothing); a pre-history single `lastRun` key is folded into the
+list once on first read, and `runCaptures` reads an entry written before `captures`
+existed back as a single-capture list, so upgrading loses nothing.
 
 The worker polls **every** non-terminal run on the 30s alarm and clears the alarm
 only once all of them are terminal (`completado`, `parcial`, `fallido`), so
@@ -148,15 +200,16 @@ the meantime cancels it), and a `!` from a partial/failed run is left in place.
 Two surfaces read that one store, each re-rendering on `storage.onChanged`:
 
 - **Popup — “Última evaluación”.** Shows the run for the *open chat only*. The run
-  is matched by comparing the tab URL to each `sourceUrl` through
+  is matched by comparing the tab URL to each capture's `sourceUrl` through
   `normalizeChatUrl` (`src/config.js`), which drops `?query` and `#hash`: the
   conversation lives in the path (`claude.ai/chat/<id>`) and a new message never
   changes it, while trackers and scroll anchors do. No match → the panel is
   hidden, keeping another chat's result from showing under this one.
 - **Evaluations page** (`src/evaluations/`, opened from the popup's
   **Evaluaciones** link via `chrome.tabs.create`). A full-page tab listing every
-  run — scenario, platform, status, progress, average, a link back to the source
-  chat, and a per-row refresh for the ones still scoring.
+  run — lote, every scenario and platform execution captured under it, status,
+  progress, average, a link back to each source chat, and a per-row refresh for the
+  ones still scoring.
 
 ## Maintaining the adapters
 
@@ -184,7 +237,7 @@ An adapter may declare a `model` selector list — where the app names the model
 answering. The first **non-empty** match wins, its first line is kept and its
 whitespace collapsed (these pickers stack a chevron and often a subtitle under the
 name), and the result is truncated to 128 characters, the width of the
-`scenario_results.model_name` column it ends up in.
+`platform_executions.model_name` column it ends up in.
 
 Alone among the selectors here, `model` resolves against the whole `document` rather
 than inside a message bubble: the picker is page furniture next to the composer, not

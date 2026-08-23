@@ -12,7 +12,14 @@
  * extra allowed origin. The same request from a content script would not be.
  */
 
-import { getRun, getRuns, getSettings, TERMINAL_STATUSES, upsertRun } from "./config.js";
+import {
+  getRun,
+  getRuns,
+  getSettings,
+  runCaptures,
+  TERMINAL_STATUSES,
+  upsertRun,
+} from "./config.js";
 
 /** Injected on demand; deliberately not a declared content script. */
 const CAPTURE_FILE = "src/content/capture.js";
@@ -115,6 +122,10 @@ async function submitCapture(tabId, meta) {
     body: JSON.stringify({
       platform: meta.platform,
       use_case: meta.useCase,
+      // The batch this capture belongs to: every capture sent under the same label
+      // joins one run, however many scenarios it names. Null when left empty — the
+      // API then falls back to grouping by scenario id alone.
+      run_label: meta.runLabel || null,
       conversations: [
         {
           scenario_id: meta.scenarioId,
@@ -133,19 +144,38 @@ async function submitCapture(tabId, meta) {
   if (!response.ok) throw new Error(await errorDetail(response));
 
   const { run_id: runId, status } = await response.json();
+  // The API answers with the *existing* run when the scenario id is one it already
+  // knows, so this capture may be joining an entry the history already holds: merge
+  // into it instead of replacing it, or the platform it was already tracking is lost.
+  const existing = await getRun(runId);
+  const entry = {
+    // Per capture, not per run: a run reused through its `run_label` holds several
+    // scenarios, so only the capture knows which one it named.
+    scenarioId: meta.scenarioId,
+    platform: meta.platform,
+    model: meta.model,
+    turns: capture.messages.length,
+    sourceUrl: capture.url,
+  };
+
   const run = {
     runId,
     status,
+    error: null,
     apiUrl: settings.apiUrl,
-    platform: meta.platform,
-    model: meta.model,
-    scenarioId: meta.scenarioId,
+    // The scenario that opened the run, kept for entries read by older code; every
+    // scenario it holds is read with `runScenarioIds`.
+    scenarioId: existing?.scenarioId ?? meta.scenarioId,
+    runLabel: meta.runLabel || existing?.runLabel || null,
     useCase: meta.useCase,
-    turns: capture.messages.length,
-    sourceUrl: capture.url,
+    // Appended unconditionally, never deduped: the API adds one PlatformExecution
+    // per capture — re-capturing the same chat on the same platform gives the
+    // scenario a second execution — so anything folded away here would leave the
+    // history under-reporting what the run holds.
+    captures: [...runCaptures(existing), entry],
     updatedAt: new Date().toISOString(),
-    progress: null,
-    platforms: [],
+    progress: existing?.progress ?? null,
+    platforms: existing?.platforms ?? [],
   };
 
   await upsertRun(run);
