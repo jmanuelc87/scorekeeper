@@ -26,11 +26,17 @@ from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.core.metrics.scale import Unit
 from scorekeeper.core.metrics.selection import MissingPromptError, sync_prompts
 from scorekeeper.core.services.ingestion import UploadedFile, ingest_evaluation
-from scorekeeper.core.services.runs import get_run_summary, set_turn_selection, start_run
+from scorekeeper.core.services.runs import (
+    get_run_summary,
+    resume_run,
+    set_turn_selection,
+    start_run,
+)
 from scorekeeper.core.services.scoring import score_run
 from scorekeeper.db.models import (
     BenchmarkRun,
     MetricScore,
+    PlatformExecution,
     Prompt,
     PromptVersion,
     RunPromptBinding,
@@ -282,6 +288,52 @@ async def test_start_run_already_started_raises(session: AsyncSession, registry)
         await start_run(run_id, session=session)
 
 
+async def test_resume_run_requeues_a_failed_run(session: AsyncSession, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
+    run.status = "fallido"
+    await session.commit()
+
+    status = await resume_run(run_id, session=session)
+
+    assert status == "en_cola"
+    await session.refresh(run)
+    assert run.status == "en_cola"
+
+
+async def test_resume_run_requeues_a_partial_run(session: AsyncSession, registry) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
+    run.status = "parcial"
+    await session.commit()
+
+    assert await resume_run(run_id, session=session) == "en_cola"
+
+
+async def test_resume_run_unknown_returns_none(session: AsyncSession) -> None:
+    assert await resume_run("not-a-uuid", session=session) is None
+    assert await resume_run("00000000-0000-0000-0000-000000000000", session=session) is None
+
+
+@pytest.mark.parametrize("status", ["ingerido", "en_cola", "en_proceso", "completado"])
+async def test_resume_run_rejects_non_resumable_states(
+    session: AsyncSession, registry, status: str
+) -> None:
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
+    run.status = status
+    await session.commit()
+
+    # A live chain must not get a second one, and a finished run has nothing to resume.
+    with pytest.raises(ValueError):
+        await resume_run(run_id, session=session)
+    await session.refresh(run)
+    assert run.status == status
+
+
 # --- prompt binding -----------------------------------------------------------
 # Templates come from the database now, so a run must pin the versions it scores
 # under: scoring is a long job while the prompt API stays live, and resolving per
@@ -443,14 +495,18 @@ def _counting(judge: RecordingJudge) -> list[str]:
 
 
 async def _rewind(session: AsyncSession) -> None:
-    """Undo the scenario status a finished run left behind.
+    """Undo the statuses a finished run left behind.
 
-    Reproduces a worker that died after committing its scores but before the scenario
-    roll-up, which is the state a resumed run actually starts from — and the state in
-    which the per-metric fingerprint, rather than the ``completado`` shortcut, decides.
+    Reproduces a worker that died after committing its scores but before the roll-up,
+    which is the state a resumed run actually starts from — and the state in which the
+    per-metric fingerprint, rather than the ``completado`` shortcut, decides. Both the
+    scenario and its platform executions carry that shortcut, so both are rewound:
+    leaving the executions ``completado`` would skip them before the fingerprint runs.
     """
     for scenario in (await session.execute(select(ScenarioResult))).scalars().all():
         scenario.status = "pending"
+    for platform_exec in (await session.execute(select(PlatformExecution))).scalars().all():
+        platform_exec.status = "pending"
     await session.commit()
 
 

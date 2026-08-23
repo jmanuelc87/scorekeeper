@@ -8,12 +8,22 @@ defined and scored, see [Evaluation metrics](evaluation-metrics.md).
 ## Overview
 
 A **SourceFile** is an imported `.xlsx` of interactions that seeds one or more
-**BenchmarkRun** rows. Each run fans out into one **PlatformExecution** per
-platform, whose conversations are stored as **ScenarioResult** rows. Every
-conversation is split into **Turn** rows (one user/model exchange each), and
-each turn is scored by an LLM-as-a-judge into multiple **MetricScore** rows. The
-LLM tokens consumed while scoring a turn are summed into a **TurnTokenUsage** row
-(one per turn).
+**BenchmarkRun** rows. Each run fans out into **ScenarioResult** rows — one per
+scenario, the *task* being benchmarked — and each scenario holds one
+**PlatformExecution** per platform it was run on. A `PlatformExecution` is the captured
+conversation itself: which platform answered, which model, where it came from, and the
+**Turn** rows (one user/model exchange each) derived from it. Each turn is scored by an
+LLM-as-a-judge into multiple **MetricScore** rows. The LLM tokens consumed while scoring
+a turn are summed into a **TurnTokenUsage** row (one per turn).
+
+This is what makes a scenario a **like-for-like comparison**: the same task, the same
+metric set, several platforms answering it side by side.
+
+A turn that was answered from retrieved context also carries **RetrievedDocument** rows —
+the documents the answer was grounded on. Each of those may in turn be split into
+**RetrievedDocumentEmbedding** rows, one per chunk with its vector, for chunk-level
+retrieval and re-ranking. Nothing writes those yet; the table is storage ahead of its
+consumer.
 
 Scores flow upward:
 
@@ -21,8 +31,21 @@ Scores flow upward:
   normalized to [0, 1]**. Metrics score on their own scale (1-5, 0-1, boolean);
   each raw score is normalized and weighted using the metric's `scale`/`weight`,
   which live in code (`scorekeeper.core.metrics`) keyed by `metric_name`,
-- a scenario's `average_score` averages its turns' `turn_score`,
-- a platform's `average_score` averages its scenarios' `average_score`.
+- a platform execution's `average_score` averages its turns' `turn_score`.
+
+**The chain of averages stops there.** A scenario has no score of its own: a mean across
+the platforms being compared would blend Claude's answer with Gemini's into one number,
+which is the opposite of what a comparison is for. To compare, read the executions side
+by side.
+
+Statuses do roll all the way up (`core.runner.rollup_status`), since "did every platform
+finish" is still a fact about a scenario: an execution is `completado`/`parcial`/`fallido`
+by its turns, a scenario by its executions, and the run by its scenarios.
+
+There is no stored *per-run, per-platform* average. "How did this platform do across
+this run" is a group-by over the run's executions, computed at read time
+(`services.serializers.platform_rollups`) — so a run comparing three platforms still
+reports one rollup per platform without a table to keep in sync.
 
 Every one of those means skips children that carry no score: `NULL` (never scored)
 and the negative `NOT_APPLICABLE` sentinel a metric stores when it had nothing to
@@ -77,33 +100,34 @@ erDiagram
         UUID source_file_id FK
         DateTime created_at
         String status
+        String label
     }
 
     PlatformExecution {
         UUID id PK
-        UUID run_id FK
+        UUID scenario_result_id FK
         String platform
-        DateTime started_at
-        DateTime finished_at
-        Float average_score
-    }
-
-    ScenarioResult {
-        UUID id PK
-        UUID platform_execution_id FK
-        String scenario_id
-        UUID use_case_id FK
         String model_name
         String source_ref
         String status
         String screenshot_path
+        DateTime started_at
+        DateTime finished_at
         Float average_score
         JSON raw_conversation
     }
 
+    ScenarioResult {
+        UUID id PK
+        UUID run_id FK
+        String scenario_id
+        UUID use_case_id FK
+        String status
+    }
+
     Turn {
         UUID id PK
-        UUID scenario_result_id FK
+        UUID platform_execution_id FK
         Integer turn_number
         Text prompt
         Text response
@@ -122,6 +146,14 @@ erDiagram
         Text document
         Text content
         Text url
+    }
+
+    RetrievedDocumentEmbedding {
+        UUID id PK
+        UUID retrieved_document_id FK
+        Integer chunk_index
+        Text content
+        Vector embedding
     }
 
     MetricScore {
@@ -221,10 +253,11 @@ erDiagram
     }
 
     SourceFile ||--o{ BenchmarkRun : "seeds"
-    BenchmarkRun ||--o{ PlatformExecution : "has"
-    PlatformExecution ||--o{ ScenarioResult : "has"
-    ScenarioResult ||--o{ Turn : "has"
+    BenchmarkRun ||--o{ ScenarioResult : "has"
+    ScenarioResult ||--o{ PlatformExecution : "compared across"
+    PlatformExecution ||--o{ Turn : "has"
     Turn ||--o{ RetrievedDocument : "grounded on"
+    RetrievedDocument ||--o{ RetrievedDocumentEmbedding : "chunked into"
     Turn ||--o{ MetricScore : "has"
     Turn ||--|| TurnTokenUsage : "has"
     MetricScore ||--|| MetricTrace : "has"
@@ -259,7 +292,8 @@ An imported `.xlsx` file of interactions — the source of one or more runs.
 
 ### BenchmarkRun
 
-One benchmark invocation, scored under a single platform (one `PlatformExecution`).
+One benchmark invocation — the root of the run tree. Its children are the
+conversations it scored; the platform each ran under hangs off the conversation.
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -267,45 +301,56 @@ One benchmark invocation, scored under a single platform (one `PlatformExecution
 | `source_file_id` | UUID | FK → `source_files.id`, `ON DELETE SET NULL`. Nullable; the file the run was seeded from. |
 | `created_at` | DateTime (tz) | When the run was created. |
 | `status` | String(32) | Run lifecycle, e.g. `pending`, `running`, `completed`. |
+| `label` | String(128) | Indexed, nullable, **non-unique**. The batch a capturing client grouped the run under (`run_label` on [`POST /captures`](apis.md#post-apiv1captures)): a later capture naming the same label joins this run — whatever its scenario — while the run is still at `ingerido`. `NULL` for every `.xlsx` import and for any capture that asked for no grouping. |
 
 ### PlatformExecution
 
-Results for a single platform (Copilot, Gemini, Claude) within a run.
+One captured conversation: a scenario as it ran on a single platform (Copilot, Gemini,
+Claude). This is where a conversation actually lives — its turns hang off it, and so does
+everything describing the capture.
 
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | UUID | Primary key. |
-| `run_id` | UUID | FK → `benchmark_runs.id`, `ON DELETE CASCADE`. |
+| `scenario_result_id` | UUID | FK → `scenario_results.id`, `ON DELETE CASCADE` (indexed). Not unique — see below. |
 | `platform` | String(64) | Platform identifier. |
-| `started_at` | DateTime (tz) | Nullable until the execution begins. |
-| `finished_at` | DateTime (tz) | Nullable until the execution ends. |
-| `average_score` | Float | Mean of this platform's scenario averages; computed after scoring. |
+| `model_name` | String(128) | The model that generated the responses (`"Claude Opus 4.5"`, `"2.5 Pro"`), as reported by the capturing client. `NULL` when unknown — an `.xlsx` import never carries one. |
+| `source_ref` | Text | Reference into the source: sheet name, conversation key, row range, or the full chat URL for a live capture. |
+| `status` | String(32) | Lifecycle of this conversation's scoring. |
+| `screenshot_path` | String(512) | Path to a stored screenshot (binary kept on disk, not in the DB). |
+| `started_at` | DateTime (tz) | Nullable until scoring of this conversation begins. |
+| `finished_at` | DateTime (tz) | Nullable until it is rolled up. |
+| `average_score` | Float | Mean of this conversation's `turn_score` values. |
+| `raw_conversation` | JSON / JSONB | Parsed rows for this conversation. JSONB on PostgreSQL, JSON on SQLite. `Turn` rows are the evaluation projection derived from it. |
+
+There is deliberately **no** unique constraint on `(scenario_result_id, platform)`: an
+upload may carry two captures of the same platform for one scenario (a retry, a second
+session), and each is its own execution.
 
 ### ScenarioResult
 
-One conversation loaded from the source file for a use case.
+One scenario of a run — the same task, compared across platforms. Holds no conversation
+of its own; the captured turns live on its `PlatformExecution` children. It carries no
+`average_score` either — see the score-flow note in the [Overview](#overview).
 
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | UUID | Primary key. |
-| `platform_execution_id` | UUID | FK → `platform_executions.id`, `ON DELETE CASCADE`. |
-| `scenario_id` | String(128) | Identifier of the scenario / use case tested. |
-| `use_case_id` | UUID | FK → `use_cases.id` (indexed). The metric set this conversation is scored with. No `ON DELETE`: the default `NO ACTION` is what stops a use case a scored run points at from being deleted out from under it. |
-| `model_name` | String(128) | The model that generated the responses (`"Claude Opus 4.5"`, `"2.5 Pro"`), as reported by the capturing client. `NULL` when unknown — an `.xlsx` import never carries one, and the browser extension leaves it empty when the chat does not name its model. |
-| `source_ref` | String(256) | Reference into the source file: sheet name, conversation key, or row range. |
-| `status` | String(32) | Scenario lifecycle status. |
-| `screenshot_path` | String(512) | Path to a stored screenshot (binary kept on disk, not in the DB). |
-| `average_score` | Float | Mean of this conversation's `turn_score` values. |
-| `raw_conversation` | JSON / JSONB | Parsed rows for this conversation from the source file. JSONB on PostgreSQL, JSON on SQLite. `Turn` rows are the evaluation projection derived from it. |
+| `run_id` | UUID | FK → `benchmark_runs.id`, `ON DELETE CASCADE` (indexed). |
+| `scenario_id` | String(128) | Identifier of the scenario tested. Human-readable and **not** unique across runs. |
+| `use_case_id` | UUID | FK → `use_cases.id` (indexed). The metric set this scenario is scored with — one per scenario, so every platform answering it is judged by the same metrics. No `ON DELETE`: the default `NO ACTION` is what stops a use case a scored run points at from being deleted out from under it. |
+| `status` | String(32) | Rolled up from the statuses of its platform executions. |
 
 ### Turn
 
-One user/model exchange within a conversation, evaluated on its own.
+One user/model exchange within a conversation, evaluated on its own. A turn belongs to
+the `PlatformExecution` that produced it, so the judge history fed to later turns never
+mixes two platforms' answers.
 
 | Column | Type | Notes |
 | --- | --- | --- |
 | `id` | UUID | Primary key. |
-| `scenario_result_id` | UUID | FK → `scenario_results.id`, `ON DELETE CASCADE`. |
+| `platform_execution_id` | UUID | FK → `platform_executions.id`, `ON DELETE CASCADE` (indexed). |
 | `turn_number` | Integer | Order of the turn within the conversation. |
 | `prompt` | Text | User message. |
 | `response` | Text | Model response. |
@@ -343,6 +388,38 @@ Groundedness metrics evaluate each document's *node text* — its `document` plu
 `content` — via `RetrievedContext.node_texts()`. Legacy plain-text spreadsheet cells
 still import: `RetrievedContext.from_blob` blank-line-splits them into content-only
 documents.
+
+### RetrievedDocumentEmbedding
+
+One chunk of a retrieved document, with its embedding — the chunked projection of
+`RetrievedDocument.content`, one row per chunk in `chunk_index` order. It exists so a
+consumer can retrieve or re-rank at *chunk* granularity instead of handing a judge the
+whole document, which is what every context-reading metric does today.
+
+| Column | Type | Notes |
+| --- | --- | --- |
+| `id` | UUID | Primary key. |
+| `retrieved_document_id` | UUID | FK → `retrieved_documents.id`, `ON DELETE CASCADE` (indexed). |
+| `chunk_index` | Integer | Order of the chunk within its document, 0-based. Unique per document (`uq_retrieved_document_embeddings_chunk`), so re-embedding replaces chunks instead of accumulating them. |
+| `content` | Text | The chunk's own text — what was embedded, kept so a hit reads back without re-splitting the parent. |
+| `embedding` | vector(1536) | The chunk's embedding. JSON on the SQLite fallback. |
+
+**Nothing populates this table yet** — it is the storage layer, ahead of the chunker and
+the consumer. The embedding *producer* already exists behind the `Judge.embed` seam
+(`scorekeeper.core.metrics.judge`), used in memory today by `answer_relevance`.
+
+The width is fixed at **1536** (`db.models.EMBEDDING_DIMENSIONS`), matching the default
+embedder `openai_embedding_model` = `text-embedding-3-small`. Fixed rather than free
+because pgvector can only index a column of known width; the cost is that
+`lmstudio_embedding_model` (nomic-embed-text, 768 dimensions) does not fit, so a
+local-mode run cannot populate the table.
+
+The table is **PostgreSQL-only in practice**. It needs the `vector` extension — the
+Compose `database` service runs `pgvector/pgvector:pg17` for that reason — and carries an
+HNSW index over `vector_cosine_ops` (cosine because the default embedder returns
+normalized vectors; HNSW because it needs no training pass). On the SQLite fallback the
+column degrades to JSON via `with_variant`, exactly as `JsonColumn` does, so the schema
+still builds but supports no similarity search.
 
 Real source cells hold *source references* (label + URL), not document text. Turning
 those into these rows — parse → locate → authorize → fetch → filter → extract →

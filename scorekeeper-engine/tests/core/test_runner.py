@@ -212,15 +212,15 @@ async def _seed_scenario(
     # ``selected`` is the set of 1-based turn numbers to flag for scoring; ``None``
     # selects every turn (the common case for tests that score the whole scenario).
     run = BenchmarkRun()
-    platform_exec = PlatformExecution(platform="claude", run=run)
     scenario = ScenarioResult(
         scenario_id="esc-1",
         use_case=await _use_case(session, use_case),
-        platform_execution=platform_exec,
+        run=run,
     )
+    platform_exec = PlatformExecution(platform="claude", scenario_result=scenario)
     for i, (prompt, response) in enumerate(exchanges, start=1):
         is_selected = selected is None or i in selected
-        scenario.turns.append(
+        platform_exec.turns.append(
             Turn(turn_number=i, prompt=prompt, response=response, is_selected=is_selected)
         )
     session.add(run)
@@ -241,8 +241,8 @@ async def _seed_scenario(
 
 
 async def test_to_turn_view_rebuilds_context_from_child_rows(session: AsyncSession) -> None:
-    _, _, scenario = await _seed_scenario(session, [("hola", "respuesta")])
-    turn = scenario.turns[0]
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "respuesta")])
+    turn = platform_exec.turns[0]
     # Insert out of order to prove the ordered relationship sorts by rank.
     turn.retrieved_documents.append(
         RetrievedContextDocument(rank=1, name="b", document="d2.pdf", content="dos", url=None)
@@ -260,14 +260,14 @@ async def test_to_turn_view_rebuilds_context_from_child_rows(session: AsyncSessi
 
 
 async def test_to_turn_view_empty_context_when_no_child_rows(session: AsyncSession) -> None:
-    _, _, scenario = await _seed_scenario(session, [("hola", "respuesta")])
-    view = EvalRunner(session, RecordingJudge())._to_turn_view(scenario.turns[0], [])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "respuesta")])
+    view = EvalRunner(session, RecordingJudge())._to_turn_view(platform_exec.turns[0], [])
     assert view.retrieved_context.is_empty
 
 
 async def test_happy_path_scores_and_rolls_up(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad", "correccion"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal"), ("adiós", "hasta luego")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal"), ("adiós", "hasta luego")])
     judge = RecordingJudge(score_value=0.8)
 
     await EvalRunner(session, judge).run_scenario(scenario)
@@ -276,22 +276,22 @@ async def test_happy_path_scores_and_rolls_up(session: AsyncSession, registry) -
     # Two metrics × two turns = four MetricScore rows.
     total = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
     assert total == 4
-    for turn in scenario.turns:
+    for turn in platform_exec.turns:
         assert turn.turn_score == pytest.approx(0.8)
         assert {ms.metric_name for ms in turn.metric_scores} == {"utilidad", "correccion"}
         assert all(ms.judge_model == "judge-test" for ms in turn.metric_scores)
-    assert scenario.average_score == pytest.approx(0.8)
+    assert platform_exec.average_score == pytest.approx(0.8)
     assert scenario.status == STATUS_COMPLETADO
 
 
 async def test_skip_on_error_keeps_survivor(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad", "rota"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
 
     await EvalRunner(session, RecordingJudge(score_value=0.6)).run_scenario(scenario)
     await session.commit()
 
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     # Only the surviving metric is persisted; the raised one is skipped.
     assert {ms.metric_name for ms in turn.metric_scores} == {"utilidad"}
     assert turn.turn_score == pytest.approx(0.6)
@@ -302,12 +302,12 @@ async def test_skip_on_error_keeps_survivor(session: AsyncSession, registry) -> 
 
 async def test_all_metrics_fail_marks_scenario_fallido(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["rota"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
 
     await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
     await session.commit()
 
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     assert turn.metric_scores == []
     assert turn.turn_score is None
     assert scenario.status == STATUS_FALLIDO
@@ -317,25 +317,25 @@ async def test_partial_scenario_when_one_turn_unscored(session: AsyncSession, re
     # One metric applies to every turn; the judge fails only on turn 1's prompt,
     # so turn 1 goes unscored while turn 2 scores → the scenario is "parcial".
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("falla", "b"), ("bien", "d")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("falla", "b"), ("bien", "d")])
     judge = RecordingJudge(score_value=0.7, fail_on_prompt="falla")
 
     await EvalRunner(session, judge).run_scenario(scenario)
     await session.commit()
 
-    by_number = {t.turn_number: t.turn_score for t in scenario.turns}
+    by_number = {t.turn_number: t.turn_score for t in platform_exec.turns}
     assert by_number[1] is None  # its only metric failed
     assert by_number[2] == pytest.approx(0.7)
     assert scenario.status == STATUS_PARCIAL
-    # The scenario average ignores the unscored turn.
-    assert scenario.average_score == pytest.approx(0.7)
+    # The conversation's average ignores the unscored turn.
+    assert platform_exec.average_score == pytest.approx(0.7)
 
 
 async def test_only_selected_turns_are_scored(session: AsyncSession, registry) -> None:
     # Turn 2 is not selected: it must be skipped for scoring (no MetricScore rows,
     # turn_score stays None) while the selected turns are scored normally.
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(
+    _, platform_exec, scenario = await _seed_scenario(
         session,
         [("hola", "r1"), ("intermedio", "r2"), ("adiós", "r3")],
         selected={1, 3},
@@ -344,7 +344,7 @@ async def test_only_selected_turns_are_scored(session: AsyncSession, registry) -
     await EvalRunner(session, RecordingJudge(score_value=0.7)).run_scenario(scenario)
     await session.commit()
 
-    by_number = {t.turn_number: t for t in scenario.turns}
+    by_number = {t.turn_number: t for t in platform_exec.turns}
     assert by_number[2].metric_scores == []
     assert by_number[2].turn_score is None
     assert by_number[1].turn_score == pytest.approx(0.7)
@@ -353,14 +353,14 @@ async def test_only_selected_turns_are_scored(session: AsyncSession, registry) -
     total = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
     assert total == 2
     # The skipped turn is excluded from the roll-up.
-    assert scenario.average_score == pytest.approx(0.7)
+    assert platform_exec.average_score == pytest.approx(0.7)
 
 
 async def test_unselected_turn_still_feeds_history(session: AsyncSession, registry) -> None:
     # Turn 2 is not scored, but turns 1 and 2 must still appear in turn 3's judge
     # history so the conversation the judge sees is complete.
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(
+    _, platform_exec, scenario = await _seed_scenario(
         session,
         [("hola", "r1"), ("intermedio", "r2"), ("adiós", "r3")],
         selected={1, 3},
@@ -377,7 +377,7 @@ async def test_unselected_turn_still_feeds_history(session: AsyncSession, regist
 
 async def test_no_selected_turns_scores_nothing(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(
+    _, platform_exec, scenario = await _seed_scenario(
         session, [("hola", "r1"), ("adiós", "r2")], selected=set()
     )
 
@@ -386,13 +386,13 @@ async def test_no_selected_turns_scores_nothing(session: AsyncSession, registry)
 
     total = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
     assert total == 0
-    assert all(t.turn_score is None for t in scenario.turns)
-    assert scenario.average_score is None
+    assert all(t.turn_score is None for t in platform_exec.turns)
+    assert platform_exec.average_score is None
 
 
 async def test_history_is_fed_forward(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "respuesta1"), ("otra", "respuesta2")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "respuesta1"), ("otra", "respuesta2")])
     judge = RecordingJudge()
 
     await EvalRunner(session, judge).run_scenario(scenario)
@@ -403,16 +403,13 @@ async def test_history_is_fed_forward(session: AsyncSession, registry) -> None:
     assert second_view.history == [("hola", "respuesta1")]
 
 
-async def test_run_platform_rolls_up_average(session: AsyncSession, registry) -> None:
+async def test_run_benchmark_scores_every_scenario(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad"])
     run = BenchmarkRun()
-    platform_exec = PlatformExecution(platform="claude", run=run)
     use_case = await _use_case(session)
     for sid in ("s1", "s2"):
-        scenario = ScenarioResult(
-            scenario_id=sid, use_case=use_case, platform_execution=platform_exec
-        )
-        scenario.turns.append(
+        scenario = ScenarioResult(scenario_id=sid, use_case=use_case, run=run)
+        PlatformExecution(platform="claude", scenario_result=scenario).turns.append(
             Turn(turn_number=1, prompt="p", response="r", is_selected=True)
         )
     session.add(run)
@@ -424,19 +421,29 @@ async def test_run_platform_rolls_up_average(session: AsyncSession, registry) ->
         .execution_options(populate_existing=True)
     )
 
-    await EvalRunner(session, RecordingJudge(score_value=0.5)).run_platform(platform_exec)
+    await EvalRunner(session, RecordingJudge(score_value=0.5)).run_benchmark(run)
     await session.commit()
 
-    assert platform_exec.average_score == pytest.approx(0.5)
-    assert platform_exec.started_at is not None
-    assert platform_exec.finished_at is not None
+    # Each execution rolls up from its turns; the scenario rolls up only a status,
+    # since averaging across the platforms being compared would blend them.
+    assert [s.status for s in run.scenario_results] == [STATUS_COMPLETADO] * 2
+    assert not hasattr(run.scenario_results[0], "average_score")
+    executions = [pe for s in run.scenario_results for pe in s.platform_executions]
+    assert [pe.average_score for pe in executions] == [
+        pytest.approx(0.5),
+        pytest.approx(0.5),
+    ]
+    # Every conversation's scoring window is stamped around its own turns.
+    assert all(
+        pe.started_at is not None and pe.finished_at is not None for pe in executions
+    )
 
 
 async def test_rescoring_a_completed_scenario_is_skipped(
     session: AsyncSession, registry
 ) -> None:
     await _select_metrics(session, ["utilidad", "correccion"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
     judge = RecordingJudge()
     runner = EvalRunner(session, judge)
 
@@ -452,7 +459,7 @@ async def test_rescoring_a_completed_scenario_is_skipped(
     # No duplicate rows, and — the point of resumability — no second judge bill.
     assert count_1 == count_2 == 2
     assert len(judge.seen_turns) == seen_1
-    assert scenario.turns[0].attempts == 1  # and no attempt burned re-visiting it
+    assert platform_exec.turns[0].attempts == 1  # and no attempt burned re-visiting it
 
 
 async def test_a_lost_turn_score_is_rebuilt_from_the_reused_scores(
@@ -462,32 +469,32 @@ async def test_a_lost_turn_score_is_rebuilt_from_the_reused_scores(
     # match, so nothing is re-judged — but the turn must not stay unscored, since the
     # chain reads ``turn_score`` to decide a turn is done.
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
     judge = RecordingJudge()
     runner = EvalRunner(session, judge)
 
     await runner.run_scenario(scenario)
     await session.commit()
-    scored = scenario.turns[0].turn_score
+    scored = platform_exec.turns[0].turn_score
     judge.seen_turns.clear()
 
     _interrupt(scenario)
-    scenario.turns[0].turn_score = None
+    platform_exec.turns[0].turn_score = None
     await runner.run_scenario(scenario)
     await session.commit()
 
     assert judge.seen_turns == []
-    assert scenario.turns[0].turn_score == pytest.approx(scored)
-    assert scenario.turns[0].attempts == 1  # rebuilt, not re-attempted
+    assert platform_exec.turns[0].turn_score == pytest.approx(scored)
+    assert platform_exec.turns[0].attempts == 1  # rebuilt, not re-attempted
 
 
 async def test_run_turn_counts_an_attempt(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
 
     await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
 
-    assert scenario.turns[0].attempts == 1
+    assert platform_exec.turns[0].attempts == 1
 
 
 async def test_run_turn_abandons_a_turn_at_the_attempt_cap(
@@ -495,16 +502,16 @@ async def test_run_turn_abandons_a_turn_at_the_attempt_cap(
 ) -> None:
     # A turn that keeps killing its worker is dropped rather than retried forever.
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
-    scenario.turns[0].attempts = MAX_TURN_ATTEMPTS
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    platform_exec.turns[0].attempts = MAX_TURN_ATTEMPTS
     await session.commit()
     judge = RecordingJudge()
 
     await EvalRunner(session, judge).run_scenario(scenario)
 
     assert judge.seen_turns == []
-    assert scenario.turns[0].turn_score is None
-    assert scenario.turns[0].attempts == MAX_TURN_ATTEMPTS  # not bumped past the cap
+    assert platform_exec.turns[0].turn_score is None
+    assert platform_exec.turns[0].attempts == MAX_TURN_ATTEMPTS  # not bumped past the cap
     assert scenario.status == STATUS_FALLIDO  # nothing scored in this scenario
 
 
@@ -512,7 +519,7 @@ async def test_delay_paced_between_consecutive_turns(
     session: AsyncSession, registry, monkeypatch, real_turn_pacing
 ) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d"), ("e", "f")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d"), ("e", "f")])
     slept = real_turn_pacing
     monkeypatch.setattr("scorekeeper.core.runner.random.uniform", lambda low, high: 0.123)
 
@@ -527,7 +534,7 @@ async def test_delay_disabled_when_max_non_positive(
     session: AsyncSession, registry, real_turn_pacing, monkeypatch
 ) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d")])
     slept = real_turn_pacing
     monkeypatch.setattr(
         "scorekeeper.core.runner.get_settings",
@@ -595,14 +602,14 @@ async def test_metrics_evaluate_concurrently(session: AsyncSession, registry) ->
     for name in names:
         MetricRegistry.add(type(name, (_BarrierMetric,), {"name": name, "barrier": barrier}))
     await _select_metrics(session, names)
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
 
     await EvalRunner(session, RecordingJudge(score_value=0.9)).run_scenario(scenario)
     await session.commit()
 
     # All three rows exist only because the metrics ran on distinct threads and
     # cleared the barrier together; a sequential runner would time out and drop them.
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     assert {ms.metric_name for ms in turn.metric_scores} == set(names)
     assert turn.turn_score == pytest.approx(0.9)
 
@@ -612,7 +619,7 @@ async def test_metrics_evaluate_concurrently(session: AsyncSession, registry) ->
 
 async def test_persists_summed_token_usage_per_turn(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad", "correccion"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal"), ("adiós", "chao")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal"), ("adiós", "chao")])
     judge = TokenRecordingJudge(input_tokens=10, output_tokens=4)
 
     await EvalRunner(session, judge).run_scenario(scenario)
@@ -620,7 +627,7 @@ async def test_persists_summed_token_usage_per_turn(session: AsyncSession, regis
 
     # One row per turn; each turn ran 2 metrics × one score() call = 2 × (10, 4).
     assert (await session.execute(select(func.count()).select_from(TurnTokenUsage))).scalar_one() == 2
-    for turn in scenario.turns:
+    for turn in platform_exec.turns:
         assert turn.token_usage is not None
         assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (20, 8)
 
@@ -631,19 +638,19 @@ async def test_token_usage_row_is_zero_when_judge_records_nothing(
     # The plain RecordingJudge never calls record_usage, so the turn still gets a
     # row, summed to 0/0 (the accumulator with no adds).
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
 
     await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
     await session.commit()
 
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     assert turn.token_usage is not None
     assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (0, 0)
 
 
 async def test_rescoring_updates_single_token_usage_row(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
 
     await EvalRunner(
         session, TokenRecordingJudge(input_tokens=5, output_tokens=2)
@@ -660,7 +667,7 @@ async def test_rescoring_updates_single_token_usage_row(session: AsyncSession, r
 
     # Re-scoring updates the existing row in place — still exactly one per turn.
     assert (await session.execute(select(func.count()).select_from(TurnTokenUsage))).scalar_one() == 1
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (7, 3)
 
 
@@ -670,23 +677,27 @@ async def test_rescoring_updates_single_token_usage_row(session: AsyncSession, r
 def _interrupt(scenario: ScenarioResult) -> None:
     """Put a scored scenario back where a crashed worker would have left it.
 
-    ``run_turn`` commits each score as it is written but ``run_scenario`` only commits
+    ``run_turn`` commits each score as it is written but ``run_execution`` only commits
     the roll-up at the end, so an interruption leaves the ``MetricScore`` rows on disk
-    and the scenario status untouched. Rewinding just the status reproduces that, and
-    is also what lifts the ``completado`` shortcut so the per-metric fingerprint — the
-    thing under test below — actually gets consulted.
+    and the statuses untouched. Rewinding them reproduces that, and is also what lifts
+    the ``completado`` shortcut so the per-metric fingerprint — the thing under test
+    below — actually gets consulted. Both levels have that shortcut, so both are
+    rewound: leaving the execution ``completado`` would skip it before the fingerprint
+    is ever reached.
     """
     scenario.status = "pending"
+    for platform_exec in scenario.platform_executions:
+        platform_exec.status = "pending"
 
 
 async def test_unchanged_turn_issues_no_judge_calls(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad", "correccion"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
     judge = RecordingJudge()
 
     await EvalRunner(session, judge).run_scenario(scenario)
     await session.commit()
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     before = {ms.metric_name: ms.id for ms in turn.metric_scores}
     score_before = turn.turn_score
 
@@ -706,12 +717,12 @@ async def test_changed_input_forces_a_rescore(
     session: AsyncSession, registry, changed: str
 ) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
     judge = RecordingJudge()
 
     await EvalRunner(session, judge).run_scenario(scenario)
     await session.commit()
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     key_before = turn.metric_scores[0].scoring_key
 
     _interrupt(scenario)
@@ -751,12 +762,12 @@ async def test_only_the_missing_metric_is_reevaluated(
 
     MetricRegistry.add(Intermitente)
     await _select_metrics(session, ["utilidad", "intermitente"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
     judge = RecordingJudge()
 
     await EvalRunner(session, judge).run_scenario(scenario)
     await session.commit()
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     assert {ms.metric_name for ms in turn.metric_scores} == {"utilidad"}
     utilidad_id = turn.metric_scores[0].id
 
@@ -775,12 +786,12 @@ async def test_only_the_missing_metric_is_reevaluated(
 
 async def test_legacy_null_scoring_key_is_rescored(session: AsyncSession, registry) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
     judge = RecordingJudge()
 
     await EvalRunner(session, judge).run_scenario(scenario)
     await session.commit()
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     # A row written before the column existed carries no provenance.
     turn.metric_scores[0].scoring_key = None
     await session.flush()
@@ -797,12 +808,12 @@ async def test_row_for_an_undeclared_metric_is_dropped(
     session: AsyncSession, registry
 ) -> None:
     await _select_metrics(session, ["utilidad", "correccion"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
     judge = RecordingJudge(score_value=0.8)
 
     await EvalRunner(session, judge).run_scenario(scenario)
     await session.commit()
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
 
     # Unlink "correccion" from the use case: its stored score no longer belongs to
     # the turn and must not keep feeding the roll-up.
@@ -827,12 +838,12 @@ async def test_duplicate_rows_for_one_metric_collapse(
     session: AsyncSession, registry
 ) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
     judge = RecordingJudge()
 
     await EvalRunner(session, judge).run_scenario(scenario)
     await session.commit()
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     # Nothing in the schema prevents a duplicate; the diff has to heal it, since the
     # roll-up would otherwise count the metric twice.
     turn.metric_scores.append(
@@ -867,12 +878,12 @@ async def test_partial_resume_accumulates_token_usage(
 
     MetricRegistry.add(Intermitente)
     await _select_metrics(session, ["utilidad", "intermitente"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
     judge = TokenRecordingJudge(input_tokens=5, output_tokens=2)
 
     await EvalRunner(session, judge).run_scenario(scenario)
     await session.commit()
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (5, 2)
 
     Intermitente.falla = False
@@ -890,7 +901,7 @@ async def test_full_reuse_leaves_token_usage_untouched(
     session: AsyncSession, registry
 ) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
 
     await EvalRunner(
         session, TokenRecordingJudge(input_tokens=5, output_tokens=2)
@@ -905,7 +916,7 @@ async def test_full_reuse_leaves_token_usage_untouched(
     ).run_scenario(scenario)
     await session.commit()
 
-    turn = scenario.turns[0]
+    turn = platform_exec.turns[0]
     assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (5, 2)
 
 
@@ -913,7 +924,7 @@ async def test_no_pacing_when_every_turn_is_reused(
     session: AsyncSession, registry, monkeypatch, real_turn_pacing
 ) -> None:
     await _select_metrics(session, ["utilidad"])
-    _, _, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d"), ("e", "f")])
+    _, platform_exec, scenario = await _seed_scenario(session, [("a", "b"), ("c", "d"), ("e", "f")])
     slept = real_turn_pacing
     monkeypatch.setattr("scorekeeper.core.runner.random.uniform", lambda low, high: 0.123)
     judge = RecordingJudge()

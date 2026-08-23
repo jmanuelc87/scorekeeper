@@ -64,6 +64,9 @@ def average(values: Iterable[float | None]) -> float | None:
     return float(np.mean(present)) if present.size else None
 
 
-# Scenario and platform averages are the same plain mean of their children.
-scenario_average = average
+# Both rollups above a turn are the same plain mean of their children:
+# ``execution_average`` folds a conversation's turn scores into its PlatformExecution,
+# ``platform_average`` folds a run's executions into one per-platform figure. There is no
+# scenario average — a mean across the platforms being compared is not a useful number.
+execution_average = average
 platform_average = average

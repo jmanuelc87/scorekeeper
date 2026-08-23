@@ -45,9 +45,10 @@ async def retrieve_run(
     flight rather than re-fetching the whole run. Each started turn counts an attempt and
     is abandoned past ``MAX_TURN_ATTEMPTS`` (see :mod:`scorekeeper.core.runner`).
 
-    When a platform execution's turns are all retrieved, its downloaded documents are purged
-    from the fetch cache (:func:`_purge_cache`) — the extracted markdown is persisted by then,
-    so the bytes are dead weight. The failure path purges too, leaving no orphaned downloads.
+    When one conversation's turns are all retrieved, its downloaded documents are purged
+    from the fetch cache (:func:`_purge_cache`) — the extracted markdown is persisted by
+    then, so the bytes are dead weight. The failure path purges too, leaving no orphaned
+    downloads.
 
     ``session`` defaults to ``SessionLocal()``; ``pipeline`` to a ``RetrievalOrchestrator`` bound
     to that session (tests inject a fake). This is the retrieval half the worker runs before
@@ -66,9 +67,9 @@ async def retrieve_run(
         )
         logger.info("Recuperando contexto para run %s…", run.id)
         try:
-            for platform_exec in run.platform_executions:
-                for scenario in platform_exec.scenario_results:
-                    for turn in scenario.turns:
+            for scenario in run.scenario_results:
+                for platform_exec in scenario.platform_executions:
+                    for turn in platform_exec.turns:
                         # Skip retrieval for turns that won't be scored (their retrieved
                         # context is only used by their own metrics) and for turns an
                         # earlier delivery already resolved — that is what makes a
@@ -87,8 +88,8 @@ async def retrieve_run(
                         turn.attempts += 1
                         await db.commit()
                         await retrieve_turn(turn, orchestrator)
-                    await db.commit()  # atomic-write unit: one scenario at a time
-                await _purge_cache(orchestrator, platform_exec)
+                    await db.commit()  # atomic-write unit: one conversation at a time
+                    await _purge_cache(orchestrator, platform_exec)
         except Exception:
             # rollback expires every instance, so the reload carries the loaders again.
             await db.rollback()
@@ -107,13 +108,13 @@ async def retrieve_run(
 async def _purge_cache(
     pipeline: RetrievalPipeline, platform_exec: PlatformExecution | None = None
 ) -> None:
-    """Release the documents downloaded for one platform execution (best-effort).
+    """Release the documents downloaded for one conversation (best-effort).
 
     Retrieval is the only phase that needs the fetched bytes — scoring reads the extracted
-    markdown off ``retrieved_documents`` — so once a platform execution's turns are done the
+    markdown off ``retrieved_documents`` — so once a conversation's turns are done the
     cache entries it created are dropped from disk and from ``document_cache``. A cleanup
-    failure is logged and swallowed: the context is already persisted, so a stranded blob is
-    not worth failing the run over.
+    failure is logged and swallowed: the context is already persisted, so a stranded blob
+    is not worth failing the run over.
     """
     label = platform_exec.platform if platform_exec is not None else "?"
     try:

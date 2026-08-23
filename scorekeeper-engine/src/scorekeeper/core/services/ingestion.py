@@ -5,6 +5,10 @@ decoupled from the upload and can run off the request path: this module only
 persists the ``BenchmarkRun -> PlatformExecution -> ScenarioResult -> Turn``
 tree at status ``ingerido`` (*persisted, not started*) and returns the run id.
 It never starts scoring — see :mod:`scorekeeper.core.services.runs`.
+
+With ``reuse_scenarios`` the tree is not necessarily new: a still-unscored scenario
+already ingested under that id takes the incoming executions instead, so a browser
+capture per platform still builds one comparable scenario. See :func:`ingest_evaluation`.
 """
 
 from __future__ import annotations
@@ -31,9 +35,15 @@ from scorekeeper.db.models import (
     SourceFile,
     Turn,
 )
+from scorekeeper.db.repositories import runs as run_repo
+from scorekeeper.db.repositories import scenarios as scenario_repo
 from scorekeeper.db.repositories import use_cases as use_case_repo
 
 logger = logging.getLogger(__name__)
+
+# A scenario nobody has scored yet — the ``ScenarioResult.status`` model default, and
+# the only status that may still take another platform execution.
+SCENARIO_PENDIENTE = "pending"
 
 
 class UnknownUseCaseError(ValueError):
@@ -122,24 +132,46 @@ async def ingest_evaluation(
     platform: str,
     files: list[UploadedFile],
     *,
+    reuse_scenarios: bool = False,
+    run_label: str | None = None,
     session: AsyncSession | None = None,
 ) -> str:
     """Parse ``files`` and persist a queued run for ``platform``; return its ``run_id``.
 
-    Builds one ``BenchmarkRun`` and, under it, one ``PlatformExecution`` per distinct
-    platform — each file lands under ``upload.platform`` when set, otherwise under the
-    run-level ``platform`` fallback. Each file becomes one ``ScenarioResult`` (with its
-    ``Turn`` rows) attached to its platform's execution. The run is committed with
-    status ``ingerido`` (persisted, not yet started) and left unscored; a caller later
-    starts it via :func:`start_run` (which enqueues the per-turn evaluation chain).
+    Builds one ``BenchmarkRun`` and, under it, one ``ScenarioResult`` per distinct
+    ``scenario_id`` — so **files sharing a scenario id are grouped**, which is how one
+    upload compares the same task across platforms. Each file becomes one
+    ``PlatformExecution`` (with its ``Turn`` rows) under its scenario, carrying
+    ``upload.platform`` when set and the run-level ``platform`` fallback otherwise.
+
+    With ``reuse_scenarios`` (the capture path; ``POST /evaluations`` leaves it off) a
+    scenario id that already names a still-``pending`` scenario of an *unstarted* run —
+    one still at ``ingerido`` — is extended rather than recreated: the executions are
+    appended to that scenario and the existing run is the one returned. A run that has
+    already been started or scored is never touched, and neither is a scenario that has
+    rolled up past ``pending``, because unscored turns would corrupt their roll-ups; both
+    cases ingest a new run exactly as before.
+
+    ``run_label`` (also capture-only, and ignored without ``reuse_scenarios``) groups one
+    tier higher: the run is resolved as the newest still-``ingerido`` run carrying that
+    label, or opened carrying it when there is none, and the scenario reuse above is then
+    **scoped to that run**. So captures naming *different* scenarios but the same label
+    land under one run — the batch the client named — while an unlabelled capture keeps
+    matching a pending scenario anywhere.
+
+    The run is committed with status ``ingerido`` (persisted, not yet started) and left
+    unscored; a caller later starts it via :func:`start_run` (which enqueues the
+    per-turn evaluation chain).
 
     This is the fast, on-request half: parsing is synchronous so a malformed sheet is
     rejected here (as ``ValueError``) before anything is persisted. ``session`` defaults
     to ``SessionLocal()``; tests inject an in-memory session.
 
-    Raises ``ValueError`` when ``platform`` or ``files`` is empty, or when a file
-    cannot be parsed (propagated from ``parse_conversation``); the transaction is
-    rolled back first so nothing is persisted.
+    Raises ``ValueError`` when ``platform`` or ``files`` is empty, when a file cannot be
+    parsed (propagated from ``parse_conversation``), or when two files share a
+    ``scenario_id`` but name different use cases — or a reused scenario names another one — they would land in one scenario and
+    only one metric set can score it, so the ambiguity is a client error rather than a
+    silent pick. The transaction is rolled back first so nothing is persisted.
     """
     if not platform:
         raise ValueError("Se requiere una plataforma.")
@@ -182,28 +214,80 @@ async def ingest_evaluation(
                 db.add(source_file)
                 parsed.append((upload, messages, source_file))
 
-            run = BenchmarkRun(status=STATUS_INGERIDO)
-            # A run references a single source file; only meaningful with one upload.
-            if len(parsed) == 1:
-                run.source_file = parsed[0][2]
+            # Resolved before the run, because a reused scenario brings its own: the new
+            # executions belong to the run that already holds the scenario.
+            scenarios: dict[str, ScenarioResult] = {}
+            run: BenchmarkRun | None = None
+            if reuse_scenarios:
+                if run_label:
+                    # The batch the client named decides the run; a label pointing at a
+                    # run that already started is free again, and opens a new one below.
+                    run = await run_repo.latest_run_for_label(
+                        db, run_label, run_status=STATUS_INGERIDO
+                    )
+                # A label with no run yet starts an empty batch: there is nothing of that
+                # run to extend, and a scenario of another run is not part of the batch.
+                if run is not None or not run_label:
+                    for scenario_id in OrderedDict.fromkeys(u.scenario_id for u, _, _ in parsed):
+                        existing = await scenario_repo.latest_scenario_for_reuse(
+                            db,
+                            scenario_id,
+                            run_status=STATUS_INGERIDO,
+                            # The model default, i.e. "nothing has scored this scenario yet".
+                            # A scenario that has rolled up to any other status keeps the
+                            # executions it was scored on: appending one now would leave its
+                            # roll-up describing a set of executions that no longer exists.
+                            scenario_status=SCENARIO_PENDIENTE,
+                            run_key=run.id if run is not None else None,
+                        )
+                        if existing is not None:
+                            scenarios[scenario_id] = existing
+                            run = run or existing.run
+            reused = set(scenarios)
 
-            # One PlatformExecution per distinct resolved platform (first-seen order);
-            # each file's optional override wins over the run-level fallback.
-            executions: dict[str, PlatformExecution] = {}
+            if run is None:
+                run = BenchmarkRun(status=STATUS_INGERIDO, label=run_label or None)
+                # A run references a single source file; only meaningful with one upload.
+                if len(parsed) == 1:
+                    run.source_file = parsed[0][2]
+
+            # One ScenarioResult per distinct scenario_id (first-seen order), one
+            # PlatformExecution per file under it: the platform is a property of the
+            # captured conversation, and each file's optional override wins over the
+            # run-level fallback.
             for upload, messages, _ in parsed:
-                resolved = upload.platform or platform
-                platform_exec = executions.get(resolved)
-                if platform_exec is None:
-                    platform_exec = PlatformExecution(platform=resolved, run=run)
-                    executions[resolved] = platform_exec
-                scenario = ScenarioResult(
-                    scenario_id=upload.scenario_id,
-                    use_case_id=use_case_ids[upload.use_case],
+                scenario = scenarios.get(upload.scenario_id)
+                if scenario is None:
+                    scenario = ScenarioResult(
+                        scenario_id=upload.scenario_id,
+                        use_case_id=use_case_ids[upload.use_case],
+                        run=run,
+                    )
+                    # Added explicitly for the same reason the execution below is: a
+                    # scenario hung off an *already persistent* run (the labelled batch)
+                    # is not cascaded into the session by the backref.
+                    scenarios[upload.scenario_id] = scenario
+                elif scenario.use_case_id != use_case_ids[upload.use_case]:
+                    conflict = (
+                        "ya está ingerido con otro caso de uso"
+                        if upload.scenario_id in reused
+                        else "llega con dos casos de uso distintos"
+                    )
+                    raise ValueError(
+                        f"El escenario {upload.scenario_id!r} {conflict}; solo un "
+                        f"conjunto de métricas puede puntuarlo."
+                    )
+                platform_exec = PlatformExecution(
+                    platform=upload.platform or platform,
                     model_name=upload.model_name,
                     source_ref=upload.filename,
                     raw_conversation={"messages": messages},
-                    platform_execution=platform_exec,
+                    scenario_result=scenario,
                 )
+                # Added explicitly: since 2.0 SQLAlchemy no longer cascades save-update
+                # along a backref, so an execution hung off an *already persistent*
+                # scenario (the reuse path) would never be flushed.
+                db.add(platform_exec)
                 for turn in project_turns(messages):
                     # Store the raw context cell; the retrieval pipeline (score-time worker)
                     # fetches/extracts it into ``retrieved_documents`` — nothing is decoupled here.
@@ -214,7 +298,7 @@ async def ingest_evaluation(
                         expected_output=turn["expected_output"],
                         retrieved_context_source=turn["retrieved_context_source"],
                     )
-                    scenario.turns.append(turn_row)
+                    platform_exec.turns.append(turn_row)
 
             db.add(run)
             # Counted from the parsed input rather than by walking the committed run tree:
@@ -223,9 +307,10 @@ async def ingest_evaluation(
             turn_total = sum(len(project_turns(messages)) for _, messages, _ in parsed)
             await db.commit()
             logger.info(
-                "Run %s ingerido: %d plataforma(s) × %d archivo(s) = %d turno(s).",
+                "Run %s (lote=%s) ingerido: %d escenario(s), %d archivo(s) = %d turno(s).",
                 run.id,
-                len(executions),
+                run.label,
+                len(scenarios),
                 len(parsed),
                 turn_total,
             )

@@ -2,7 +2,7 @@
 
 One module on purpose: the models are a single interlinked object graph whose
 forward references (``Mapped[list[BenchmarkRun]]`` on ``SourceFile``, the string
-``order_by="PlatformExecution.started_at"``) resolve through the declarative
+``order_by="Turn.turn_number"``) resolve through the declarative
 registry, and importing ``Base`` from here is what guarantees Alembic's
 autogenerate sees all of them.
 
@@ -32,6 +32,7 @@ from sqlalchemy import (
 )
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.ext.asyncio import AsyncAttrs
+from pgvector.sqlalchemy import Vector
 from sqlalchemy.orm import (
     DeclarativeBase,
     Mapped,
@@ -43,6 +44,18 @@ from scorekeeper.core.retrieved_context import RetrievedDocument
 
 # JSONB on PostgreSQL, plain JSON on the SQLite fallback.
 JsonColumn = JSON().with_variant(JSONB, "postgresql")
+
+# Width of a stored embedding, fixed by the default embedder: ``openai_embedding_model``
+# is ``text-embedding-3-small`` (1536 dimensions). Fixed rather than free because pgvector
+# can only index a column of known width. Note this excludes ``lmstudio_embedding_model``
+# (nomic-embed-text, 768) — a local-mode run cannot populate the table.
+EMBEDDING_DIMENSIONS = 1536
+
+# A real ``vector`` on PostgreSQL; JSON on the SQLite fallback, which has no such type.
+# Same escape hatch as ``JsonColumn``, and it is what keeps ``Base.metadata.create_all``
+# working for the test suite (tests/conftest.py builds its schema on in-memory SQLite and
+# never runs Alembic). Similarity operators are PostgreSQL-only either way.
+EmbeddingColumn = Vector(EMBEDDING_DIMENSIONS).with_variant(JSON(), "sqlite")
 
 
 def _now() -> datetime:
@@ -76,11 +89,10 @@ class SourceFile(Base):
 
 
 class BenchmarkRun(Base):
-    """A single benchmark invocation, scored under one platform.
+    """A single benchmark invocation — the root of the run tree.
 
-    The ``platform_executions`` relationship is a list for historical reasons, but the
-    orchestrator now creates exactly one ``PlatformExecution`` per run — one platform
-    per set of files.
+    Its children are the scenarios it scored; each scenario holds one
+    ``PlatformExecution`` per platform it was run on.
     """
 
     __tablename__ = "benchmark_runs"
@@ -88,54 +100,46 @@ class BenchmarkRun(Base):
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=_now)
     status: Mapped[str] = mapped_column(String(32), default="pending")
+    # The batch a client groups its captures under ("lote-agosto"), looked up by value
+    # so a later capture naming the same label joins this run instead of opening one.
+    # Non-unique and nullable: only the capture path sets it, and a label is reusable
+    # once the run it named has started.
+    label: Mapped[str | None] = mapped_column(String(128), index=True, default=None)
     source_file_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("source_files.id", ondelete="SET NULL"), index=True, default=None
     )
 
     source_file: Mapped[SourceFile | None] = relationship(back_populates="runs")
-    platform_executions: Mapped[list[PlatformExecution]] = relationship(
+    scenario_results: Mapped[list[ScenarioResult]] = relationship(
         back_populates="run",
         cascade="all, delete-orphan",
-        order_by="PlatformExecution.started_at",
+        # Ordered by the human-readable label, not by a timestamp: ``started_at`` is
+        # NULL until a worker scores the scenario, and NULLs sort first on SQLite but
+        # last on PostgreSQL — the order would differ between tests and production.
+        order_by="ScenarioResult.scenario_id",
     )
 
 
 class PlatformExecution(Base):
-    """Results for one platform (Copilot, Gemini, Claude) within a run."""
+    """One captured conversation: a scenario as it ran on a single platform.
+
+    This is where a conversation actually lives — the platform that answered, the
+    model it used, the source it came from, and the ``Turn`` rows scored from it. A
+    scenario holds one of these per platform, which is what makes the scenario a
+    like-for-like comparison across Copilot, Gemini and Claude.
+
+    No uniqueness on ``(scenario_result_id, platform)``: an upload may legitimately
+    carry two captures of the same platform for one scenario (a retry, a second
+    session), and each is its own execution.
+    """
 
     __tablename__ = "platform_executions"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    run_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("benchmark_runs.id", ondelete="CASCADE"), index=True
+    scenario_result_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("scenario_results.id", ondelete="CASCADE"), index=True
     )
     platform: Mapped[str] = mapped_column(String(64))
-    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    average_score: Mapped[float | None] = mapped_column(Float, default=None)
-
-    run: Mapped[BenchmarkRun] = relationship(back_populates="platform_executions")
-    scenario_results: Mapped[list[ScenarioResult]] = relationship(
-        back_populates="platform_execution",
-        cascade="all, delete-orphan",
-    )
-
-
-class ScenarioResult(Base):
-    """A single conversation (use case) loaded from the source file and scored."""
-
-    __tablename__ = "scenario_results"
-
-    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    platform_execution_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("platform_executions.id", ondelete="CASCADE"), index=True
-    )
-    scenario_id: Mapped[str] = mapped_column(String(128))
-    # The use case this conversation is scored under, as a foreign key rather than a
-    # repeated label: the metric set lives in ``use_case_metrics``. No ``ondelete`` —
-    # the default NO ACTION is what stops a use case a scored run points at from being
-    # deleted out from under it.
-    use_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("use_cases.id"), index=True)
     # The model that generated the responses in this conversation ("Claude Opus 4.5",
     # "2.5 Pro"), as reported by the capturing client. None when the client did not
     # know it: an .xlsx upload never does, and neither does a chat UI that stopped
@@ -148,23 +152,62 @@ class ScenarioResult(Base):
     source_ref: Mapped[str | None] = mapped_column(Text, default=None)
     status: Mapped[str] = mapped_column(String(32), default="pending")
     screenshot_path: Mapped[str | None] = mapped_column(String(512), default=None)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
     average_score: Mapped[float | None] = mapped_column(Float, default=None)
     # Parsed rows for this conversation from the source file; Turn rows are the
     # evaluation projection derived from it.
     raw_conversation: Mapped[dict[str, Any] | None] = mapped_column(JsonColumn, default=None)
 
-    platform_execution: Mapped[PlatformExecution] = relationship(
-        back_populates="scenario_results"
+    scenario_result: Mapped[ScenarioResult] = relationship(
+        back_populates="platform_executions"
     )
-    # Eager-load it (see ``db.repositories.runs``): the runner's log line and
-    # ``_serialize_scenario`` both read ``use_case.name``, and a lazy many-to-one under
-    # an AsyncSession is a MissingGreenlet, not a slow query.
-    use_case: Mapped[UseCase] = relationship()
     turns: Mapped[list[Turn]] = relationship(
-        back_populates="scenario_result",
+        back_populates="platform_execution",
         cascade="all, delete-orphan",
         order_by="Turn.turn_number",
     )
+
+
+class ScenarioResult(Base):
+    """One scenario of a run — the same task, compared across platforms.
+
+    Holds no conversation of its own: the captured turns live on its
+    ``PlatformExecution`` children, one per platform the scenario was run on. What it
+    owns is the *question* — which scenario, scored under which use case.
+
+    Deliberately carries **no** ``average_score``. A mean across platforms would blend
+    Claude's answer with Gemini's into one number, which is the opposite of what a
+    comparison is for; the scores that mean something are the per-platform ones on
+    ``PlatformExecution``. ``status`` is kept because a lifecycle rollup — did every
+    platform finish — is still a fact about the scenario.
+    """
+
+    __tablename__ = "scenario_results"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    run_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("benchmark_runs.id", ondelete="CASCADE"), index=True
+    )
+    scenario_id: Mapped[str] = mapped_column(String(128))
+    # The use case this scenario is scored under, as a foreign key rather than a
+    # repeated label: the metric set lives in ``use_case_metrics``. No ``ondelete`` —
+    # the default NO ACTION is what stops a use case a scored run points at from being
+    # deleted out from under it. It sits here rather than on the execution because
+    # every platform of one scenario must be scored by the same metrics to compare.
+    use_case_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("use_cases.id"), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="pending")
+
+    run: Mapped[BenchmarkRun] = relationship(back_populates="scenario_results")
+    platform_executions: Mapped[list[PlatformExecution]] = relationship(
+        back_populates="scenario_result",
+        cascade="all, delete-orphan",
+        order_by="PlatformExecution.platform",
+    )
+    # Eager-load it (see ``db.repositories.runs``): the runner's log line and
+    # ``serialize_scenario`` both read ``use_case.name``, and a lazy many-to-one under
+    # an AsyncSession is a MissingGreenlet, not a slow query.
+    use_case: Mapped[UseCase] = relationship()
 
 
 class Turn(Base):
@@ -173,8 +216,8 @@ class Turn(Base):
     __tablename__ = "turns"
 
     id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
-    scenario_result_id: Mapped[uuid.UUID] = mapped_column(
-        ForeignKey("scenario_results.id", ondelete="CASCADE"), index=True
+    platform_execution_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("platform_executions.id", ondelete="CASCADE"), index=True
     )
     turn_number: Mapped[int] = mapped_column(Integer)
     prompt: Mapped[str] = mapped_column(Text)
@@ -204,7 +247,7 @@ class Turn(Base):
     # ``retrieved_documents`` child rows. None = the sheet had no context column.
     retrieved_context_source: Mapped[str | None] = mapped_column(Text, default=None)
 
-    scenario_result: Mapped[ScenarioResult] = relationship(back_populates="turns")
+    platform_execution: Mapped[PlatformExecution] = relationship(back_populates="turns")
     # Retrieved context a RAG answer was grounded on, for groundedness-style metrics —
     # one child row per document, ordered by retriever rank. The pydantic
     # ``RetrievedContext`` (scorekeeper.core.retrieved_context) is the in-memory assembly of
@@ -247,6 +290,11 @@ class RetrievedContextDocument(Base):
     url: Mapped[str | None] = mapped_column(Text, default=None)  # Source URL, if any.
 
     turn: Mapped[Turn] = relationship(back_populates="retrieved_documents")
+    embeddings: Mapped[list[RetrievedDocumentEmbedding]] = relationship(
+        back_populates="retrieved_document",
+        cascade="all, delete-orphan",
+        order_by="RetrievedDocumentEmbedding.chunk_index",
+    )
 
     @classmethod
     def from_document(
@@ -269,6 +317,58 @@ class RetrievedContextDocument(Base):
             content=self.content,
             url=self.url,
         )
+
+
+class RetrievedDocumentEmbedding(Base):
+    """One chunk of a retrieved document, with its embedding.
+
+    A document is stored whole on ``RetrievedContextDocument.content``; this is the
+    chunked projection of that text, one row per chunk in ``chunk_index`` order, so a
+    consumer can retrieve or re-rank at chunk granularity instead of handing a judge the
+    entire document. Nothing writes these rows yet — the table is the storage layer, and
+    the producer seam is ``Judge.embed`` (``core.metrics.judge``).
+
+    PostgreSQL-only in practice: ``embedding`` degrades to JSON on the SQLite fallback,
+    which supports no similarity search.
+    """
+
+    __tablename__ = "retrieved_document_embeddings"
+    __table_args__ = (
+        # A chunk index identifies a chunk within its document, so re-embedding a
+        # document replaces rows rather than accumulating them.
+        UniqueConstraint(
+            "retrieved_document_id",
+            "chunk_index",
+            name="uq_retrieved_document_embeddings_chunk",
+        ),
+        # Cosine, not L2: the default embedder returns normalized vectors, and cosine is
+        # the conventional distance for text. HNSW over IVFFlat because it needs no
+        # training pass and behaves on an empty table. Declared here rather than only in
+        # the migration so it stays in ``Base.metadata`` and autogenerate does not
+        # propose dropping it; SQLAlchemy ignores the ``postgresql_*`` options on SQLite,
+        # which gets an inert plain index instead.
+        Index(
+            "ix_retrieved_document_embeddings_hnsw",
+            "embedding",
+            postgresql_using="hnsw",
+            postgresql_ops={"embedding": "vector_cosine_ops"},
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    retrieved_document_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("retrieved_documents.id", ondelete="CASCADE"), index=True
+    )
+    # Order of the chunk within its document, 0-based.
+    chunk_index: Mapped[int] = mapped_column(Integer)
+    # The chunk's own text — what was embedded, kept so a hit can be read back without
+    # re-splitting the parent document.
+    content: Mapped[str] = mapped_column(Text)
+    embedding: Mapped[list[float]] = mapped_column(EmbeddingColumn)
+
+    retrieved_document: Mapped[RetrievedContextDocument] = relationship(
+        back_populates="embeddings"
+    )
 
 
 class MetricScore(Base):

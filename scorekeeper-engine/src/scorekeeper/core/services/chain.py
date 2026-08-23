@@ -34,13 +34,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scorekeeper.config.settings import get_settings
 from scorekeeper.core.metrics import selection
 from scorekeeper.core.metrics.judge import Judge
-from scorekeeper.core.metrics.rollup import platform_average, scenario_average
+from scorekeeper.core.metrics.rollup import execution_average
 from scorekeeper.core.retrieval.pipeline import RetrievalOrchestrator
 from scorekeeper.core.retrieval.protocols import RetrievalPipeline
 from scorekeeper.core.runner import (
     MAX_TURN_ATTEMPTS,
     STATUS_FALLIDO,
     EvalRunner,
+    execution_status,
     scenario_status,
     turn_delay_seconds,
 )
@@ -140,8 +141,8 @@ async def advance_chain(
             turn = await turn_repo.get_turn_for_scoring(db, turn_id)
             if turn is None:
                 raise ValueError(f"El turno {turn_id} no existe.")
-            scenario = turn.scenario_result
-            platform_exec = scenario.platform_execution
+            platform_exec = turn.platform_execution
+            scenario = platform_exec.scenario_result
 
             refs = await turn_repo.list_selected_turn_refs(db, run_key)
             index = next(
@@ -152,7 +153,7 @@ async def advance_chain(
                 return None
             nxt = refs[index + 1] if index + 1 < len(refs) else None
 
-            # Idempotent: the first turn of the platform stamps it, later ones leave it.
+            # Idempotent: the first turn of the execution stamps it, later ones leave it.
             if platform_exec.started_at is None:
                 platform_exec.started_at = _now()
 
@@ -204,13 +205,11 @@ async def _work_turn(
         await db.commit()
 
     metric_names = await selection.metrics_for(db, scenario.use_case_id)
-    templates = await selection.bound_templates(
-        db, scenario.platform_execution.run_id, metric_names
-    )
+    templates = await selection.bound_templates(db, scenario.run_id, metric_names)
     metrics = await selection.resolve(db, scenario.use_case_id, templates)
     # run_turn counts the attempt and commits it before the first judge call.
     await EvalRunner(db, judge, templates).run_turn(
-        turn, metrics, _history_before(scenario, turn)
+        turn, metrics, _history_before(turn.platform_execution, turn)
     )
     await _purge_turn_cache(orchestrator, turn)
 
@@ -218,9 +217,9 @@ async def _work_turn(
 async def _purge_turn_cache(pipeline: RetrievalPipeline, turn: Turn) -> None:
     """Release what this turn downloaded (best-effort).
 
-    Per turn rather than per platform execution: every job builds its own orchestrator
+    Per turn rather than per conversation: every job builds its own orchestrator
     and ``purge_cache`` only drops the URLs *that* instance served, so a purge deferred
-    to the platform boundary would strand every earlier turn's bytes. The extracted
+    to the execution boundary would strand every earlier turn's bytes. The extracted
     markdown is already persisted, so a cleanup failure is logged, never raised.
     """
     try:
@@ -236,17 +235,23 @@ async def _purge_turn_cache(pipeline: RetrievalPipeline, turn: Turn) -> None:
         )
 
 
-def _history_before(scenario: ScenarioResult, turn: Turn) -> list[tuple[str, str]]:
-    """The conversation preceding ``turn``, rebuilt from the stored scenario.
+def _history_before(
+    platform_exec: PlatformExecution, turn: Turn
+) -> list[tuple[str, str]]:
+    """The conversation preceding ``turn``, rebuilt from its stored execution.
 
-    Nothing about the history travels in the message: ``scenario.turns`` is ordered by
-    ``turn_number``, and *every* turn feeds the history whether or not it is selected for
-    scoring, so the exchanges before this one are exactly the ones ahead of it in that
-    list. Stops on identity rather than comparing ``turn_number``, so duplicate numbering
-    cannot quietly change what the judge sees.
+    Scoped to the one platform execution, which *is* the conversation — a sibling
+    platform's answers to the same scenario are a different conversation and must never
+    leak into this judge's history.
+
+    Nothing about the history travels in the message: ``platform_execution.turns`` is
+    ordered by ``turn_number``, and *every* turn feeds the history whether or not it is
+    selected for scoring, so the exchanges before this one are exactly the ones ahead of
+    it in that list. Stops on identity rather than comparing ``turn_number``, so
+    duplicate numbering cannot quietly change what the judge sees.
     """
     history: list[tuple[str, str]] = []
-    for other in scenario.turns:
+    for other in platform_exec.turns:
         if other.id == turn.id:
             break
         history.append((other.prompt, other.response))
@@ -262,67 +267,75 @@ async def _close_boundaries(
 ) -> None:
     """Roll up whatever the turn just scored was the last of.
 
-    A boundary is simply "the successor lives somewhere else" — or there is no successor.
+    A boundary is simply "the successor lives somewhere else" — or there is no
+    successor. Innermost first: the platform execution closes, and if that was the
+    scenario's last execution the scenario closes over it.
     """
-    if nxt is None or nxt.scenario_result_id != current.scenario_result_id:
-        _finalize_scenario(scenario)
-        await db.commit()
-        logger.info(
-            "Escenario %s finalizado: estado=%s, promedio=%s",
-            scenario.scenario_id,
-            scenario.status,
-            scenario.average_score,
-        )
-    if nxt is None or nxt.platform_execution_id != current.platform_execution_id:
-        _finalize_platform(platform_exec)
-        await db.commit()
-        logger.info(
-            "Plataforma %s finalizada: promedio=%s",
-            platform_exec.platform,
-            platform_exec.average_score,
-        )
+    if nxt is not None and nxt.platform_execution_id == current.platform_execution_id:
+        return
+    _finalize_execution(platform_exec)
+    await db.commit()
+    logger.info(
+        "Plataforma %s (escenario %s) finalizada: estado=%s, promedio=%s",
+        platform_exec.platform,
+        scenario.scenario_id,
+        platform_exec.status,
+        platform_exec.average_score,
+    )
+
+    if nxt is not None and nxt.scenario_result_id == current.scenario_result_id:
+        return
+    _finalize_scenario(scenario)
+    await db.commit()
+    logger.info(
+        "Escenario %s finalizado: estado=%s, por plataforma=%s",
+        scenario.scenario_id,
+        scenario.status,
+        {pe.platform: pe.average_score for pe in scenario.platform_executions},
+    )
 
 
-def _finalize_scenario(scenario: ScenarioResult) -> None:
-    """Write a scenario's roll-up — the tail of the old ``EvalRunner.run_scenario``.
+def _finalize_execution(platform_exec: PlatformExecution) -> None:
+    """Write one conversation's roll-up — the tail of ``EvalRunner.run_execution``.
 
     Keeps that method's asymmetry on purpose: the average covers the *selected* turns,
-    while the status reads ``turn_score`` across *every* turn (so a scenario with a
+    while the status reads ``turn_score`` across *every* turn (so an execution with a
     deselected turn reports ``parcial``). Changing it here would silently re-define what
     a stored status means.
     """
-    scenario.average_score = scenario_average(
-        [turn.turn_score for turn in scenario.turns if turn.is_selected]
+    platform_exec.average_score = execution_average(
+        [turn.turn_score for turn in platform_exec.turns if turn.is_selected]
     )
-    scenario.status = scenario_status(scenario)
-
-
-def _finalize_platform(platform_exec: PlatformExecution) -> None:
-    """Write a platform execution's roll-up — the tail of ``EvalRunner.run_platform``."""
-    platform_exec.average_score = platform_average(
-        [scenario.average_score for scenario in platform_exec.scenario_results]
-    )
+    platform_exec.status = execution_status(platform_exec)
     platform_exec.finished_at = _now()
+
+
+def _finalize_scenario(scenario: ScenarioResult) -> None:
+    """Roll a scenario's status up over its platform executions.
+
+    Status only: a scenario has no average, because a mean across the platforms being
+    compared is not a number worth storing.
+    """
+    scenario.status = scenario_status(scenario)
 
 
 async def _finalize_run(db: AsyncSession, run_id: str) -> None:
     """Roll the run up, sweeping the units the chain never visited.
 
-    The chain only walks *selected* turns, so a scenario with none is never reached and
-    would keep its ``pending`` status for good — which ``run_status`` would then read as
-    a permanently partial run. Finalizing them here is what lets a run whose selection
+    The chain only walks *selected* turns, so an execution with none is never reached
+    and would keep its ``pending`` status for good — which ``run_status`` would then read
+    as a permanently partial run. Finalizing them here is what lets a run whose selection
     covered only part of the tree still reach ``completado``.
     """
     run = await run_repo.get_run_tree(db, run_id, metric_scores=False, retrieval=False)
     if run is None:
         return
-    for platform_exec in run.platform_executions:
-        for scenario in platform_exec.scenario_results:
-            if not any(turn.is_selected for turn in scenario.turns):
-                _finalize_scenario(scenario)
-        if platform_exec.finished_at is None:
-            platform_exec.started_at = platform_exec.started_at or _now()
-            _finalize_platform(platform_exec)
+    for scenario in run.scenario_results:
+        for platform_exec in scenario.platform_executions:
+            if platform_exec.finished_at is None:
+                platform_exec.started_at = platform_exec.started_at or _now()
+                _finalize_execution(platform_exec)
+        _finalize_scenario(scenario)
     run.status = run_status(run)
     await db.commit()
     logger.info("Run %s finalizado con estado %s", run_id, run.status)

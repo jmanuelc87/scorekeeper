@@ -4,15 +4,21 @@ from __future__ import annotations
 
 import pytest
 
+from sqlalchemy import func, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.db.models import (
     AuthProviderConfig,
+    BenchmarkRun,
     MetricDefinition,
+    PlatformExecution,
     Prompt,
     PromptVersion,
     RetrievedContextDocument,
+    RetrievedDocumentEmbedding,
+    ScenarioResult,
+    Turn,
 )
 from scorekeeper.core.retrieval.credentials.secrets import SecretError
 from scorekeeper.core.retrieved_context import RetrievedDocument
@@ -183,5 +189,102 @@ async def test_version_numbers_are_unique_per_prompt(session: AsyncSession) -> N
     session.add(_version(prompt, 1, "published"))
     await session.flush()
     session.add(_version(prompt, 1, "discarded"))
+    with pytest.raises(IntegrityError):
+        await session.flush()
+
+
+async def test_deleting_a_run_cascades_through_the_whole_tree(
+    session: AsyncSession, compose_use_case
+) -> None:
+    """The inverted hierarchy cascades all the way down from the run.
+
+    Neither the executions nor the turns hang off the run directly any more, so the
+    delete has to travel run → scenario → platform execution → turn to reach them.
+    """
+    run = BenchmarkRun()
+    scenario = ScenarioResult(
+        scenario_id="esc-1", use_case=await compose_use_case([]), run=run
+    )
+    # Two platforms answering one scenario, each with its own turns.
+    for platform in ("claude", "gemini"):
+        PlatformExecution(platform=platform, scenario_result=scenario).turns.append(
+            Turn(turn_number=1, prompt="p", response="r")
+        )
+    session.add(scenario)
+    await session.commit()
+
+    await session.delete(run)
+    await session.commit()
+
+    for model in (ScenarioResult, PlatformExecution, Turn):
+        remaining = (await session.execute(select(func.count()).select_from(model))).scalar_one()
+        assert remaining == 0, model.__name__
+
+
+async def test_deleting_a_run_cascades_into_document_embeddings(
+    session: AsyncSession, compose_use_case
+) -> None:
+    """Embeddings hang two levels below the turn and must still go with the run.
+
+    The chain is run → scenario → platform execution → turn → retrieved document →
+    embedding, so this covers the two links the tree-wide test above does not reach.
+    """
+    run = BenchmarkRun()
+    scenario = ScenarioResult(
+        scenario_id="esc-1", use_case=await compose_use_case([]), run=run
+    )
+    turn = Turn(turn_number=1, prompt="p", response="r")
+    PlatformExecution(platform="claude", scenario_result=scenario).turns.append(turn)
+    document = RetrievedContextDocument(
+        rank=0, name="doc", document="d.pdf", content="uno dos", url=None
+    )
+    turn.retrieved_documents.append(document)
+    # Two chunks of the one document. The vectors are short on purpose: this asserts the
+    # FK chain, and on the SQLite fallback the column is JSON and enforces no width.
+    for index, chunk in enumerate(("uno", "dos")):
+        document.embeddings.append(
+            RetrievedDocumentEmbedding(
+                chunk_index=index, content=chunk, embedding=[0.1, 0.2, 0.3]
+            )
+        )
+    session.add(scenario)
+    await session.commit()
+
+    stored = (
+        await session.execute(select(func.count()).select_from(RetrievedDocumentEmbedding))
+    ).scalar_one()
+    assert stored == 2
+
+    await session.delete(run)
+    await session.commit()
+
+    for model in (RetrievedContextDocument, RetrievedDocumentEmbedding):
+        remaining = (await session.execute(select(func.count()).select_from(model))).scalar_one()
+        assert remaining == 0, model.__name__
+
+
+async def test_document_embedding_chunk_index_is_unique_per_document(
+    session: AsyncSession, compose_use_case
+) -> None:
+    """Re-embedding a document replaces its chunks rather than accumulating them."""
+    run = BenchmarkRun()
+    scenario = ScenarioResult(
+        scenario_id="esc-1", use_case=await compose_use_case([]), run=run
+    )
+    turn = Turn(turn_number=1, prompt="p", response="r")
+    PlatformExecution(platform="claude", scenario_result=scenario).turns.append(turn)
+    document = RetrievedContextDocument(
+        rank=0, name="doc", document="d.pdf", content="uno", url=None
+    )
+    turn.retrieved_documents.append(document)
+    document.embeddings.append(
+        RetrievedDocumentEmbedding(chunk_index=0, content="uno", embedding=[0.1])
+    )
+    session.add(scenario)
+    await session.flush()
+
+    document.embeddings.append(
+        RetrievedDocumentEmbedding(chunk_index=0, content="duplicado", embedding=[0.2])
+    )
     with pytest.raises(IntegrityError):
         await session.flush()

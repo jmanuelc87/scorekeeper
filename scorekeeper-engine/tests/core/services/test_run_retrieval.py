@@ -203,9 +203,9 @@ async def test_retrieve_run_abandons_a_turn_at_the_attempt_cap(session: AsyncSes
 # -- cache cleanup -------------------------------------------------------------------------
 
 
-async def test_retrieve_run_purges_cache_once_per_platform_execution(session: AsyncSession) -> None:
-    # Two scenarios under one platform execution: the cache is released when the execution
-    # finishes, not after every scenario, and only once every turn has been retrieved.
+async def test_retrieve_run_purges_cache_once_per_scenario(session: AsyncSession) -> None:
+    # Two scenarios: the cache is released as each one finishes, once its turns have all
+    # been retrieved — the scenario is the unit the downloaded bytes belong to.
     files = [
         UploadedFile(
             filename=f"esc{i}.xlsx",
@@ -226,7 +226,10 @@ async def test_retrieve_run_purges_cache_once_per_platform_execution(session: As
     await retrieve_run(run_id, session=session, pipeline=pipeline)
 
     assert pipeline.calls == ["ref-1", "ref-2"]
-    assert pipeline.purges == [2]  # one purge, after both scenarios ran
+    # One purge per scenario. The stub reports the cumulative number of cells retrieved
+    # so far, so the second purge sees both — what matters is that each fires only after
+    # its own scenario's turns have run.
+    assert pipeline.purges == [1, 2]
 
 
 async def test_retrieve_run_purges_cache_on_failure(session: AsyncSession) -> None:

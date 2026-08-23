@@ -19,6 +19,7 @@ async def test_scenario_turns_endpoint_forwards_and_returns(monkeypatch) -> None
     payload = [
         {
             "turn_id": "11111111-1111-1111-1111-111111111111",
+            "platform": "claude",
             "turn_number": 1,
             "prompt": "hola",
             "response": "qué tal",

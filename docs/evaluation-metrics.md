@@ -45,8 +45,8 @@ flowchart TD
     inst --> ev
     res --> rows[("MetricScore rows")]
     rows -- "turn_score(): weighted mean<br/>of normalized scores" --> ts["Turn.turn_score"]
-    ts -- "average()" --> sa["ScenarioResult.average_score"]
-    sa -- "average()" --> pa["PlatformExecution.average_score"]
+    ts -- "average()" --> pe["PlatformExecution.average_score"]
+    pe -- "grouped by platform<br/>at read time" --> pa["platforms[].average_score"]
 ```
 
 - `@register` puts a metric in the code catalog; `sync_metrics()` mirrors its name
@@ -59,7 +59,7 @@ flowchart TD
 - `evaluate()` sees only a `TurnView`: prompt, response, conversation history,
   the turn's retrieved context, and the expected output.
 - Each result becomes a `MetricScore` row; rollup turns them into a per-turn
-  score and then into scenario and platform averages (see
+  score and then into per-conversation and per-platform averages (see
   [Data model](data-model.md)).
 
 ## Core concepts
@@ -314,8 +314,10 @@ async with SessionLocal() as session:
 turn_score = Σ (scale.normalize(score) · weight) / Σ weight
 ```
 
-`average(values)` (aliased as `scenario_average` / `platform_average`) is the
-plain mean of the non-null children, used for scenario and platform rollups.
+`average(values)` (aliased as `execution_average` / `platform_average`) is the
+plain mean of the non-null children: `execution_average` folds a conversation's turn
+scores into its `PlatformExecution`, `platform_average` folds a run's executions into
+one figure per platform. There is no scenario-level average.
 
 ### Not-applicable scores
 
@@ -467,11 +469,12 @@ No LLM SDK is wired up yet. To score for real:
    the `Judge` Protocol (e.g. `AnthropicJudge`, using the latest Claude models via
    structured/JSON tool output for the score and Spanish justification).
 2. Add its SDK (e.g. `anthropic`) to `pyproject.toml`.
-3. Build the scoring runner that: reads each `ScenarioResult.use_case`, calls
+3. Build the scoring runner that: reads each scenario's `use_case`, calls
    `resolve(session, use_case)`, runs `evaluate()` per turn, persists
    `MetricScore` rows, and fills `Turn.turn_score` /
-   `ScenarioResult.average_score` / `PlatformExecution.average_score` via
-   `rollup`.
+   `PlatformExecution.average_score` via `rollup`. A scenario stores no average —
+   its platforms are compared, not blended — and the per-run, per-platform figure is
+   grouped at read time.
 
 Because metrics depend only on the `Judge` Protocol, none of the taxonomy changes
 when the SDK lands — only the new judge file and the runner.

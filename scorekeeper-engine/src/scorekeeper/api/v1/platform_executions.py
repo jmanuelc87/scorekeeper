@@ -1,4 +1,4 @@
-"""``/platform-executions`` — one flat row per platform execution, filtered."""
+"""``/platform-executions`` — one flat rollup row per run and platform, filtered."""
 
 from __future__ import annotations
 
@@ -20,13 +20,14 @@ async def list_platform_executions(
         None, description="Fin del rango ISO-8601 sobre la ventana de evaluación."
     ),
 ) -> list[dict]:
-    """Retrieve the platform executions matching the filters, as a flat list.
+    """Retrieve the per-run, per-platform rollups matching the filters, as a flat list.
 
-    One entry per platform execution rather than per run, so a run holding several
-    platforms yields several entries sharing a ``run_id``. Each entry carries the
-    platform's rollup (``average_score``, scenario count, status breakdown) and its
-    scoring window; it does not nest the scenario results — read those through
-    ``GET /runs``.
+    One entry per (run, platform) pair, so a run holding several platforms yields
+    several entries sharing a ``run_id``. Each entry carries the platform's rollup
+    (``average_score``, scenario count, status breakdown) and its scoring window; it
+    does not nest the scenario results — read those through ``GET /runs``. The entry is
+    keyed by ``run_id`` + ``platform`` and has no id of its own: a platform execution
+    row belongs to a single scenario now, so the rollup is grouped, not stored.
 
     Both filters are optional and AND-combined. The date range bounds the scoring
     window (``started_at``/``finished_at``), which stays null until a worker scores

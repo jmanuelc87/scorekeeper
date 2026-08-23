@@ -35,11 +35,15 @@ async def get_turn_with_token_usage(session: AsyncSession, turn_id: str) -> Turn
 
 
 class TurnRef(NamedTuple):
-    """One selected turn's place in the run — enough to know where its boundaries are."""
+    """One selected turn's place in the run — enough to know where its boundaries are.
+
+    Two boundaries, innermost first: a turn ends its platform execution, and the last
+    execution of a scenario ends the scenario.
+    """
 
     turn_id: uuid.UUID
-    scenario_result_id: uuid.UUID
     platform_execution_id: uuid.UUID
+    scenario_result_id: uuid.UUID
 
 
 async def get_run_key_for_turn(session: AsyncSession, turn_id: str) -> uuid.UUID | None:
@@ -53,9 +57,9 @@ async def get_run_key_for_turn(session: AsyncSession, turn_id: str) -> uuid.UUID
     except ValueError:
         return None
     stmt = (
-        select(PlatformExecution.run_id)
-        .join(ScenarioResult, ScenarioResult.platform_execution_id == PlatformExecution.id)
-        .join(Turn, Turn.scenario_result_id == ScenarioResult.id)
+        select(ScenarioResult.run_id)
+        .join(PlatformExecution, PlatformExecution.scenario_result_id == ScenarioResult.id)
+        .join(Turn, Turn.platform_execution_id == PlatformExecution.id)
         .where(Turn.id == key)
     )
     return (await session.execute(stmt)).scalars().one_or_none()
@@ -67,26 +71,29 @@ async def list_selected_turn_refs(
     """Every selected turn of a run, in the order the chain must score them.
 
     This is where "the next unit of work" is defined. The order is spelled out here
-    rather than taken from the relationships because neither gives a total one:
-    ``BenchmarkRun.platform_executions`` orders by ``started_at``, which is NULL until a
-    worker touches it, and ``PlatformExecution.scenario_results`` has no order at all.
-    The ``platform``/``scenario_id`` pairing matches ``scenarios.list_scenarios_for_run``;
-    the ``id`` tiebreakers keep it total when two scenarios share a label.
+    rather than taken from the relationships because none of them gives a total one:
+    ``BenchmarkRun.scenario_results`` orders by ``scenario_id``, which repeats when two
+    scenarios share a label, and ``ScenarioResult.platform_executions`` by ``platform``,
+    which repeats when a scenario holds two captures of one platform.
+
+    Scenario-major, then platform: a scenario's platforms are scored back to back, which
+    is what makes its cross-platform rollup land as soon as the scenario is done. The
+    ``id`` tiebreakers keep the order total.
 
     The returned list answers everything a per-turn job asks: where it is, what comes
-    next, and whether the successor crosses a scenario or platform boundary (i.e. whether
-    it owes a roll-up before handing over).
+    next, and whether the successor crosses a platform-execution or scenario boundary
+    (i.e. whether it owes a roll-up before handing over).
     """
     stmt = (
-        select(Turn.id, ScenarioResult.id, PlatformExecution.id)
-        .join(ScenarioResult, Turn.scenario_result_id == ScenarioResult.id)
-        .join(PlatformExecution, ScenarioResult.platform_execution_id == PlatformExecution.id)
-        .where(PlatformExecution.run_id == run_key, Turn.is_selected)
+        select(Turn.id, PlatformExecution.id, ScenarioResult.id)
+        .join(PlatformExecution, Turn.platform_execution_id == PlatformExecution.id)
+        .join(ScenarioResult, PlatformExecution.scenario_result_id == ScenarioResult.id)
+        .where(ScenarioResult.run_id == run_key, Turn.is_selected)
         .order_by(
-            PlatformExecution.platform,
-            PlatformExecution.id,
             ScenarioResult.scenario_id,
             ScenarioResult.id,
+            PlatformExecution.platform,
+            PlatformExecution.id,
             Turn.turn_number,
         )
     )
@@ -98,9 +105,9 @@ async def get_turn_for_scoring(session: AsyncSession, turn_id: str) -> Turn | No
 
     Under an ``AsyncSession`` an unloaded relationship is a ``MissingGreenlet``, not a
     slow query, so the whole reach is eager: the turn's own children to score it,
-    ``scenario_result.turns`` to rebuild the conversation history *and* roll the scenario
-    up, and the platform execution's scenarios to roll that up in turn.
-    ``MetricScore.trace`` is required rather than an optimization — clearing
+    ``platform_execution.turns`` to rebuild the conversation history *and* roll the
+    execution up, and the scenario above it (with its other executions) to roll *that*
+    up in turn. ``MetricScore.trace`` is required rather than an optimization — clearing
     ``turn.metric_scores`` cascades delete-orphan into it at flush time.
     """
     return await _load(
@@ -109,11 +116,11 @@ async def get_turn_for_scoring(session: AsyncSession, turn_id: str) -> Turn | No
         selectinload(Turn.metric_scores).selectinload(MetricScore.trace),
         selectinload(Turn.retrieved_documents),
         selectinload(Turn.token_usage),
-        selectinload(Turn.scenario_result).options(
-            selectinload(ScenarioResult.use_case),
-            selectinload(ScenarioResult.turns),
-            selectinload(ScenarioResult.platform_execution).selectinload(
-                PlatformExecution.scenario_results
+        selectinload(Turn.platform_execution).options(
+            selectinload(PlatformExecution.turns),
+            selectinload(PlatformExecution.scenario_result).options(
+                selectinload(ScenarioResult.use_case),
+                selectinload(ScenarioResult.platform_executions),
             ),
         ),
     )

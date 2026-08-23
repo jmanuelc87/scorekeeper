@@ -182,17 +182,23 @@ async def _seed_run(
     """
     use_case = await _use_case(session)
     run = BenchmarkRun()
-    for platform, scenarios in shape.items():
-        platform_exec = PlatformExecution(platform=platform, run=run)
-        for scenario_id, exchanges in scenarios.items():
-            scenario = ScenarioResult(
-                scenario_id=scenario_id,
-                use_case=use_case,
-                platform_execution=platform_exec,
+    # A scenario is shared across the platforms that ran it, so build it once and hang
+    # one execution per platform off it.
+    scenarios: dict[str, ScenarioResult] = {}
+    for platform, shape_scenarios in shape.items():
+        for scenario_id, exchanges in shape_scenarios.items():
+            scenario = scenarios.get(scenario_id)
+            if scenario is None:
+                scenario = ScenarioResult(
+                    scenario_id=scenario_id, use_case=use_case, run=run
+                )
+                scenarios[scenario_id] = scenario
+            platform_exec = PlatformExecution(
+                platform=platform, scenario_result=scenario
             )
             for i, (prompt, response) in enumerate(exchanges, start=1):
                 key = f"{platform}/{scenario_id}/{i}"
-                scenario.turns.append(
+                platform_exec.turns.append(
                     Turn(
                         turn_number=i,
                         prompt=prompt,
@@ -230,7 +236,7 @@ async def test_start_chain_marks_en_proceso_and_returns_the_first_turn(
 
     assert run.status == STATUS_EN_PROCESO
     assert nxt is not None
-    assert nxt.turn_id == str(run.platform_executions[0].scenario_results[0].turns[0].id)
+    assert nxt.turn_id == str(run.scenario_results[0].platform_executions[0].turns[0].id)
     assert nxt.countdown == 0.0  # nothing to pace away from yet
 
 
@@ -259,7 +265,7 @@ async def test_advance_chain_scores_only_its_own_turn(
 ) -> None:
     # The whole point of the granularity: one job judges one turn and stops.
     run = await _seed_run(session, {"claude": {"esc-1": [("a", "b"), ("c", "d")]}})
-    turns = run.platform_executions[0].scenario_results[0].turns
+    turns = run.scenario_results[0].platform_executions[0].turns
     judge = RecordingJudge()
 
     first = await start_chain(str(run.id), session=session)
@@ -281,7 +287,7 @@ async def test_advance_chain_retrieves_before_scoring_its_turn(
     first = await start_chain(str(run.id), session=session)
     await advance_chain(first.turn_id, session=session, judge=judge, pipeline=pipeline)
 
-    turn = run.platform_executions[0].scenario_results[0].turns[0]
+    turn = run.scenario_results[0].platform_executions[0].turns[0]
     assert [d.content for d in turn.retrieved_documents] == ["md::ref-claude/esc-1/1"]
     # The judge saw the context the same job had just fetched.
     assert judge.seen_turns[0].retrieved_context.documents[0].content == (
@@ -360,53 +366,67 @@ async def test_scenario_rollup_happens_on_its_last_turn(
     run = await _seed_run(
         session, {"claude": {"esc-1": [("a", "b"), ("c", "d")], "esc-2": [("e", "f")]}}
     )
-    scenarios = run.platform_executions[0].scenario_results
-    by_id = {s.scenario_id: s for s in scenarios}
+    # The score lives on the execution; the scenario only rolls up a status.
+    by_id = {s.scenario_id: s.platform_executions[0] for s in run.scenario_results}
+    status_of = {s.scenario_id: s for s in run.scenario_results}
 
     first = await start_chain(str(run.id), session=session)
     second = await advance_chain(first.turn_id, session=session, judge=RecordingJudge())
-    assert by_id["esc-1"].average_score is None  # mid-scenario: not rolled up yet
+    assert by_id["esc-1"].average_score is None  # mid-conversation: not rolled up yet
 
     third = await advance_chain(second.turn_id, session=session, judge=RecordingJudge())
     assert by_id["esc-1"].average_score == pytest.approx(0.8)
-    assert by_id["esc-1"].status == STATUS_COMPLETADO
+    assert status_of["esc-1"].status == STATUS_COMPLETADO
     assert by_id["esc-2"].average_score is None  # its own turn has not run
 
     await advance_chain(third.turn_id, session=session, judge=RecordingJudge())
     assert by_id["esc-2"].average_score == pytest.approx(0.8)
 
 
-async def test_platform_rollup_happens_on_its_last_turn(
+async def test_execution_rolls_up_before_its_scenario(
     session: AsyncSession, registry
 ) -> None:
+    # One scenario run on two platforms — the shape the whole inversion exists for.
+    # Each execution closes on its own last turn; the scenario closes over both only
+    # once the second one is done.
     run = await _seed_run(
         session, {"claude": {"esc-1": [("a", "b")]}, "gemini": {"esc-1": [("c", "d")]}}
     )
-    by_platform = {pe.platform: pe for pe in run.platform_executions}
+    scenario = run.scenario_results[0]
+    by_platform = {pe.platform: pe for pe in scenario.platform_executions}
+    assert set(by_platform) == {"claude", "gemini"}  # one scenario, two conversations
 
     first = await start_chain(str(run.id), session=session)
     second = await advance_chain(first.turn_id, session=session, judge=RecordingJudge())
 
+    # The first platform is finished; the scenario is not, since one platform is left.
     assert by_platform["claude"].average_score == pytest.approx(0.8)
     assert by_platform["claude"].finished_at is not None
-    assert by_platform["gemini"].finished_at is None  # not its turn yet
+    assert by_platform["gemini"].finished_at is None
+    assert scenario.status != STATUS_COMPLETADO
 
     await advance_chain(second.turn_id, session=session, judge=RecordingJudge())
     assert by_platform["gemini"].finished_at is not None
+    # The scenario rolls up a status over both platforms — never a blended average.
+    assert scenario.status == STATUS_COMPLETADO
+    assert [pe.average_score for pe in scenario.platform_executions] == [
+        pytest.approx(0.8),
+        pytest.approx(0.8),
+    ]
 
 
 async def test_platform_started_at_is_stamped_once(
     session: AsyncSession, registry
 ) -> None:
     run = await _seed_run(session, {"claude": {"esc-1": [("a", "b"), ("c", "d")]}})
-    platform_exec = run.platform_executions[0]
+    platform_exec = run.scenario_results[0].platform_executions[0]
 
     first = await start_chain(str(run.id), session=session)
     await advance_chain(first.turn_id, session=session, judge=RecordingJudge())
     stamped = platform_exec.started_at
 
     await advance_chain(
-        str(platform_exec.scenario_results[0].turns[1].id),
+        str(platform_exec.turns[1].id),
         session=session,
         judge=RecordingJudge(),
     )
@@ -438,9 +458,9 @@ async def test_scenario_without_selected_turns_is_finalized_at_the_end(
 
     await _drive(session, run, judge=RecordingJudge())
 
-    by_id = {s.scenario_id: s for s in run.platform_executions[0].scenario_results}
+    by_id = {s.scenario_id: s for s in run.scenario_results}
     assert by_id["esc-2"].status == STATUS_FALLIDO  # nothing scored in it
-    assert by_id["esc-2"].average_score is None
+    assert by_id["esc-2"].platform_executions[0].average_score is None
     await session.refresh(run)
     assert run.status != "pending"
 
@@ -453,7 +473,7 @@ async def test_already_scored_turn_still_returns_the_successor(
 ) -> None:
     # A re-delivery must repair the chain rather than stall it.
     run = await _seed_run(session, {"claude": {"esc-1": [("a", "b"), ("c", "d")]}})
-    turns = run.platform_executions[0].scenario_results[0].turns
+    turns = run.scenario_results[0].platform_executions[0].turns
     first = await start_chain(str(run.id), session=session)
     await advance_chain(first.turn_id, session=session, judge=RecordingJudge())
 
@@ -489,7 +509,7 @@ async def test_advance_chain_abandons_a_turn_at_the_attempt_cap_and_keeps_going(
     session: AsyncSession, registry
 ) -> None:
     run = await _seed_run(session, {"claude": {"esc-1": [("a", "b"), ("c", "d")]}})
-    turns = run.platform_executions[0].scenario_results[0].turns
+    turns = run.scenario_results[0].platform_executions[0].turns
     turns[0].attempts = MAX_TURN_ATTEMPTS
     await session.commit()
     judge = RecordingJudge()

@@ -8,12 +8,20 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from scorekeeper.core.runner import STATUS_FALLIDO, STATUS_PARCIAL
 from scorekeeper.core.services.serializers import summarize_run
 from scorekeeper.core.services.status import STATUS_EN_COLA, STATUS_INGERIDO
 from scorekeeper.db.connection import session_scope
 from scorekeeper.db.repositories import runs as run_repo
 
 logger = logging.getLogger(__name__)
+
+# The states a run may be resumed from: it stopped without scoring everything it had
+# selected. ``fallido`` is a chain that died on an error; ``parcial`` is one that
+# finished walking but left turns unscored. ``en_cola``/``en_proceso`` are excluded
+# because the chain is still live — Celery re-delivers a job whose worker died, so a
+# run in those states repairs itself rather than needing a second chain.
+RESUMABLE_STATUSES = frozenset({STATUS_FALLIDO, STATUS_PARCIAL})
 
 
 async def get_run_summary(
@@ -51,6 +59,35 @@ async def start_run(run_id: str, *, session: AsyncSession | None = None) -> str 
         return STATUS_EN_COLA
 
 
+async def resume_run(run_id: str, *, session: AsyncSession | None = None) -> str | None:
+    """Move a stopped run back to ``en_cola`` so its chain can be enqueued again.
+
+    Resuming re-enqueues the *same* chain: :func:`~scorekeeper.core.services.chain.start_chain`
+    re-pins the prompts and walks the run's selected turns from the start, and each turn
+    that already has a score is skipped rather than re-judged, so only the unscored ones
+    cost a judge call. Commits the new status; the caller enqueues.
+
+    Returns the new status (``en_cola``) on success, or ``None`` when the ``run_id`` is
+    unknown/invalid. Raises ``ValueError`` when the run is not in a resumable state (see
+    :data:`RESUMABLE_STATUSES`) — a run still queued or in process has a live chain, and
+    one already ``completado`` has nothing left to score.
+    """
+    async with session_scope(session) as db:
+        run = await run_repo.get_run(db, run_id)
+        if run is None:
+            return None
+        if run.status not in RESUMABLE_STATUSES:
+            raise ValueError(
+                f"El run {run_id} no se puede reanudar desde el estado "
+                f"'{run.status}'. Estados reanudables: "
+                f"{', '.join(sorted(RESUMABLE_STATUSES))}."
+            )
+        run.status = STATUS_EN_COLA
+        await db.commit()
+        logger.info("Run %s reanudado: encolado de nuevo para puntuación.", run_id)
+        return STATUS_EN_COLA
+
+
 async def set_turn_selection(
     run_id: str,
     turn_ids: list[str],
@@ -83,9 +120,9 @@ async def set_turn_selection(
             except (ValueError, AttributeError):
                 continue  # ignore malformed ids
         updated = 0
-        for platform_exec in run.platform_executions:
-            for scenario in platform_exec.scenario_results:
-                for turn in scenario.turns:
+        for scenario in run.scenario_results:
+            for platform_exec in scenario.platform_executions:
+                for turn in platform_exec.turns:
                     if turn.id in wanted:
                         turn.is_selected = is_selected
                         updated += 1

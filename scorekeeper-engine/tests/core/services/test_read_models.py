@@ -165,7 +165,7 @@ async def test_retrieve_platform_granularity_stops_at_platform(session: AsyncSes
     assert platform["average_score"] == pytest.approx(0.8)
     assert platform["status_breakdown"] == {"completado": 1}
     # Platform granularity does not descend into scenarios.
-    assert "scenario_results" not in platform
+    assert "scenario_results" not in run
 
 
 async def test_retrieve_scenario_granularity_adds_scenarios(session: AsyncSession, registry) -> None:
@@ -173,16 +173,19 @@ async def test_retrieve_scenario_granularity_adds_scenarios(session: AsyncSessio
 
     runs = await retrieve_runs(granularity="scenario_results", session=session)
 
-    scenarios = runs[0]["platforms"][0]["scenario_results"]
+    scenarios = runs[0]["scenario_results"]
     assert len(scenarios) == 1
     scenario = scenarios[0]
     assert scenario["scenario_id"] == "esc1"
     assert scenario["use_case"] == "default"
     assert scenario["status"] == "completado"
+    # The conversation itself hangs off the scenario, one per platform.
+    execution = scenario["platform_executions"][0]
+    assert execution["platform"] == "claude"
     # A spreadsheet never names the model that answered.
-    assert scenario["model_name"] is None
+    assert execution["model_name"] is None
     # Scenario granularity does not descend into turns.
-    assert "turns" not in scenario
+    assert "turns" not in execution
 
 
 async def test_scenario_serialization_exposes_the_captured_model(
@@ -205,8 +208,8 @@ async def test_scenario_serialization_exposes_the_captured_model(
 
     runs = await retrieve_runs(granularity="scenario_results", session=session)
 
-    scenario = runs[0]["platforms"][0]["scenario_results"][0]
-    assert scenario["model_name"] == "Claude Opus 4.5"
+    scenario = runs[0]["scenario_results"][0]
+    assert scenario["platform_executions"][0]["model_name"] == "Claude Opus 4.5"
 
 
 async def test_retrieve_metric_granularity_adds_turns_and_scores(session: AsyncSession, registry) -> None:
@@ -214,8 +217,8 @@ async def test_retrieve_metric_granularity_adds_turns_and_scores(session: AsyncS
 
     runs = await retrieve_runs(granularity="metric_scores", session=session)
 
-    scenario = runs[0]["platforms"][0]["scenario_results"][0]
-    turns = scenario["turns"]
+    scenario = runs[0]["scenario_results"][0]
+    turns = scenario["platform_executions"][0]["turns"]
     assert [t["turn_number"] for t in turns] == [1, 2]
     # Each serialized turn carries its id so clients can reach /turns/{id}/traces.
     assert all(uuid.UUID(t["turn_id"]) for t in turns)
@@ -373,7 +376,7 @@ async def test_not_applicable_score_serializes_as_null(
 
     # Both projections hide the internal encoding behind a null.
     assert turns[0]["metric_scores"][0]["score"] is None
-    run_turns = runs[0]["platforms"][0]["scenario_results"][0]["turns"]
+    run_turns = runs[0]["scenario_results"][0]["platform_executions"][0]["turns"]
     assert run_turns[0]["metric_scores"][0]["score"] is None
 
 
@@ -383,7 +386,7 @@ async def test_scenario_serialization_exposes_id(session: AsyncSession, registry
 
     runs = await retrieve_runs(granularity="scenario_results", session=session)
 
-    serialized = runs[0]["platforms"][0]["scenario_results"][0]
+    serialized = runs[0]["scenario_results"][0]
     # The UUID handle GET /scenarios/{id}/turns takes, alongside the readable label.
     assert serialized["id"] == str(scenario.id)
     assert serialized["scenario_id"] == "esc1"
@@ -392,12 +395,10 @@ async def test_scenario_serialization_exposes_id(session: AsyncSession, registry
 async def test_retrieve_scenario_turns_empty_scenario_returns_list(
     session: AsyncSession, compose_use_case
 ) -> None:
-    execution = PlatformExecution(platform="claude", run=BenchmarkRun())
     scenario = ScenarioResult(
-        scenario_id="vacio",
-        use_case=await compose_use_case([]),
-        platform_execution=execution,
+        scenario_id="vacio", use_case=await compose_use_case([]), run=BenchmarkRun()
     )
+    PlatformExecution(platform="claude", scenario_result=scenario)
     session.add(scenario)
     await session.commit()
 
@@ -424,9 +425,8 @@ async def test_retrieve_default_granularity_is_scenario(session: AsyncSession, r
 
     runs = await retrieve_runs(session=session)
 
-    platform = runs[0]["platforms"][0]
-    assert "scenario_results" in platform
-    assert "turns" not in platform["scenario_results"][0]
+    assert "scenario_results" in runs[0]
+    assert "turns" not in runs[0]["scenario_results"][0]["platform_executions"][0]
 
 
 async def test_retrieve_platform_filter(session: AsyncSession, registry) -> None:
@@ -505,21 +505,31 @@ async def test_retrieve_run_scenarios_returns_flat_rollups(
     scenarios = await retrieve_run_scenarios(run_id, session=session)
 
     assert scenarios is not None
-    # Flat: one entry per scenario, no platform nesting to walk.
+    # One entry per scenario, each nesting the conversations it was run as.
     assert [scenario["scenario_id"] for scenario in scenarios] == ["esc1", "esc2"]
     assert set(scenarios[0]) == {
         "id",
         "scenario_id",
-        "platform",
         "use_case",
+        "status",
+        "platform_executions",
+    }
+    assert scenarios[0]["use_case"] == "default"
+    # No scenario-level average: the score lives on each platform's execution.
+    assert "average_score" not in scenarios[0]
+    # The platform, model and per-conversation rollup live on the execution.
+    execution = scenarios[0]["platform_executions"][0]
+    assert set(execution) == {
+        "id",
+        "platform",
         "model_name",
         "status",
         "average_score",
+        "started_at",
+        "finished_at",
     }
-    # The platform each scenario ran under, and the use case resolved to its name.
-    assert scenarios[0]["platform"] == "claude"
-    assert scenarios[0]["use_case"] == "default"
-    assert scenarios[0]["average_score"] == pytest.approx(0.8)
+    assert execution["platform"] == "claude"
+    assert execution["average_score"] == pytest.approx(0.8)
     # The id is the ScenarioResult UUID the turns endpoint takes.
     assert await retrieve_scenario_turns(scenarios[0]["id"], session=session) is not None
 
@@ -582,7 +592,8 @@ async def test_retrieve_run_scenarios_unscored_run_returns_entries(
     scenarios = await retrieve_run_scenarios(run_id, session=session)
 
     assert len(scenarios) == 1
-    assert scenarios[0]["average_score"] is None
+    assert scenarios[0]["status"] == "pending"
+    assert scenarios[0]["platform_executions"][0]["average_score"] is None
 
 
 async def test_retrieve_platform_executions_returns_flat_entries(
@@ -596,7 +607,6 @@ async def test_retrieve_platform_executions_returns_flat_entries(
     row = rows[0]
     # Flat: the platform rollup is the whole entry, never a nested scenario tree.
     assert set(row) == {
-        "id",
         "run_id",
         "platform",
         "started_at",
@@ -606,7 +616,6 @@ async def test_retrieve_platform_executions_returns_flat_entries(
         "status_breakdown",
     }
     assert row["run_id"] == run_id
-    assert uuid.UUID(row["id"])
     assert row["platform"] == "claude"
     assert row["average_score"] == pytest.approx(0.8)
     assert row["scenarios"] == 1
@@ -657,18 +666,25 @@ async def test_retrieve_platform_executions_date_range(
     )
 
 
-async def test_retrieve_platform_executions_unfinished_execution(session: AsyncSession) -> None:
-    execution = PlatformExecution(
-        platform="claude", started_at=datetime(2026, 7, 10, 12, 0, 0), run=BenchmarkRun()
+async def test_retrieve_platform_executions_unfinished_execution(
+    session: AsyncSession, compose_use_case
+) -> None:
+    scenario = ScenarioResult(
+        scenario_id="esc1", use_case=await compose_use_case([]), run=BenchmarkRun()
     )
-    session.add(execution)
+    PlatformExecution(
+        platform="claude",
+        started_at=datetime(2026, 7, 10, 12, 0, 0),
+        scenario_result=scenario,
+    )
+    session.add(scenario)
     await session.commit()
 
     rows = await retrieve_platform_executions(session=session)
     assert len(rows) == 1
-    # An execution with no scenarios still projects, with an empty rollup.
-    assert rows[0]["scenarios"] == 0
-    assert rows[0]["status_breakdown"] == {}
+    # Started but never finished: the rollup counts its conversation, end still open.
+    assert rows[0]["scenarios"] == 1
+    assert rows[0]["status_breakdown"] == {"pending": 1}
     assert rows[0]["finished_at"] is None
     # The bounds are asymmetric: a lower bound only tests started_at, so an
     # in-progress execution survives it...
@@ -678,23 +694,24 @@ async def test_retrieve_platform_executions_unfinished_execution(session: AsyncS
 
 
 async def test_retrieve_platform_executions_flattens_multiple_platforms(
-    session: AsyncSession,
+    session: AsyncSession, compose_use_case
 ) -> None:
     run = BenchmarkRun()
-    session.add_all(
-        [
-            PlatformExecution(platform="gemini", run=run),
-            PlatformExecution(platform="claude", run=run),
-        ]
+    # One scenario run on both platforms — the shape the rollup exists to summarize.
+    scenario = ScenarioResult(
+        scenario_id="esc1", use_case=await compose_use_case([]), run=run
     )
+    for platform in ("gemini", "claude"):
+        PlatformExecution(platform=platform, scenario_result=scenario)
+    session.add(scenario)
     await session.commit()
 
     rows = await retrieve_platform_executions(session=session)
 
-    # One entry per platform execution — both sharing the run they belong to.
+    # One entry per distinct platform in the run — both sharing its run_id.
     assert len(rows) == 2
     assert {row["run_id"] for row in rows} == {str(run.id)}
-    # Within a run, platform breaks the created_at tie (inserted gemini first).
+    # Within a run the rollups are ordered by platform (inserted gemini first).
     assert [row["platform"] for row in rows] == ["claude", "gemini"]
 
 
