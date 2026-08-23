@@ -13,14 +13,14 @@ scored, see [Evaluation metrics](evaluation-metrics.md); for the credential stor
 |------------------------------|---------|
 | `GET /health`                | Liveness probe. |
 | `POST /api/v1/evaluations`          | Ingest conversation `.xlsx` files for scoring (per-file platform, defaulting to the payload platform). Persists at `ingerido`; does **not** start scoring. |
-| `POST /api/v1/captures`             | Ingest conversations captured from a chat UI as JSON for scoring (the browser extension's entry point). Persists at `ingerido`; does **not** start scoring. |
+| `POST /api/v1/captures`             | Ingest conversations captured from a chat UI as JSON for scoring (the browser extension's entry point). Persists at `ingerido` — joining the run its `run_label` names, and the still-`pending` scenario already ingested under that id, if any; does **not** start scoring. |
 | `PATCH /api/v1/evaluations/{run_id}/turns/selection` | Deselect (or re-select) which of an ingested run's turns are scored — scoring is **opt-out per turn**, so this is only needed to narrow a run. Must be called before `/api/v1/evaluations/{run_id}/start`. |
 | `POST /api/v1/evaluations/{run_id}/start` | Start scoring an ingested run: flip it from `ingerido` to `en_cola` and **enqueue** the per-turn chain. |
 | `GET /api/v1/evaluations/{run_id}`  | Poll a run's status and summary. |
 | `GET /api/v1/runs`                  | Retrieve full scored run details, filtered and at a chosen granularity. |
 | `GET /api/v1/runs/{run_id}/scenarios` | Retrieve one run's scenario results as a flat list of rollups (optional `platform`/`status` filters). |
-| `GET /api/v1/platform-executions`   | Retrieve platform executions as a flat list of rollups, filtered by platform and scoring window. |
-| `GET /api/v1/scenarios/{scenario_id}/turns` | Retrieve one scenario's turns — conversation content plus per-metric scores. |
+| `GET /api/v1/platform-executions`   | Retrieve the per-run, per-platform rollups as a flat list, filtered by platform and scoring window. |
+| `GET /api/v1/scenarios/{scenario_id}/turns` | Retrieve one scenario's turns across every platform — conversation content plus per-metric scores. |
 | `GET /api/v1/metrics`               | List the registered metrics a use case can be composed from. |
 | `POST /api/v1/use-cases`            | Create a use case: a name plus the set of metrics it is scored with. |
 | `GET /api/v1/use-cases`             | List every use case with its metric names. |
@@ -121,19 +121,25 @@ Per-file override object:
 ### Semantics: one platform per file (defaulting to the payload platform)
 
 Each file is scored under its own platform — its per-file `platform` override when
-set, otherwise the payload-level `platform`. The endpoint builds **one
-`BenchmarkRun`** with **one `PlatformExecution` per distinct platform**, and attaches
-each file's `ScenarioResult` (with its `Turn` rows) to that platform's execution. So
-a single request can compare platforms: files sharing a platform group under the same
-execution.
+set, otherwise the payload-level `platform`. The endpoint builds **one `BenchmarkRun`**
+holding one `ScenarioResult` per distinct `scenario_id`, and one `PlatformExecution`
+(with its `Turn` rows) per file underneath it.
+
+So **files sharing a `scenario_id` are grouped into one scenario** — that is how a single
+request compares platforms on the same task:
 
 ```
 BenchmarkRun
-├─ PlatformExecution(platform="claude")   # esc1 has no override → payload default
-│  └─ ScenarioResult(esc1.xlsx) → Turn…
-└─ PlatformExecution(platform="gemini")   # esc2 overrides platform
-   └─ ScenarioResult(esc2.xlsx) → Turn…
+└─ ScenarioResult(scenario_id="esc1")          # both files name this scenario
+   ├─ PlatformExecution(platform="claude")     # esc1-claude.xlsx, no override
+   │  └─ Turn…
+   └─ PlatformExecution(platform="gemini")     # esc1-gemini.xlsx, overridden
+      └─ Turn…
 ```
+
+Files with different `scenario_id`s stay in separate scenarios, exactly as before. Two
+files sharing a `scenario_id` but naming **different `use_case`s** is a `422`: they would
+land in one scenario, and only one metric set can score it.
 
 Each uploaded file is also recorded as a `SourceFile` (filename + SHA-256) for
 provenance; the run links `source_file` only when exactly one file is uploaded
@@ -154,8 +160,9 @@ On the request (`ingest_evaluation`):
    `model` content the `response` (a missing side becomes `""`). The raw
    `retrieved_context` cell is stored verbatim on `Turn.retrieved_context_source` — it is
    **not** interpreted here; the retrieval pipeline handles it in the worker.
-3. Build and commit the `BenchmarkRun → PlatformExecution → ScenarioResult → Turn`
-   tree — one `PlatformExecution` per distinct platform — with status `ingerido`. Every
+3. Build and commit the `BenchmarkRun → ScenarioResult → PlatformExecution → Turn`
+   tree — scenarios grouped by `scenario_id`, one execution per file — with status
+   `ingerido`. Every
    `Turn` lands with `is_selected = true`. Nothing is enqueued; the run waits for a client to
    call `POST /api/v1/evaluations/{run_id}/start`, optionally dropping turns first with
    `PATCH /api/v1/evaluations/{run_id}/turns/selection`.
@@ -177,11 +184,12 @@ job per turn, off the request path:
    rebuilt from the stored scenario, so unselected turns still feed it even though they are
    never scored (their `turn_score` stays `null`). Then enqueue the next turn, after the
    pacing delay.
-6. **Roll-ups**, at the boundaries the chain crosses: the last selected turn of a scenario
-   writes its `average_score` / `status`, the last of a platform writes its `average_score`
-   and `finished_at`, and the last of the run rolls the status up to `completado` /
-   `parcial` / `fallido`. Scenarios with no selected turns are finalized in that last step,
-   since the chain never visits them.
+6. **Roll-ups**, at the boundaries the chain crosses: the last selected turn of a platform
+   execution writes its `average_score` / `status` / `finished_at`, the last execution of a
+   scenario writes the scenario's `status` (it has no average — its platforms are compared,
+   not blended), and the last of the run rolls the status up to `completado` / `parcial` /
+   `fallido`. Executions with no selected turns are finalized in that last step, since the
+   chain never visits them.
 
 > **Prerequisites.** The database schema must already exist (`alembic upgrade head`)
 > and the configured judge must have a valid API key (see `scorekeeper.config.settings`). The
@@ -221,12 +229,38 @@ Both endpoints converge immediately: the messages are normalized by
 the `.xlsx` parser uses) and persisted by the same `ingest_evaluation`, so a captured
 conversation is indistinguishable downstream from an uploaded one.
 
+One thing differs: a `scenario_id` **already ingested** — that is, one still at
+`pending` whose run is still at `ingerido`, not yet started — is *extended* instead of
+recreated. Capturing the same scenario on Copilot, then Gemini, then Claude therefore
+leaves **one run with one scenario holding three `PlatformExecution` rows**, and each
+call answers with that same `run_id`. Repeating a platform simply adds a second
+execution; nothing is replaced.
+
+Both statuses must hold, and either one failing sends the capture to a new run rather
+than an error: once the run has been started, or once the scenario itself has rolled up
+past `pending`, no execution is added to it — appending an unscored one would leave a
+roll-up describing a set of executions that no longer exists. `POST
+/api/v1/evaluations` does **not** do any of this — every upload is its own run.
+
+`run_label` groups one tier higher, at the run itself. Captures naming the same label
+land under **one run**, whatever their scenario ids — so a client capturing `S-01`,
+`S-02` and `S-03` under `"lote-agosto"` gets one run holding three scenarios, and all
+three calls answer with that same `run_id`. The run is resolved as the newest run
+carrying the label and still at `ingerido`; when there is none, a new run is opened
+carrying it (a label whose run has already been started is therefore free again). The
+scenario reuse above is then **scoped to that run**: a `scenario_id` matching a still-
+`pending` scenario *of that run* is extended, and one belonging to any other run is not
+— pulling in an unrelated run's scenario is exactly what the label exists to prevent.
+Without a label nothing changes: the scenario lookup spans every unstarted run, as
+before.
+
 - **Content type:** `application/json`
 
 | Field           | Type       | Required | Default     | Description |
 |-----------------|------------|----------|-------------|-------------|
 | `platform`      | `string`   | yes      | —           | The **default** platform for the request. Applies to every conversation that does not override it. |
 | `use_case`      | `string`   | no       | `"default"` | Default use case — the metric set the conversations are scored with. Must already exist ([`POST /use-cases`](#post-apiv1use-cases)); an unknown name is a `422`. |
+| `run_label`     | `string`   | no       | `null`      | The batch these conversations belong to. Every capture naming it joins the run it already opened, whatever the `scenario_id`. Payload-level, not per-conversation — the run *is* the batch. Omitted, `null` or blank all mean "no grouping requested". |
 | `conversations` | `array`    | yes      | —           | One or more captured conversations; **each is one scenario**. Must be non-empty. |
 
 Conversation object:
@@ -267,7 +301,7 @@ Identical to `POST /api/v1/evaluations` — the run is persisted at `ingerido`. 
 | Status | When |
 |--------|------|
 | `422`  | The body fails schema validation (empty `platform`, empty `conversations`, a conversation with no `messages`), **or** a `use_case` names a use case that does not exist. |
-| `400`  | A conversation's messages are all blank, or ingest rejected the run. Nothing is persisted. |
+| `400`  | A conversation's messages are all blank, the `use_case` contradicts the one the reused scenario was ingested under, or ingest rejected the run. Nothing is persisted. |
 
 ## `PATCH /api/v1/evaluations/{run_id}/turns/selection`
 
@@ -365,8 +399,8 @@ completado|parcial|fallido`). A freshly ingested run stays at `ingerido` until
   any terminal status it is pinned to `1.0` (a turn whose every metric failed keeps
   `turn_score = null`, so a finished run must not read below 100%).
 - `platforms` — one entry per distinct platform in the run. `average_score` is the
-  mean of that platform's scenario averages (`null` until scoring finishes) and
-  `status_breakdown` counts its scenarios by status. A single-platform run has one
+  mean of that platform's conversation averages (`null` until scoring finishes) and
+  `status_breakdown` counts its conversations by status. A single-platform run has one
   entry.
 
 ### Errors
@@ -396,9 +430,10 @@ All are optional and combined with AND.
 The date range filters the **scoring window** (`PlatformExecution.started_at` /
 `finished_at`), which is `null` until a worker scores the run — so a bound excludes
 still-queued/in-progress runs. Results are ordered by run creation date. Granularity
-controls depth (each level adds to the one above): `platform_executions` → per-platform
-rollups; `scenario_results` → adds each scenario (its `id`, `scenario_id`, `use_case`,
-`model_name`, `status`, `average_score`); `metric_scores` → adds each turn and its per-metric scores
+controls depth (each level adds to the one above): `platform_executions` → the
+per-platform `platforms[]` rollups alone; `scenario_results` → adds the run's
+`scenario_results[]`, each nesting its `platform_executions[]`; `metric_scores` → adds
+each execution's turns and their per-metric scores
 (`metric_name`, `score`, `judge_model`, `rubric_version`). Each score's structured `trace`
 is persisted on the `metric_traces` table but is not surfaced by this endpoint.
 
@@ -422,13 +457,48 @@ human-readable, **non-unique** `scenario_id` label (e.g. the file stem).
         "started_at": "2026-07-10T12:00:00+00:00",
         "finished_at": "2026-07-10T12:05:00+00:00",
         "scenarios": 2,
-        "status_breakdown": {"completado": 2},
-        "scenario_results": [ … ]
+        "status_breakdown": {"completado": 2}
+      }
+    ],
+    "scenario_results": [
+      {
+        "id": "3f0a…",
+        "scenario_id": "reseña-hotel",
+        "use_case": "rag_completo",
+        "status": "completado",
+        "platform_executions": [
+          {
+            "id": "7b2c…",
+            "platform": "claude",
+            "model_name": "Claude Opus 4.5",
+            "status": "completado",
+            "average_score": 0.86,
+            "started_at": "2026-07-10T12:00:00+00:00",
+            "finished_at": "2026-07-10T12:02:00+00:00"
+          },
+          {
+            "id": "9e4d…",
+            "platform": "gemini",
+            "model_name": "2.5 Pro",
+            "status": "completado",
+            "average_score": 0.76,
+            "started_at": "2026-07-10T12:02:00+00:00",
+            "finished_at": "2026-07-10T12:05:00+00:00"
+          }
+        ]
       }
     ]
   }
 ]
 ```
+
+A **scenario** is the task; each of its `platform_executions` is one platform's answer to
+it, with its own turns and rollup. The scenario itself carries **no `average_score`**: a
+mean across the platforms being compared would blend them into one number. Read the
+executions side by side instead — that comparison is the point.
+
+`platforms[]` is a different cut of the same data: one entry per distinct platform
+*across the whole run*, grouped at read time rather than stored, ordered by platform name.
 
 ### Errors
 
@@ -438,11 +508,10 @@ human-readable, **non-unique** `scenario_id` label (e.g. the file stem).
 
 ## `GET /api/v1/runs/{run_id}/scenarios`
 
-Retrieve one run's scenario results as a **flat** list of rollups. Same data as the
-`scenario_results` granularity of [`GET /api/v1/runs`](#get-apiv1runs), but scoped by path
-and already flattened: no `platforms[]` nesting to walk, each entry instead names the
-`platform` it ran under. A run holding several platform executions yields every one of its
-scenarios in a single list.
+Retrieve one run's scenario results as a flat list. The same entries the
+`scenario_results` granularity of [`GET /api/v1/runs`](#get-apiv1runs) returns, but scoped
+by path and filterable by platform/status. Each entry nests its `platform_executions` —
+one per platform the scenario was run on.
 
 Depth stops at the scenario rollup — no turns, no metric scores. Read a scenario's turns
 with [`GET /api/v1/scenarios/{scenario_id}/turns`](#get-apiv1scenariosscenario_idturns),
@@ -457,24 +526,32 @@ Both are optional, exact matches, combined with AND.
 
 | Param      | Type     | Default | Description |
 |------------|----------|---------|-------------|
-| `platform` | `string` | —       | Exact, **case-sensitive** platform match (e.g. `claude`, `copilot`, `gemini`). |
-| `status`   | `string` | —       | Exact match on the scenario's `status` (e.g. `completado`, `pending`). |
+| `platform` | `string` | —       | Selects scenarios that ran on it (exact, **case-sensitive**). The scenario is still returned **whole**, with every platform — one cut down to a single platform is no longer a comparison. |
+| `status`   | `string` | —       | Exact match on the scenario's rolled-up `status` (e.g. `completado`, `pending`). |
 
 ### Response `200`
 
-Ordered by platform, then by the `scenario_id` label. A known run whose scenarios no
-filter matches yields `[]`.
+Ordered by the `scenario_id` label; each scenario's executions are ordered by `platform`.
+A known run whose scenarios no filter matches yields `[]`.
 
 ```json
 [
   {
     "id": "3f0a…",
     "scenario_id": "reseña-hotel",
-    "platform": "claude",
     "use_case": "rag_completo",
-    "model_name": null,
     "status": "completado",
-    "average_score": 0.81
+    "platform_executions": [
+      {
+        "id": "7b2c…",
+        "platform": "claude",
+        "model_name": "Claude Opus 4.5",
+        "status": "completado",
+        "average_score": 0.86,
+        "started_at": "2026-07-10T12:00:00+00:00",
+        "finished_at": "2026-07-10T12:02:00+00:00"
+      }
+    ]
   }
 ]
 ```
@@ -482,7 +559,8 @@ filter matches yields `[]`.
 Each scenario carries both an `id` (its `ScenarioResult` UUID) and the human-readable,
 **non-unique** `scenario_id` label (e.g. the file stem). `model_name` is the model that
 answered, when the capturing client reported one — always `null` for an `.xlsx` import.
-`average_score` is `null` until the scenario has been scored.
+Each execution's `average_score` is `null` until it has been scored. The scenario has no
+`average_score` of its own.
 
 ### Errors
 
@@ -492,12 +570,15 @@ answered, when the capturing client reported one — always `null` for an `.xlsx
 
 ## `GET /api/v1/platform-executions`
 
-Retrieve platform executions as a **flat** list of rollups, filtered by platform and
-scoring window. Same data as the `platform_executions` granularity of
-[`GET /api/v1/runs`](#get-apiv1runs), but one entry per platform execution instead of per
-run: there is no `platforms[]` nesting to walk, and each entry names the `run_id` it
-belongs to. A run holding several platform executions (files can override the platform)
-yields one entry per execution, all sharing that `run_id`.
+Retrieve the per-run, per-platform rollups as a **flat** list, filtered by platform and
+scoring window. The same entries the `platforms[]` block of
+[`GET /api/v1/runs`](#get-apiv1runs) carries, but lifted out of their run: each names the
+`run_id` it belongs to. A run whose scenarios span several platforms (files can override
+the platform) yields one entry per platform, all sharing that `run_id`.
+
+A `PlatformExecution` row belongs to a single scenario, so an entry here is **grouped**
+from the run's scenarios rather than read from a table — which is why it is keyed by
+`run_id` + `platform` and carries no id of its own.
 
 Depth stops at the platform rollup — no scenario results, no turns. Read a run's scenarios
 via [`GET /api/v1/runs/{run_id}/scenarios`](#get-apiv1runsrun_idscenarios).
@@ -520,15 +601,15 @@ asymmetric — a lower bound alone still returns an execution that started but h
 finished, while any upper bound excludes it.
 
 Results are ordered by the run's creation date, then by `platform` (which breaks the tie
-between the several executions of one run). `id` is the `PlatformExecution` UUID;
-`average_score` is the mean of this platform's scenario averages, `null` until scored.
+between the several platforms of one run). `average_score` is the mean of this platform's
+conversation averages, `null` until scored. `started_at` is the earliest start among the
+platform's scenarios; `finished_at` stays `null` until every one of them has finished.
 
 ### Response `200`
 
 ```json
 [
   {
-    "id": "9c4e…",
     "run_id": "b1f2…",
     "platform": "claude",
     "started_at": "2026-07-10T12:00:00+00:00",
@@ -548,14 +629,19 @@ between the several executions of one run). `id` is the `PlatformExecution` UUID
 
 ## `GET /api/v1/scenarios/{scenario_id}/turns`
 
-Retrieve a single scenario's turns, in `turn_number` order — the conversation
-**content** (`prompt` / `response` / `expected_output` / `retrieved_context_source`)
-alongside each turn's rolled-up `turn_score` and per-metric scores. `GET /api/v1/runs`
-(even at `metric_scores` granularity) omits the turn content; this endpoint surfaces it,
-so a caller can read what was actually scored without re-uploading the source.
+Retrieve a single scenario's turns, ordered by `platform` then `turn_number` — the
+conversation **content** (`prompt` / `response` / `expected_output` /
+`retrieved_context_source`) alongside each turn's rolled-up `turn_score` and per-metric
+scores. `GET /api/v1/runs` (even at `metric_scores` granularity) omits the turn content;
+this endpoint surfaces it, so a caller can read what was actually scored without
+re-uploading the source.
 
-The `{scenario_id}` is a **`ScenarioResult` UUID** — the unique handle for one
-conversation scored under one platform in one run — discoverable as the `id` on each
+A scenario holds one conversation per platform, so **the list spans them all** and every
+entry names its `platform`. Group by it to compare the platforms turn for turn in a
+single request.
+
+The `{scenario_id}` is a **`ScenarioResult` UUID** — the unique handle for one scenario of
+one run — discoverable as the `id` on each
 scenario in `GET /api/v1/runs?granularity=scenario_results` or, flat,
 [`GET /api/v1/runs/{run_id}/scenarios`](#get-apiv1runsrun_idscenarios). The human-readable, non-unique
 `ScenarioResult.scenario_id` label is **not** accepted here (it can match many
@@ -567,6 +653,7 @@ Returns one entry per turn (a scenario with no turns yields `[]`):
 [
   {
     "turn_id": "7c9e…",
+    "platform": "claude",
     "turn_number": 1,
     "prompt": "¿Cuántos habitantes tiene Madrid?",
     "response": "Madrid tiene unos 3,3 millones de habitantes.",
@@ -583,7 +670,7 @@ Returns one entry per turn (a scenario with no turns yields `[]`):
 
 A `null` `score` means the metric did not apply to that turn — it had nothing to
 measure (no retrieved context, no claims), so it is also left out of the turn,
-scenario and platform averages.
+conversation and scenario averages.
 
 Like the other read paths, the per-metric structured `trace` is not surfaced here —
 read it via [`GET /api/v1/turns/{turn_id}/traces`](#get-apiv1turnsturn_idtraces) using each entry's
@@ -1029,6 +1116,7 @@ curl -X POST http://localhost:8001/api/v1/captures \
   -d '{
         "platform": "claude",
         "use_case": "default",
+        "run_label": "lote-agosto",
         "conversations": [{
           "scenario_id": "reseña-hotel-2026-07-22-11-30",
           "model_name": "Claude Opus 4.5",
@@ -1039,7 +1127,8 @@ curl -X POST http://localhost:8001/api/v1/captures \
           ]
         }]
       }'
-# {"run_id":"b1f2…","status":"ingerido"} — then POST /api/v1/evaluations/{run_id}/start to score
+# {"run_id":"b1f2…","status":"ingerido"} — the next capture sending "lote-agosto" joins this
+# same run; then POST /api/v1/evaluations/{run_id}/start to score
 ```
 
 Retrieve full details for all `claude` runs scored in July, down to metric scores:
@@ -1075,7 +1164,9 @@ curl 'http://localhost:8001/api/v1/turns/7c9e…/token-usage'
 ```
 
 Multiple files with per-file overrides — `esc1` keeps the payload `claude` default;
-`esc2` is scored under `gemini` (producing two platform executions in the one run):
+`esc2` is scored under `gemini`. They carry different `scenario_id`s, so they stay two
+scenarios; give them the **same** `scenario_id` instead to compare the platforms on one
+task:
 
 ```bash
 curl -X POST http://localhost:8001/api/v1/evaluations \
@@ -1174,6 +1265,27 @@ celery -A scorekeeper.celery_app:celery_app worker --loglevel=info --concurrency
 Under Docker Compose this is the `worker` service; it shares the app image and the
 `DATABASE_URL` (which also backs the broker). Set `CELERY_BROKER_URL` to point at a
 dedicated broker (e.g. Redis) instead of Postgres.
+
+### Scaling the worker on the Postgres broker
+
+kombu's SQLAlchemy transport creates its tables on the *first queue operation*, guarded
+only by an in-process lock. Several replicas booting against a database that has never
+seen the broker therefore race, and all but one die on:
+
+```
+duplicate key value violates unique constraint "pg_class_relname_nsp_index"
+DETAIL:  Key (relname, relnamespace)=(queue_id_sequence, 2200) already exists.
+```
+
+The `migrate` service closes that window by declaring the queue once
+(`scorekeeper-init-broker`, see `scorekeeper/broker.py`) before any worker starts;
+workers already wait on it via `service_completed_successfully`. Keep that ordering if
+you change the compose file, or drop back to one replica.
+
+This is a patch over a broker that was not built to be shared. Pointing
+`CELERY_BROKER_URL` at Redis removes the failure mode entirely — along with the polling
+the SQL transport does — and is the right move before running more than a couple of
+workers.
 
 ## Related code
 

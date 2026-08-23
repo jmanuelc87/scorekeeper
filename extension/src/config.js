@@ -88,6 +88,29 @@ export async function upsertRun(run) {
   return runs;
 }
 
+/**
+ * One display label per capture, numbered when the run holds more than one
+ * execution from the same platform.
+ *
+ * The API appends a `PlatformExecution` per capture and never dedupes, so capturing
+ * the same chat twice really does leave the scenario with two `copilot` executions —
+ * a bare platform name would then name both and read as a rendering bug.
+ */
+export function captureLabels(captures) {
+  const totals = new Map();
+  for (const item of captures) {
+    totals.set(item.platform, (totals.get(item.platform) ?? 0) + 1);
+  }
+
+  const seen = new Map();
+  return captures.map((item) => {
+    if ((totals.get(item.platform) ?? 0) < 2) return item.platform;
+    const nth = (seen.get(item.platform) ?? 0) + 1;
+    seen.set(item.platform, nth);
+    return `${item.platform} #${nth}`;
+  });
+}
+
 /** Drop a trailing slash so `${apiUrl}/api/v1/captures` never doubles up. */
 export function trimSlash(url) {
   return String(url).trim().replace(/\/+$/, "");
@@ -150,14 +173,50 @@ export function slugify(text, maxLength = 48) {
     .replace(/-+$/, "");
 }
 
-/** A sortable `YYYY-MM-DD-HH-MM` stamp in local time, for default scenario ids. */
-export function timestamp(date = new Date()) {
-  const pad = (value) => String(value).padStart(2, "0");
+/**
+ * The captures a run entry holds, newest last — one per platform execution.
+ *
+ * A run is reused whenever a capture names a scenario id the API already knows, so
+ * one entry can describe several captures. Entries written before that (one capture
+ * per run, its fields at the top level) are read back as a single-capture list, so
+ * the surfaces never branch on which shape they got.
+ */
+export function runCaptures(run) {
+  if (Array.isArray(run?.captures)) return run.captures;
+  if (!run?.platform && !run?.sourceUrl) return [];
   return [
-    date.getFullYear(),
-    pad(date.getMonth() + 1),
-    pad(date.getDate()),
-    pad(date.getHours()),
-    pad(date.getMinutes()),
-  ].join("-");
+    {
+      platform: run.platform,
+      model: run.model,
+      turns: run.turns,
+      sourceUrl: run.sourceUrl,
+    },
+  ];
+}
+
+/**
+ * Every scenario id the run has captured, in capture order, deduped.
+ *
+ * A run groups several scenarios when the captures shared a `run_label`, so the id
+ * lives on each capture. Entries written before that carry a single id at the top
+ * level; they are read back through it, so the surfaces never branch on the shape.
+ */
+export function runScenarioIds(run) {
+  const ids = runCaptures(run)
+    .map((item) => item.scenarioId ?? run?.scenarioId)
+    .filter(Boolean);
+  return [...new Set(ids.length ? ids : [run?.scenarioId].filter(Boolean))];
+}
+
+/**
+ * The most recently updated run, or `null`.
+ *
+ * Not `runs[0]`: `pollRuns` upserts sequentially and `upsertRun` prepends, so a poll
+ * cycle leaves the list in reverse order of polling, not of activity.
+ */
+export function newestRun(runs) {
+  return (runs ?? []).reduce(
+    (newest, run) => (!newest || (run.updatedAt ?? "") > (newest.updatedAt ?? "") ? run : newest),
+    null,
+  );
 }

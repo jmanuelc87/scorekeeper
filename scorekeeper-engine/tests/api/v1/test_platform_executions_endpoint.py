@@ -11,7 +11,6 @@ from scorekeeper.core.services import read_models
 # The endpoint declares a response_model, so a stub must carry every field —
 # an incomplete dict is a 500 ResponseValidationError, not a 200.
 _EXECUTION = {
-    "id": "3f1b6c2e-0000-4000-8000-000000000001",
     "run_id": "3f1b6c2e-0000-4000-8000-000000000002",
     "platform": "claude",
     "started_at": "2026-07-10T12:00:00+00:00",

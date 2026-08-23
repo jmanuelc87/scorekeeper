@@ -12,12 +12,14 @@ router = APIRouter(prefix="/scenarios", tags=["scenarios"])
 
 @router.get("/{scenario_id}/turns", response_model=list[ScenarioTurn])
 async def get_scenario_turns(scenario_id: str) -> list[dict]:
-    """Return a scenario's turns, in ``turn_number`` order.
+    """Return a scenario's turns, ordered by ``platform`` then ``turn_number``.
 
     ``scenario_id`` is a ``ScenarioResult`` id (its UUID) — the unique handle for one
-    conversation scored under one platform in one run; it is surfaced as ``id`` on each
-    scenario in ``GET /runs``. The non-unique human-readable ``scenario_id`` label is
-    not accepted here.
+    scenario of one run; it is surfaced as ``id`` on each scenario in ``GET /runs``. The
+    non-unique human-readable ``scenario_id`` label is not accepted here.
+
+    A scenario holds one conversation per platform, so the list spans them all and each
+    turn names its ``platform`` — group by it to compare the platforms turn for turn.
 
     Each turn carries its content (``prompt``/``response``/``expected_output``/
     ``retrieved_context_source``), rolled-up ``turn_score`` and per-metric scores.

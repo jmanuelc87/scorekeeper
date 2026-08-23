@@ -28,7 +28,9 @@ async def list_runs(
     """Retrieve full scored details for the runs matching the filters.
 
     All filters are optional and AND-combined; ``granularity`` controls depth
-    (``platform_executions`` → ``scenario_results`` → ``metric_scores``).
+    (``platform_executions`` → ``scenario_results`` → ``metric_scores``): the run's
+    per-platform rollups, then its scenarios with their platform executions, then each
+    execution's turns.
     Returns a list ordered by creation date;
     an unknown ``run_id`` yields ``[]``. ``400`` for an unknown ``granularity`` or an
     unparseable date.
@@ -58,11 +60,14 @@ async def get_run_scenarios(
 ) -> list[dict]:
     """Retrieve a run's scenario results as a flat list.
 
-    One entry per scenario, flattened across the run's platform executions and tagged
-    with the ``platform`` that produced it. Each entry stops at the scenario rollup —
-    read a scenario's turns via ``GET /scenarios/{scenario_id}/turns`` using its ``id``.
+    One entry per scenario, each nesting its ``platform_executions`` — one per platform
+    the scenario ran on, with that conversation's own status and average. Depth stops
+    there: read a scenario's turns via ``GET /scenarios/{scenario_id}/turns`` using its
+    ``id``.
 
-    Both filters are optional, exact and AND-combined. ``404`` when the ``run_id`` is
+    Both filters are optional, exact and AND-combined. ``platform`` selects scenarios
+    that ran on it and still returns each one whole, with every platform — a scenario
+    cut down to one platform is no longer a comparison. ``404`` when the ``run_id`` is
     unknown or malformed; a known run no scenario matches yields ``[]``.
     """
     scenarios = await read_models.retrieve_run_scenarios(

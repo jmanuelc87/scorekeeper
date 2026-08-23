@@ -42,6 +42,12 @@ class Settings(BaseSettings):
     anthropic_judge_model: str = "claude-opus-4-8"
     openai_judge_model: str = "gpt-5.6-sol"
     judge_max_tokens: int = 16384
+    # Per-request timeout (seconds) for every judge LLM call, passed to the provider
+    # client. Raised above the SDKs' 600s default because a scoring call with
+    # judge_max_tokens output and adaptive thinking can legitimately run long; a
+    # timeout here surfaces as a transport error that judge_call names, not a retry
+    # (see scorekeeper.core.metrics.judges).
+    judge_timeout_seconds: float = 1800.0
     # Local LM Studio judge (judge_provider="lmstudio"): an OpenAI-compatible server
     # for end-to-end testing with no API key or external cost. It remaps every
     # requested/pinned model to lmstudio_judge_model (the one loaded model), so all

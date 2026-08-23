@@ -87,6 +87,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
                 model=settings.openai_judge_model,
                 api_key=settings.openai_api_key,
                 embedding_model=settings.openai_embedding_model,
+                timeout=settings.judge_timeout_seconds,
             )
         return _traced(
             AnthropicJudge(
@@ -96,6 +97,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
                 system_prompt=settings.judge_system_prompt,
                 embedder=embedder,
                 step_models=_step_models(settings, settings.anthropic_judge_model),
+                timeout=settings.judge_timeout_seconds,
             ),
             settings,
         )
@@ -110,6 +112,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
                 system_prompt=settings.judge_system_prompt,
                 embedding_model=settings.openai_embedding_model,
                 step_models=_step_models(settings, settings.openai_judge_model),
+                timeout=settings.judge_timeout_seconds,
             ),
             settings,
         )
@@ -125,6 +128,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
                 api_key=settings.lmstudio_api_key,
                 system_prompt=settings.judge_system_prompt,
                 embedding_model=settings.lmstudio_embedding_model,
+                timeout=settings.judge_timeout_seconds,
             ),
             settings,
         )

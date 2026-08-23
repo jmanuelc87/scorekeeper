@@ -24,15 +24,27 @@ async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
     one scenario and follows the same platform rules as an uploaded file: its own
     ``platform`` when set, otherwise the payload-level one.
 
+    Unlike ``POST /evaluations``, a scenario id already ingested — and not yet started —
+    is *extended* rather than recreated (``reuse_scenarios``): capturing the same scenario
+    on Copilot, then Gemini, then Claude leaves one run with one scenario holding the
+    three executions, and each call answers with that same ``run_id``.
+
+    ``run_label`` groups one tier higher: every capture naming the same label joins the
+    run that label already opened — including captures of *different* scenarios, which
+    then become sibling scenarios of one run — and the scenario reuse above only looks
+    inside that run. A label whose run has already been started opens a new run carrying
+    it. Without a label the behaviour is unchanged.
+
     Returns ``202`` with a ``run_id`` at status ``ingerido``. Like ``POST
     /evaluations``, ingestion is decoupled from scoring: call ``POST
     /evaluations/{run_id}/start`` to enqueue the pipeline, then poll
     ``GET /evaluations/{run_id}`` for progress and results.
     """
     logger.info(
-        "POST /captures: %d conversación(es), plataforma=%s",
+        "POST /captures: %d conversación(es), plataforma=%s, lote=%s",
         len(payload.conversations),
         payload.platform,
+        payload.run_label,
     )
 
     uploads: list[ingestion.UploadedFile] = []
@@ -65,7 +77,14 @@ async def create_capture(payload: CapturePayload) -> EvaluationEnqueuedResponse:
         )
 
     try:
-        run_id = await ingestion.ingest_evaluation(payload.platform, uploads)
+        run_id = await ingestion.ingest_evaluation(
+            payload.platform,
+            uploads,
+            reuse_scenarios=True,
+            # A cleared field arrives as "", which means "no batch" exactly like an
+            # omitted key — one value for both.
+            run_label=(payload.run_label or "").strip() or None,
+        )
     except ingestion.UnknownUseCaseError as exc:
         # A ValueError subclass, so this arm must precede the one below.
         logger.warning("POST /captures rechazado: %s", exc)

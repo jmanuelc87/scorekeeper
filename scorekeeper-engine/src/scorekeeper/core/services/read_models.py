@@ -12,15 +12,14 @@ from scorekeeper.core.services.serializers import (
     GRANULARITY_METRIC,
     GRANULARITY_SCENARIO,
     _GRANULARITIES,
+    platform_rollups,
     serialize_metric_trace,
-    serialize_platform_execution,
     serialize_run,
-    serialize_run_scenario,
+    serialize_scenario,
     serialize_scenario_turn,
     serialize_turn_token_usage,
 )
 from scorekeeper.db.connection import session_scope
-from scorekeeper.db.repositories import platform_executions as platform_execution_repo
 from scorekeeper.db.repositories import runs as run_repo
 from scorekeeper.db.repositories import scenarios as scenario_repo
 from scorekeeper.db.repositories import turns as turn_repo
@@ -76,12 +75,17 @@ async def retrieve_scenario_turns(
     *,
     session: AsyncSession | None = None,
 ) -> list[dict[str, Any]] | None:
-    """Return one scenario's turns in ``turn_number`` order, or ``None`` if unknown.
+    """Return one scenario's turns, or ``None`` if the scenario is unknown.
 
     ``scenario_id`` is a ``ScenarioResult`` id (its UUID) — the unique handle for one
-    conversation scored under one platform in one run; the human-readable
-    ``ScenarioResult.scenario_id`` label is *not* unique and is not accepted here.
-    Discover the UUID from ``GET /runs`` (each scenario carries its ``id``).
+    scenario of one run; the human-readable ``ScenarioResult.scenario_id`` label is *not*
+    unique and is not accepted here. Discover the UUID from ``GET /runs`` (each scenario
+    carries its ``id``).
+
+    A scenario holds one conversation per platform, so the list spans them all: ordered
+    by ``platform``, then ``turn_number``, with each entry naming its ``platform``. That
+    keeps one request per scenario while still letting a client group by platform to
+    compare answers turn for turn.
 
     Each entry carries the turn's content (``prompt``/``response``/``expected_output``/
     ``retrieved_context_source``), its rolled-up ``turn_score``, and per-metric scores
@@ -93,7 +97,11 @@ async def retrieve_scenario_turns(
         scenario = await scenario_repo.get_scenario_with_turns(db, scenario_id)
         if scenario is None:
             return None
-        return [serialize_scenario_turn(turn) for turn in scenario.turns]
+        return [
+            serialize_scenario_turn(turn)
+            for platform_exec in scenario.platform_executions
+            for turn in platform_exec.turns
+        ]
 
 
 async def retrieve_run_scenarios(
@@ -106,14 +114,16 @@ async def retrieve_run_scenarios(
     """Return one run's scenario results as a flat list, or ``None`` if unknown.
 
     ``run_id`` is a ``BenchmarkRun`` id (its UUID). Each entry is a scenario rollup —
-    ``id``, ``scenario_id``, ``platform``, ``use_case``, ``model_name``, ``status`` and
-    ``average_score`` — flattened across the run's platform executions, so a run holding
-    several platforms yields every scenario in one list. Turns are not included; read
-    them via :func:`retrieve_scenario_turns` using each entry's ``id``.
+    ``id``, ``scenario_id``, ``use_case``, ``status`` — plus its ``platform_executions``,
+    one per platform the scenario ran on, each carrying that conversation's own
+    ``average_score``. The scenario itself has no average: the scores worth reading are
+    the per-platform ones. Turns are not included; read them via
+    :func:`retrieve_scenario_turns` using each entry's ``id``.
 
-    Both filters are optional, exact and combined with AND: ``platform`` matches
-    ``PlatformExecution.platform`` (case-sensitive), ``status`` matches
-    ``ScenarioResult.status``.
+    Both filters are optional, exact and combined with AND. ``platform`` selects
+    scenarios that ran on it (case-sensitive) and still returns each one *whole*, with
+    every platform — a scenario cut down to one platform is no longer a comparison.
+    ``status`` matches the scenario's own rolled-up ``status``.
 
     A malformed or unknown ``run_id`` yields ``None`` (the HTTP layer maps that to
     ``404``); a known run whose scenarios no filter matches yields ``[]``. The run is
@@ -126,7 +136,7 @@ async def retrieve_run_scenarios(
         scenarios = await scenario_repo.list_scenarios_for_run(
             db, run.id, platform=platform, status=status
         )
-        return [serialize_run_scenario(scenario) for scenario in scenarios]
+        return [serialize_scenario(scenario) for scenario in scenarios]
 
 
 async def retrieve_runs(
@@ -190,12 +200,13 @@ async def retrieve_platform_executions(
     end_date: str | None = None,
     session: AsyncSession | None = None,
 ) -> list[dict[str, Any]]:
-    """Return the platform executions matching the given filters, as a flat list.
+    """Return the per-run, per-platform rollups matching the given filters, flat.
 
-    One entry per :class:`PlatformExecution` rather than per run, so a run holding
-    several platforms (files can carry a per-file platform override) yields several
-    entries sharing a ``run_id``. Each entry is the platform's rollup — no nested
-    scenario results; read those through :func:`retrieve_runs`.
+    One entry per (run, platform) pair, so a run whose files carried a per-file platform
+    override yields several entries sharing a ``run_id``. A platform execution row is
+    per-scenario now, so the rollup is grouped rather than read from a table — see
+    :func:`~scorekeeper.core.services.serializers.platform_rollups`. The entry carries no
+    nested scenario results; read those through :func:`retrieve_runs`.
 
     Both filters are optional and combined with AND:
 
@@ -207,20 +218,23 @@ async def retrieve_platform_executions(
       ``finished_at <= end_date``. Those columns stay ``NULL`` until a worker scores
       the run, so a bound naturally excludes queued/in-progress executions.
 
-    Raises ``ValueError`` for an unparseable date. Results are ordered by the run's
-    creation date, then by platform; no match yields ``[]``.
+    The filters narrow which *runs* are read, exactly as in :func:`retrieve_runs`; a run
+    that matches contributes every platform it holds. Raises ``ValueError`` for an
+    unparseable date. Results are ordered by the run's creation date, then by platform;
+    no match yields ``[]``.
     """
     start = _parse_date(start_date, "start_date")
     end = _parse_date(end_date, "end_date")
 
     async with session_scope(session) as db:
-        executions = await platform_execution_repo.list_platform_executions(
-            db,
-            platform=platform,
-            start=start,
-            end=end,
+        runs = await run_repo.list_runs(
+            db, platform=platform, start=start, end=end, with_metric_scores=False
         )
-        return [serialize_platform_execution(execution) for execution in executions]
+        return [
+            {"run_id": str(run.id), **rollup}
+            for run in runs
+            for rollup in platform_rollups(run)
+        ]
 
 
 def _parse_date(value: str | None, field: str) -> datetime | None:

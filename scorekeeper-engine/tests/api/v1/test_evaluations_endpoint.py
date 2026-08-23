@@ -188,6 +188,55 @@ async def test_start_endpoint_already_started_409(monkeypatch) -> None:
     assert "enqueued" not in captured  # a re-start never enqueues a second job
 
 
+async def test_resume_endpoint_enqueues_and_returns_queued(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_resume(run_id, **kw):
+        captured["resumed"] = run_id
+        return "en_cola"
+
+    monkeypatch.setattr(run_service, "resume_run", fake_resume)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/evaluations/run-123/resume")
+
+    # 202 Accepted; the stopped run goes back to en_cola and its chain is enqueued again.
+    assert response.status_code == 202
+    assert response.json() == {"run_id": "run-123", "status": "en_cola"}
+    assert captured["resumed"] == "run-123"
+    assert captured["enqueued"] == "run-123"
+
+
+async def test_resume_endpoint_unknown_run_404(monkeypatch) -> None:
+    captured: dict = {}
+
+    monkeypatch.setattr(run_service, "resume_run", _async_none)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/evaluations/does-not-exist/resume")
+
+    assert response.status_code == 404
+    assert "enqueued" not in captured  # nothing enqueued for an unknown run
+
+
+async def test_resume_endpoint_not_resumable_409(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_resume(run_id, **kw):
+        raise ValueError("El run no se puede reanudar desde el estado 'en_proceso'.")
+
+    monkeypatch.setattr(run_service, "resume_run", fake_resume)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/evaluations/run-123/resume")
+
+    assert response.status_code == 409
+    assert "enqueued" not in captured  # a live chain never gets a second job
+
+
 async def test_selection_endpoint_returns_updated_count(monkeypatch) -> None:
     captured: dict = {}
 

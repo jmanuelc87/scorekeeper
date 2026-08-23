@@ -1,67 +1,39 @@
-import React, { useEffect, useState } from "react";
+import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
+import { Layout, type Page } from "./components/Layout";
+import { RunsDashboard } from "./components/RunsDashboard";
+import { Metrics } from "./components/Metrics";
+import { MetricPrompt } from "./components/MetricPrompt";
+import { UseCases } from "./components/UseCases";
+import { AuthProviders } from "./components/AuthProviders";
 import "./styles.css";
 
-type Score = {
-  id: number;
-  player: string;
-  points: number;
-  created_at: string;
-};
-
-const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8001";
-
 function App() {
-  const [scores, setScores] = useState<Score[]>([]);
-  const [error, setError] = useState("");
-  const [loading, setLoading] = useState(true);
-
-  const refresh = async () => {
-    setLoading(true);
-    setError("");
-    try {
-      const response = await fetch(`${API_URL}/api/results`);
-      if (!response.ok) throw new Error(`Request failed (${response.status})`);
-      setScores(await response.json());
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "Could not load scores");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  useEffect(() => { void refresh(); }, []);
+  const [page, setPage] = useState<Page>("dashboard");
+  const [promptId, setPromptId] = useState<string | null>(null);
 
   return (
-    <main>
-      <header>
-        <div>
-          <p className="eyebrow">Live results</p>
-          <h1>Scorekeeper</h1>
-        </div>
-        <button onClick={() => void refresh()} disabled={loading}>Refresh</button>
-      </header>
-      {error && <p className="notice error">{error}</p>}
-      {loading && <p className="notice">Loading scores…</p>}
-      {!loading && !error && scores.length === 0 && (
-        <p className="notice">No scores yet. Record one through the API.</p>
+    <Layout currentPage={page} onNavigate={setPage}>
+      {page === "dashboard" && <RunsDashboard />}
+      {page === "metrics" && (
+        <Metrics
+          onOpenPrompt={(id) => {
+            setPromptId(id);
+            setPage("metric-prompt");
+          }}
+        />
       )}
-      {scores.length > 0 && (
-        <div className="table-wrap">
-          <table>
-            <thead><tr><th>Player</th><th>Points</th><th>Recorded</th></tr></thead>
-            <tbody>{scores.map((score) => (
-              <tr key={score.id}>
-                <td>{score.player}</td>
-                <td className="points">{score.points}</td>
-                <td>{new Date(score.created_at).toLocaleString()}</td>
-              </tr>
-            ))}</tbody>
-          </table>
-        </div>
+      {page === "metric-prompt" && promptId && (
+        <MetricPrompt promptId={promptId} onBack={() => setPage("metrics")} />
       )}
-    </main>
+      {page === "use-cases" && <UseCases />}
+      {page === "auth-providers" && <AuthProviders />}
+    </Layout>
   );
 }
 
-createRoot(document.getElementById("root")!).render(<React.StrictMode><App /></React.StrictMode>);
+createRoot(document.getElementById("root")!).render(
+  <React.StrictMode>
+    <App />
+  </React.StrictMode>
+);

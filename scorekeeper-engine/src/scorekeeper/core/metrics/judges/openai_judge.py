@@ -32,6 +32,9 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound=BaseModel)
 
 PROVIDER = "OpenAI"
+
+# Per-request timeout (seconds) for the provider client; see Settings.judge_timeout_seconds.
+DEFAULT_TIMEOUT_SECONDS = 900.0
 DEFAULT_MODEL = "gpt-5.6-sol"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 # Chat models this judge may call (exact-match allow-list; extend as models ship).
@@ -66,6 +69,7 @@ class OpenAIJudge:
         system_prompt: str | None = None,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
         step_models: StepModels | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self.model = model
         self.embedding_model = embedding_model
@@ -79,7 +83,7 @@ class OpenAIJudge:
             # max_retries=0: retrying is owned by ``judge_call``, which backs off with
             # jitter and honors Retry-After. Leaving the SDK's own retries on would
             # multiply the two budgets and make the total wait impossible to reason about.
-            client = openai.OpenAI(api_key=api_key, max_retries=0)
+            client = openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout)
         self._client: Any = client
 
     def _owns(self, model: str) -> bool:
@@ -96,7 +100,7 @@ class OpenAIJudge:
             self._step_models.for_step(step), owns=self._owns, provider=self.provider
         )
 
-    def _resolve(self, step: JudgeStep | None, model: str | None) -> str:
+    def resolve_model(self, step: JudgeStep | None, model: str | None) -> str:
         """An explicit ``model`` (validated) wins over ``step`` routing."""
         if model is not None:
             return owned_model(model, owns=self._owns, provider=self.provider)
@@ -127,7 +131,7 @@ class OpenAIJudge:
         model: str | None = None,
     ) -> JudgeVerdict:
         spec = scale_spec(scale)
-        model = self._resolve(step, model)
+        model = self.resolve_model(step, model)
         content = f"{render_prompt(rubric, turn)}\n\n{spec.instruction_es}"
 
         def _call() -> tuple[Any, Any]:
@@ -171,7 +175,7 @@ class OpenAIJudge:
         step: JudgeStep | None = None,
         model: str | None = None,
     ) -> T:
-        model = self._resolve(step, model)
+        model = self.resolve_model(step, model)
 
         def _call() -> tuple[Any, Any]:
             completion = self._client.chat.completions.parse(

@@ -279,9 +279,9 @@ async def test_run_evaluation_multiple_files(session: AsyncSession, registry) ->
     assert {s.scenario_id for s in scenarios} == {"esc1", "esc2"}
 
 
-async def test_ingest_groups_files_by_per_file_platform(session: AsyncSession, registry) -> None:
-    # esc1 has no override (falls back to the run-level "claude"); esc2 overrides to
-    # "gemini"; esc3 also overrides to "gemini" and must share esc2's execution.
+async def test_ingest_resolves_the_platform_per_file(session: AsyncSession, registry) -> None:
+    # esc1 has no override (falls back to the run-level "claude"); esc2 and esc3
+    # override to "gemini". Each file gets its own execution carrying that platform.
     files = [
         UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default"),
         UploadedFile("esc2.xlsx", _conversation_bytes(), "esc2", "default", platform="gemini"),
@@ -291,14 +291,13 @@ async def test_ingest_groups_files_by_per_file_platform(session: AsyncSession, r
     run_id = await ingest_evaluation("claude", files, session=session)
 
     run = await session.get(BenchmarkRun, uuid.UUID(run_id))
-    by_platform = {pe.platform: pe for pe in run.platform_executions}
-    # One execution per distinct resolved platform.
-    assert set(by_platform) == {"claude", "gemini"}
-    assert {s.scenario_id for s in by_platform["claude"].scenario_results} == {"esc1"}
-    assert {s.scenario_id for s in by_platform["gemini"].scenario_results} == {"esc2", "esc3"}
+    by_scenario = {
+        s.scenario_id: s.platform_executions[0].platform for s in run.scenario_results
+    }
+    assert by_scenario == {"esc1": "claude", "esc2": "gemini", "esc3": "gemini"}
 
 
-async def test_ingest_single_platform_when_no_overrides(session: AsyncSession, registry) -> None:
+async def test_ingest_falls_back_to_the_run_platform(session: AsyncSession, registry) -> None:
     files = [
         UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default"),
         UploadedFile("esc2.xlsx", _conversation_bytes(), "esc2", "default"),
@@ -307,10 +306,11 @@ async def test_ingest_single_platform_when_no_overrides(session: AsyncSession, r
     run_id = await ingest_evaluation("claude", files, session=session)
 
     run = await session.get(BenchmarkRun, uuid.UUID(run_id))
-    # No per-file platform → a single execution holding both scenarios.
-    assert len(run.platform_executions) == 1
-    assert run.platform_executions[0].platform == "claude"
-    assert len(run.platform_executions[0].scenario_results) == 2
+    # No per-file platform → every scenario carries the run-level one.
+    assert len(run.scenario_results) == 2
+    assert {
+        pe.platform for s in run.scenario_results for pe in s.platform_executions
+    } == {"claude"}
 
 
 async def test_run_evaluation_rejects_empty_inputs(session: AsyncSession, registry) -> None:
@@ -389,24 +389,29 @@ async def test_captured_messages_reach_turns_without_a_spreadsheet(session: Asyn
 
     scenario = (
         await session.scalars(
-            select(ScenarioResult).options(selectinload(ScenarioResult.turns))
+            select(ScenarioResult).options(
+                selectinload(ScenarioResult.platform_executions).selectinload(
+                    PlatformExecution.turns
+                )
+            )
         )
     ).one()
     assert scenario.scenario_id == "esc-captura"
-    assert scenario.source_ref == "https://claude.ai/chat/abc"
+    platform_exec = scenario.platform_executions[0]
+    assert platform_exec.source_ref == "https://claude.ai/chat/abc"
     # Turns were derived from role alternation: two user+model pairs.
-    turns = sorted(scenario.turns, key=lambda t: t.turn_number)
+    turns = sorted(platform_exec.turns, key=lambda t: t.turn_number)
     assert [(t.turn_number, t.prompt, t.response) for t in turns] == [
         (1, "Hola", "¿Qué tal?"),
         (2, "Adiós", "Hasta luego"),
     ]
-    assert scenario.raw_conversation["messages"][0]["turn"] == 1
+    assert platform_exec.raw_conversation["messages"][0]["turn"] == 1
     run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     assert str(run.status) == "ingerido"
 
 
-async def test_captured_model_lands_on_the_scenario(session: AsyncSession) -> None:
-    """The capturing client's model is stored per scenario; an upload without one is NULL."""
+async def test_captured_model_lands_on_the_execution(session: AsyncSession) -> None:
+    """The capturing client's model is stored per conversation; without one it is NULL."""
     await ingest_evaluation(
         "claude",
         [
@@ -427,10 +432,14 @@ async def test_captured_model_lands_on_the_scenario(session: AsyncSession) -> No
         session=session,
     )
 
-    scenarios = (
-        await session.scalars(select(ScenarioResult).order_by(ScenarioResult.scenario_id))
+    executions = (
+        await session.scalars(
+            select(PlatformExecution)
+            .join(PlatformExecution.scenario_result)
+            .order_by(ScenarioResult.scenario_id)
+        )
     ).all()
-    assert [(s.scenario_id, s.model_name) for s in scenarios] == [
+    assert [(pe.scenario_result.scenario_id, pe.model_name) for pe in executions] == [
         ("esc-con-modelo", "Claude Opus 4.5"),
         ("esc-sin-modelo", None),
     ]
@@ -465,7 +474,7 @@ async def test_captured_citations_reach_turn_context(session: AsyncSession) -> N
         session=session,
     )
 
-    turn = (await session.scalars(select(ScenarioResult))).one().turns[0]
+    turn = (await session.scalars(select(PlatformExecution))).one().turns[0]
     # Both model messages joined into one response, and the context survived even
     # though it hung off the second of them.
     assert turn.response == "Conectar para continuar\nTres noticias"

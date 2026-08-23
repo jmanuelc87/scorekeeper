@@ -235,3 +235,5 @@ __marimo__/
 # Other
 .claude/
 .vscode/
+frontend/vite.config.js
+frontend/vite.config.d.ts

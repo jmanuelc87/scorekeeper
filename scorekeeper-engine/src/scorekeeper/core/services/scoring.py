@@ -18,10 +18,9 @@ from scorekeeper.core.metrics import selection
 from scorekeeper.core.metrics.judge import Judge
 from scorekeeper.core.retrieval.protocols import RetrievalPipeline
 from scorekeeper.core.runner import (
-    STATUS_COMPLETADO,
     STATUS_FALLIDO,
-    STATUS_PARCIAL,
     EvalRunner,
+    rollup_status,
 )
 from scorekeeper.core.services import ingestion, retrieval
 from scorekeeper.core.services.ingestion import UploadedFile
@@ -62,7 +61,7 @@ async def score_run(
         await db.commit()
 
         turn_total = sum(
-            len(s.turns) for pe in run.platform_executions for s in pe.scenario_results
+            len(pe.turns) for s in run.scenario_results for pe in s.platform_executions
         )
         logger.info("Puntuando run %s: %d turno(s) con el juez…", run.id, turn_total)
         try:
@@ -112,11 +111,7 @@ async def pin_prompts(
     re-resolve, and a prompt published mid-run would split the run's rollups across two
     rubrics, which is exactly what pinning exists to prevent.
     """
-    use_case_ids = {
-        scenario.use_case_id
-        for platform_exec in run.platform_executions
-        for scenario in platform_exec.scenario_results
-    }
+    use_case_ids = {scenario.use_case_id for scenario in run.scenario_results}
     by_use_case = await use_case_repo.metric_names_for_many(db, use_case_ids)
     metric_names = {name for names in by_use_case.values() for name in names}
 
@@ -162,13 +157,4 @@ def run_status(run: BenchmarkRun) -> str:
     ``fallido`` when nothing scored or every scenario failed, ``completado`` when
     all completed, otherwise ``parcial``.
     """
-    statuses = [
-        scenario.status
-        for platform_exec in run.platform_executions
-        for scenario in platform_exec.scenario_results
-    ]
-    if not statuses or all(status == STATUS_FALLIDO for status in statuses):
-        return STATUS_FALLIDO
-    if all(status == STATUS_COMPLETADO for status in statuses):
-        return STATUS_COMPLETADO
-    return STATUS_PARCIAL
+    return rollup_status([scenario.status for scenario in run.scenario_results])

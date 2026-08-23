@@ -87,11 +87,19 @@ def _scenario_payload() -> dict:
     return {
         "id": "3f0ac1d2-0000-4000-8000-000000000001",
         "scenario_id": "esc1",
-        "platform": "claude",
         "use_case": "rag_completo",
-        "model_name": None,
         "status": "completado",
-        "average_score": 0.81,
+        "platform_executions": [
+            {
+                "id": "3f0ac1d2-0000-4000-8000-000000000002",
+                "platform": "claude",
+                "model_name": None,
+                "status": "completado",
+                "average_score": 0.81,
+                "started_at": "2026-07-10T12:00:00+00:00",
+                "finished_at": "2026-07-10T12:05:00+00:00",
+            }
+        ],
     }
 
 
@@ -153,7 +161,9 @@ async def test_run_scenarios_endpoint_emits_exactly_the_rollup_fields(monkeypatc
     """The response model stops at the scenario rollup — extras are dropped."""
 
     async def fake(run_id, **kwargs):
-        return [_scenario_payload() | {"turns": [{"turn_number": 1}]}]
+        payload = _scenario_payload()
+        payload["platform_executions"][0]["turns"] = [{"turn_number": 1}]
+        return [payload]
 
     monkeypatch.setattr(read_models, "retrieve_run_scenarios", fake)
 
@@ -161,12 +171,21 @@ async def test_run_scenarios_endpoint_emits_exactly_the_rollup_fields(monkeypatc
         response = client.get("/api/v1/runs/b1f2/scenarios")
 
     assert response.status_code == 200
-    assert set(response.json()[0]) == {
+    body = response.json()[0]
+    assert set(body) == {
         "id",
         "scenario_id",
-        "platform",
         "use_case",
+        "status",
+        "platform_executions",
+    }
+    # The nested execution stops at its rollup too — the turns are dropped.
+    assert set(body["platform_executions"][0]) == {
+        "id",
+        "platform",
         "model_name",
         "status",
         "average_score",
+        "started_at",
+        "finished_at",
     }

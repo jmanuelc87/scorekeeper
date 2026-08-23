@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING, Any
 
 from scorekeeper.core.metrics.judges.openai_judge import (
     DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_TIMEOUT_SECONDS,
     OpenAIJudge,
 )
 
@@ -58,6 +59,7 @@ class LMStudioJudge(OpenAIJudge):
         client: Any | None = None,
         system_prompt: str | None = None,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         if client is None:
             import openai  # lazy: only needed when building a real client
@@ -65,7 +67,9 @@ class LMStudioJudge(OpenAIJudge):
             # LM Studio ignores the API key, but the SDK requires a non-empty one.
             # max_retries=0 for the same reason as the cloud judges: ``judge_call`` owns
             # retrying, so the SDK must not add a second, invisible budget on top.
-            client = openai.OpenAI(base_url=base_url, api_key=api_key, max_retries=0)
+            client = openai.OpenAI(
+                base_url=base_url, api_key=api_key, max_retries=0, timeout=timeout
+            )
         # No step_models: resolution is overridden below to always use ``model``, so
         # per-step routing would be a no-op.
         super().__init__(
@@ -87,7 +91,7 @@ class LMStudioJudge(OpenAIJudge):
         """Always the single loaded local model, ignoring per-step routing."""
         return self.model
 
-    def _resolve(self, step: JudgeStep | None, model: str | None) -> str:
+    def resolve_model(self, step: JudgeStep | None, model: str | None) -> str:
         """Remap any requested/pinned model to the one loaded local model."""
         return self.model
 

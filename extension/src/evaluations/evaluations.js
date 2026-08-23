@@ -6,7 +6,14 @@
  * state to storage, so the table stays live even while scoring continues.
  */
 
-import { RUNS_KEY, STATUS_LABELS, TERMINAL_STATUSES } from "../config.js";
+import {
+  captureLabels,
+  RUNS_KEY,
+  runCaptures,
+  runScenarioIds,
+  STATUS_LABELS,
+  TERMINAL_STATUSES,
+} from "../config.js";
 
 const ui = {
   table: document.getElementById("table"),
@@ -49,9 +56,16 @@ function render(runs) {
 
 /** One `<tr>`; running rows get their own refresh button. */
 function runRow(run) {
-  const scenario = cell(run.scenarioId, "cell-scenario");
-  scenario.title = run.scenarioId;
-  const platform = cell(run.platform);
+  const captures = runCaptures(run);
+  // One execution per capture, so a platform captured twice is listed twice.
+  const labels = captureLabels(captures);
+  const label = cell(run.runLabel || "—", "cell-label");
+  label.title = run.runLabel ?? "";
+  // A lote groups several scenarios under one run, so the cell names all of them.
+  const scenarios = runScenarioIds(run).join(" · ");
+  const scenario = cell(scenarios, "cell-scenario");
+  scenario.title = scenarios;
+  const platform = cell(labels.join(" · "));
 
   const status = cell();
   const badge = Object.assign(document.createElement("span"), {
@@ -74,18 +88,24 @@ function runRow(run) {
   const average = cell(rowAverage(run));
 
   const source = cell(null, "cell-source");
-  if (run.sourceUrl) {
-    source.append(
-      Object.assign(document.createElement("a"), {
-        href: run.sourceUrl,
-        target: "_blank",
-        rel: "noreferrer",
-        textContent: "Abrir chat",
-      }),
-    );
-  } else {
-    source.textContent = "—";
-  }
+  const links = captures
+    .map((item, index) =>
+      item.sourceUrl
+        ? Object.assign(document.createElement("a"), {
+            href: item.sourceUrl,
+            target: "_blank",
+            rel: "noreferrer",
+            // One link per capture, so each needs to say which chat it opens.
+            textContent: captures.length > 1 ? labels[index] : "Abrir chat",
+          })
+        : null,
+    )
+    .filter(Boolean);
+  // Interleaved rather than styled: the cell has no rule of its own, so without a
+  // separator two links would read as one word.
+  if (links.length)
+    source.append(...links.flatMap((link, index) => (index ? [" · ", link] : [link])));
+  else source.textContent = "—";
 
   const action = cell(null, "cell-action");
   if (!TERMINAL_STATUSES.includes(run.status)) {
@@ -99,7 +119,7 @@ function runRow(run) {
   }
 
   const row = document.createElement("tr");
-  row.append(scenario, platform, status, progress, average, source, action);
+  row.append(label, scenario, platform, status, progress, average, source, action);
   return row;
 }
 
@@ -117,7 +137,7 @@ function formatProgress(run) {
     : "—";
 }
 
-// One entry per platform in the run; a capture only ever submits one.
+// One entry per platform execution scored under the run.
 function rowAverage(run) {
   const scores = (run.platforms ?? [])
     .map((entry) => entry.average_score)

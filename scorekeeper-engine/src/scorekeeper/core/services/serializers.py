@@ -13,6 +13,7 @@ from datetime import datetime
 from typing import Any
 
 from scorekeeper.core.metrics.base import is_not_applicable
+from scorekeeper.core.metrics.rollup import platform_average
 from scorekeeper.core.runner import (
     STATUS_COMPLETADO,
     STATUS_FALLIDO,
@@ -27,9 +28,11 @@ from scorekeeper.db.models import (
     TurnTokenUsage,
 )
 
-# Serialization depth: how deep :func:`serialize_run` walks the run tree.
-GRANULARITY_PLATFORM = "platform_executions"  # stop at the platform execution
-GRANULARITY_SCENARIO = "scenario_results"  # descend into scenario results
+# Serialization depth: how deep :func:`serialize_run` walks the run tree. The names are
+# unchanged from when platform executions were the run's children — they still describe
+# the depth of the *response*, which is what clients select on.
+GRANULARITY_PLATFORM = "platform_executions"  # per-platform rollups only
+GRANULARITY_SCENARIO = "scenario_results"  # add the run's scenario results
 GRANULARITY_METRIC = "metric_scores"  # descend through turns to metric scores
 _GRANULARITIES = (GRANULARITY_PLATFORM, GRANULARITY_SCENARIO, GRANULARITY_METRIC)
 
@@ -46,9 +49,9 @@ def _run_progress(run: BenchmarkRun) -> dict[str, Any]:
     """
     turns = [
         turn
-        for platform_exec in run.platform_executions
-        for scenario in platform_exec.scenario_results
-        for turn in scenario.turns
+        for scenario in run.scenario_results
+        for platform_exec in scenario.platform_executions
+        for turn in platform_exec.turns
     ]
     total = len(turns)
     if run.status in _TERMINAL_STATUSES:
@@ -61,31 +64,55 @@ def _run_progress(run: BenchmarkRun) -> dict[str, Any]:
 def summarize_run(run: BenchmarkRun) -> dict[str, Any]:
     """Project the scored run into the JSON-serializable API response shape.
 
-    A run may hold one ``PlatformExecution`` per distinct platform (files can carry
-    a per-file platform override), so ``platforms`` is a list.
+    A run's scenarios may name different platforms (files can carry a per-file platform
+    override), so ``platforms`` is a list — one entry per distinct platform.
     """
     return {
         "run_id": str(run.id),
         "status": run.status,
         "progress": _run_progress(run),
-        "platforms": [
-            _platform_summary(platform_exec)
-            for platform_exec in run.platform_executions
-        ],
+        "platforms": platform_rollups(run),
     }
 
 
-def _platform_summary(platform_exec: PlatformExecution) -> dict[str, Any]:
-    """One platform execution's rollup: average, scenario count, status breakdown."""
-    breakdown: dict[str, int] = {}
-    for scenario in platform_exec.scenario_results:
-        breakdown[scenario.status] = breakdown.get(scenario.status, 0) + 1
-    return {
-        "platform": platform_exec.platform,
-        "average_score": platform_exec.average_score,
-        "scenarios": len(platform_exec.scenario_results),
-        "status_breakdown": breakdown,
-    }
+def platform_rollups(run: BenchmarkRun) -> list[dict[str, Any]]:
+    """One rollup per distinct platform in ``run``, ordered by platform name.
+
+    The rollup has no table of its own: a platform execution belongs to one scenario, so
+    "how did this platform do across this run" is a group-by over the run's executions
+    rather than a stored row. ``scenarios`` counts the executions on that platform —
+    equivalently, the scenarios that were run on it, since a scenario contributes at most
+    one conversation per platform in the usual case.
+    """
+    grouped: dict[str, list[PlatformExecution]] = {}
+    for scenario in run.scenario_results:
+        for platform_exec in scenario.platform_executions:
+            grouped.setdefault(platform_exec.platform, []).append(platform_exec)
+
+    rollups = []
+    for platform, executions in sorted(grouped.items()):
+        breakdown: dict[str, int] = {}
+        for platform_exec in executions:
+            breakdown[platform_exec.status] = breakdown.get(platform_exec.status, 0) + 1
+        started = [pe.started_at for pe in executions if pe.started_at is not None]
+        finished = [pe.finished_at for pe in executions if pe.finished_at is not None]
+        rollups.append(
+            {
+                "platform": platform,
+                "average_score": platform_average(
+                    [pe.average_score for pe in executions]
+                ),
+                # Null until *every* member has finished: a half-scored platform has no
+                # end yet, which is what keeps the date filters excluding it.
+                "started_at": _iso(min(started)) if started else None,
+                "finished_at": (
+                    _iso(max(finished)) if len(finished) == len(executions) else None
+                ),
+                "scenarios": len(executions),
+                "status_breakdown": breakdown,
+            }
+        )
+    return rollups
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -97,95 +124,71 @@ def serialize_run(run: BenchmarkRun, granularity: str) -> dict[str, Any]:
     """Project a run into a JSON-serializable dict, deepened to ``granularity``.
 
     ``platform_executions`` emits run + per-platform rollups; ``scenario_results``
-    adds each scenario; ``metric_scores`` adds each turn and its metric scores. All
-    rollup values are already-persisted columns — nothing is recomputed here.
+    adds the run's scenarios; ``metric_scores`` adds each turn and its metric scores.
+
+    Scenarios sit at the top level rather than nested under a platform, mirroring the
+    schema: they are the run's children, and each names its own platform. The
+    ``platforms`` block stays as the per-platform rollup clients summarize a run with.
     """
-    return {
+    entry: dict[str, Any] = {
         "run_id": str(run.id),
         "status": run.status,
+        # The batch a capturing client grouped this run under; null for every other path.
+        "label": run.label,
         "created_at": _iso(run.created_at),
         "progress": _run_progress(run),
-        "platforms": [
-            _serialize_platform(platform_exec, granularity)
-            for platform_exec in run.platform_executions
-        ],
-    }
-
-
-def _serialize_platform(
-    platform_exec: PlatformExecution, granularity: str
-) -> dict[str, Any]:
-    breakdown: dict[str, int] = {}
-    for scenario in platform_exec.scenario_results:
-        breakdown[scenario.status] = breakdown.get(scenario.status, 0) + 1
-    entry: dict[str, Any] = {
-        "platform": platform_exec.platform,
-        "average_score": platform_exec.average_score,
-        "started_at": _iso(platform_exec.started_at),
-        "finished_at": _iso(platform_exec.finished_at),
-        "scenarios": len(platform_exec.scenario_results),
-        "status_breakdown": breakdown,
+        "platforms": platform_rollups(run),
     }
     if granularity in (GRANULARITY_SCENARIO, GRANULARITY_METRIC):
         entry["scenario_results"] = [
-            _serialize_scenario(scenario, granularity)
-            for scenario in platform_exec.scenario_results
+            serialize_scenario(scenario, granularity) for scenario in run.scenario_results
         ]
     return entry
 
 
-def serialize_platform_execution(platform_exec: PlatformExecution) -> dict[str, Any]:
-    """One platform execution as a flat row: its rollup plus its own and its run's id.
+def serialize_scenario(
+    scenario: ScenarioResult, granularity: str = GRANULARITY_SCENARIO
+) -> dict[str, Any]:
+    """One scenario and how each platform answered it.
 
-    The projection ``GET /platform-executions`` returns — the same fields
-    :func:`serialize_run` nests under ``platforms``, lifted to the top level. The
-    granularity is fixed at ``platform_executions`` rather than taken as an argument:
-    that is what guarantees no caller can ask for a depth the repository did not
-    eager-load, which under an ``AsyncSession`` is a ``MissingGreenlet``.
+    Shared by ``GET /runs`` and ``GET /runs/{run_id}/scenarios``. The scenario carries a
+    ``status`` rolled up across its ``platform_executions`` but **no average**: the
+    scores worth reading are the per-platform ones, side by side. Turns are nested under
+    their execution only at ``metric_scores``; otherwise read them via
+    ``/scenarios/{scenario_id}/turns``.
     """
     return {
-        "id": str(platform_exec.id),
-        "run_id": str(platform_exec.run_id),
-        **_serialize_platform(platform_exec, GRANULARITY_PLATFORM),
-    }
-
-
-def _serialize_scenario(
-    scenario: ScenarioResult, granularity: str
-) -> dict[str, Any]:
-    entry: dict[str, Any] = {
         # The row's UUID — the handle GET /scenarios/{id}/turns takes (distinct from the
         # human-readable, non-unique ``scenario_id`` label below).
         "id": str(scenario.id),
         "scenario_id": scenario.scenario_id,
         "use_case": scenario.use_case.name,
+        "status": scenario.status,
+        "platform_executions": [
+            _serialize_execution(platform_exec, granularity)
+            for platform_exec in scenario.platform_executions
+        ],
+    }
+
+
+def _serialize_execution(
+    platform_exec: PlatformExecution, granularity: str
+) -> dict[str, Any]:
+    """One captured conversation: which platform answered, how it scored, its turns."""
+    entry: dict[str, Any] = {
+        "id": str(platform_exec.id),
+        "platform": platform_exec.platform,
         # The model that answered, when the capturing client reported one; null for
         # every .xlsx import.
-        "model_name": scenario.model_name,
-        "status": scenario.status,
-        "average_score": scenario.average_score,
+        "model_name": platform_exec.model_name,
+        "status": platform_exec.status,
+        "average_score": platform_exec.average_score,
+        "started_at": _iso(platform_exec.started_at),
+        "finished_at": _iso(platform_exec.finished_at),
     }
     if granularity == GRANULARITY_METRIC:
-        entry["turns"] = [_serialize_turn(turn) for turn in scenario.turns]
+        entry["turns"] = [_serialize_turn(turn) for turn in platform_exec.turns]
     return entry
-
-
-def serialize_run_scenario(scenario: ScenarioResult) -> dict[str, Any]:
-    """One scenario of a run as a flat entry, tagged with the platform that ran it.
-
-    Same fields as :func:`_serialize_scenario` plus ``platform``, which that projection
-    leaves implicit in its nesting under a platform execution. Depth stops at the
-    scenario rollup — read its turns via ``/scenarios/{scenario_id}/turns``.
-    """
-    return {
-        "id": str(scenario.id),
-        "scenario_id": scenario.scenario_id,
-        "platform": scenario.platform_execution.platform,
-        "use_case": scenario.use_case.name,
-        "model_name": scenario.model_name,
-        "status": scenario.status,
-        "average_score": scenario.average_score,
-    }
 
 
 def _serialize_metric_score(score: MetricScore) -> dict[str, Any]:
@@ -239,9 +242,13 @@ def serialize_scenario_turn(turn: Turn) -> dict[str, Any]:
     caller can read the scenario's turns without re-uploading the source. The
     structured metric ``trace`` is still not surfaced here (read it via
     ``/turns/{turn_id}/traces``).
+
+    A scenario spans several conversations, so each turn names the ``platform`` whose
+    conversation it belongs to — otherwise the flat list could not be told apart.
     """
     return {
         "turn_id": str(turn.id),
+        "platform": turn.platform_execution.platform,
         "turn_number": turn.turn_number,
         "prompt": turn.prompt,
         "response": turn.response,

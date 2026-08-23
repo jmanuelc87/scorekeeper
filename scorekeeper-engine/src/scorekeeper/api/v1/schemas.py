@@ -78,6 +78,10 @@ class CapturePayload(BaseModel):
 
     platform: str = Field(..., min_length=1)
     use_case: str = ingestion.DEFAULT_USE_CASE
+    # The batch these conversations belong to: captures naming the same label land
+    # under one run, whatever their scenario ids. Payload-level, not per-conversation —
+    # a run is the batch. Absent, null or blank means "no grouping requested".
+    run_label: str | None = None
     conversations: list[CaptureConversation] = Field(..., min_length=1)
 
 
@@ -111,13 +115,15 @@ class PlatformSummary(BaseModel):
 
 
 class PlatformExecutionRead(BaseModel):
-    """One platform execution as a flat row — the ``GET /platform-executions`` entry.
+    """One run's rollup for one platform — the ``GET /platform-executions`` entry.
 
+    Identified by ``run_id`` + ``platform``: the row is grouped from the run's
+    scenarios rather than read from a table, so it has no id of its own.
     ``started_at``/``finished_at`` are ISO-8601 strings the serializer already
-    formatted, and stay ``null`` until a worker scores the run.
+    formatted. ``started_at`` stays ``null`` until a worker begins scoring, and
+    ``finished_at`` until every scenario on the platform is done.
     """
 
-    id: str
     run_id: str
     platform: str
     started_at: str | None = None
@@ -127,32 +133,50 @@ class PlatformExecutionRead(BaseModel):
     status_breakdown: dict[str, int]
 
 
+class ScenarioPlatformExecution(BaseModel):
+    """One platform's answer to a scenario — the conversation that was scored.
+
+    ``started_at``/``finished_at`` are ISO-8601 strings the serializer already
+    formatted, and stay ``null`` until a worker scores this conversation.
+    """
+
+    id: str
+    platform: str
+    # The model that answered, when the capturing client reported one; null for every
+    # .xlsx import.
+    model_name: str | None = None
+    status: str
+    # Null until this conversation has been scored.
+    average_score: float | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
 class RunScenarioResult(BaseModel):
     """One scenario result of a run — the ``GET /runs/{run_id}/scenarios`` entry.
 
     ``id`` is the ``ScenarioResult`` UUID, the handle
     ``GET /scenarios/{scenario_id}/turns`` takes; ``scenario_id`` is the
-    human-readable, **non-unique** label (e.g. the file stem). ``platform`` names the
-    platform execution this scenario ran under, since the list is flat.
+    human-readable, **non-unique** label (e.g. the file stem). ``status`` rolls up across
+    ``platform_executions``, one per platform the scenario was run on.
+
+    There is no scenario-level average: the scores are the per-platform ones on each
+    execution, which is what makes the entry a comparison rather than a blend.
     """
 
     id: str
     scenario_id: str
-    platform: str
     use_case: str
-    # The model that answered, when the capturing client reported one; null for every
-    # .xlsx import.
-    model_name: str | None = None
     status: str
-    # Null until the scenario has been scored.
-    average_score: float | None = None
+    platform_executions: list[ScenarioPlatformExecution]
 
 
 class EvaluationResponse(BaseModel):
     run_id: str
     status: str
     progress: RunProgress
-    # One entry per distinct platform in the run (files may override the platform).
+    # One entry per distinct platform among the run's scenarios (files may override
+    # the platform), grouped at read time.
     platforms: list[PlatformSummary]
 
 
@@ -161,7 +185,7 @@ class ScenarioTurnMetric(BaseModel):
 
     ``score`` is ``null`` when the metric did not apply to the turn — it had
     nothing to measure (no retrieved context, no claims), so it is also left out
-    of the turn, scenario and platform averages.
+    of the turn, conversation and scenario averages.
     """
 
     metric_name: str
@@ -171,9 +195,14 @@ class ScenarioTurnMetric(BaseModel):
 
 
 class ScenarioTurn(BaseModel):
-    """One turn of a scenario: its conversation content plus per-metric scores."""
+    """One turn of a scenario: its conversation content plus per-metric scores.
+
+    A scenario holds one conversation per platform, so the list spans them all and
+    ``platform`` says which one this turn belongs to.
+    """
 
     turn_id: str
+    platform: str
     turn_number: int
     prompt: str
     response: str

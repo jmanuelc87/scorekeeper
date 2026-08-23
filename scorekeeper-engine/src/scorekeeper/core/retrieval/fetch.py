@@ -61,7 +61,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Default per-request timeout for public HTTP fetches.
-_FETCH_TIMEOUT_SECONDS = 30.0
+_FETCH_TIMEOUT_SECONDS = 180.0
 
 # Redirect hops a public GET follows before giving up (each one is host-checked).
 _MAX_REDIRECTS = 5

@@ -4,14 +4,15 @@ Everything the runner needs already exists as isolated pieces: metric *selection
 (``metrics.selection.resolve``), metric *behavior* (``Metric.evaluate`` against a
 ``Judge``), and *roll-up* math (``metrics.rollup``). ``EvalRunner`` is the loop that
 wires them together over the persisted hierarchy
-``BenchmarkRun → PlatformExecution → ScenarioResult → Turn`` and writes the results
-back: one ``MetricScore`` per metric per turn, plus the composite ``turn_score`` and
-the ``average_score`` at scenario and platform level.
+``BenchmarkRun → ScenarioResult → PlatformExecution → Turn`` and writes the results
+back: one ``MetricScore`` per metric per turn, the composite ``turn_score``, and the
+``average_score`` of each platform execution. Nothing averages *across* platforms — a
+scenario rolls up a ``status``, not a score.
 
 Design:
 
-* **Layered** — a public method at every level (``run_benchmark`` / ``run_platform`` /
-  ``run_scenario`` / ``run_turn``) so a caller can score a whole run or a single turn.
+* **Layered** — a public method at every level (``run_benchmark`` / ``run_scenario`` /
+  ``run_execution`` / ``run_turn``) so a caller can score a whole run or a single turn.
 * **Skip-metric-continue** — a metric that raises is logged and skipped; the turn still
   scores from the metrics that succeeded, and scenario ``status`` records whether the
   scoring was complete, partial, or a total failure.
@@ -30,8 +31,8 @@ It is also the unit of *delivery* — ``services.chain`` scores one turn per Cel
 so a crash costs one turn rather than the whole run, and the ``attempts`` counter bounds
 how often a turn that keeps crashing is retried.
 The roll-ups commit at their own level as they are computed: the ``turn_score`` in
-``run_turn``, the scenario ``average_score`` / ``status`` in ``run_scenario``, the
-platform ``average_score`` in ``run_platform``.
+``run_turn``, the execution ``average_score`` / ``status`` in ``run_execution``, and
+the scenario ``status`` in ``run_scenario``.
 
 **Resumable at metric granularity.** Scoring re-enters — a crashed Celery worker
 redelivers the whole job — and the judge bill is the expensive part, so a re-run
@@ -68,7 +69,7 @@ from scorekeeper.core.metrics.fingerprint import scoring_key
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
 from scorekeeper.core.metrics.judges import make_judge
 from scorekeeper.core.metrics.judges.base import UsageAccumulator, collect_usage
-from scorekeeper.core.metrics.rollup import platform_average, scenario_average, turn_score
+from scorekeeper.core.metrics.rollup import execution_average, turn_score
 from scorekeeper.core.metrics.selection import active_templates, metrics_for, resolve
 from scorekeeper.core.retrieved_context import RetrievedContext
 
@@ -133,60 +134,25 @@ class EvalRunner:
 
     # ---- Level 1: whole run -------------------------------------------------
     async def run_benchmark(self, run: BenchmarkRun) -> None:
-        """Score every platform execution in ``run`` and commit."""
+        """Score every scenario in ``run`` and commit."""
         logger.info(
-            "Run %s: puntuando %d ejecución(es) de plataforma",
-            run.id,
-            len(run.platform_executions),
+            "Run %s: puntuando %d escenario(s)", run.id, len(run.scenario_results)
         )
-        for platform_exec in run.platform_executions:
-            await self.run_platform(platform_exec)
-        await self.session.commit()
-        logger.info("Run %s: todas las plataformas puntuadas", run.id)
-
-    # ---- Level 2: one platform ---------------------------------------------
-    async def run_platform(self, platform_exec: PlatformExecution) -> None:
-        """Score every scenario for one platform and roll up its average."""
-        logger.info(
-            "Plataforma %s: puntuando %d escenario(s)",
-            platform_exec.platform,
-            len(platform_exec.scenario_results),
-        )
-        platform_exec.started_at = _now()
-        scenario_scores: list[float | None] = []
-        for scenario in platform_exec.scenario_results:
+        for scenario in run.scenario_results:
             await self.run_scenario(scenario)
-            scenario_scores.append(scenario.average_score)
-        platform_exec.average_score = platform_average(scenario_scores)
-        platform_exec.finished_at = _now()
-        await self.session.flush()
-        logger.info(
-            "Plataforma %s finalizada: promedio=%s",
-            platform_exec.platform,
-            platform_exec.average_score,
-        )
+        await self.session.commit()
+        logger.info("Run %s: todos los escenarios puntuados", run.id)
 
-    # ---- Level 3: one scenario (conversation) ------------------------------
+    # ---- Level 2: one scenario (across platforms) --------------------------
     async def run_scenario(self, scenario: ScenarioResult) -> None:
-        """Score every turn of one conversation, roll up its average, and commit.
+        """Score every platform execution of one scenario, roll it up, and commit.
 
-        Metric selection follows the scenario's use case (its ``use_case_metrics``
-        links); the running conversation ``history`` is fed forward so later turns
-        see earlier exchanges. Consecutive turns are paced by a short random delay
-        (see ``_pace_between_turns``), but only after a turn that actually reached
-        the judge — a resumed turn costs no quota and so earns no pause.
+        The scenario is the comparison unit: its platforms are scored back to back so
+        their scores can be read side by side. It rolls up only a ``status`` — averaging
+        across platforms would blend the systems being compared into one number.
 
-        A scenario already ``completado`` returns immediately: it has nothing left to
-        score, and its ``average_score`` / ``status`` are already persisted. Note the
-        cost of that shortcut — it *shadows* the per-metric fingerprint, so a
-        ``completado`` scenario will not re-score after a new prompt version is
-        published or the judge model is swapped, even though its keys no longer match.
-        The fingerprint remains the mechanism for ``parcial``/``fallido`` scenarios
-        and for a run interrupted mid-flight.
-
-        Individual metric scores are already committed as they are written (see
-        ``run_turn``); this final commit persists the scenario roll-up
-        (``average_score`` / ``status``).
+        A scenario already ``completado`` returns immediately — see
+        :meth:`run_execution` for what that shortcut costs.
         """
         if scenario.status == STATUS_COMPLETADO:
             logger.info(
@@ -194,12 +160,60 @@ class EvalRunner:
                 scenario.scenario_id,
             )
             return
+        logger.info(
+            "Escenario %s (use_case=%s): %d plataforma(s)",
+            scenario.scenario_id,
+            scenario.use_case.name,
+            len(scenario.platform_executions),
+        )
+        for platform_exec in scenario.platform_executions:
+            await self.run_execution(platform_exec)
+        scenario.status = scenario_status(scenario)
+        await self.session.commit()
+        logger.info(
+            "Escenario %s finalizado: estado=%s, por plataforma=%s",
+            scenario.scenario_id,
+            scenario.status,
+            {pe.platform: pe.average_score for pe in scenario.platform_executions},
+        )
+
+    # ---- Level 3: one platform execution (conversation) --------------------
+    async def run_execution(self, platform_exec: PlatformExecution) -> None:
+        """Score every turn of one captured conversation, roll up its average, commit.
+
+        Metric selection follows the *scenario's* use case (its ``use_case_metrics``
+        links) — every platform of a scenario is judged by the same metrics, which is
+        what makes their scores comparable. The running conversation ``history`` is fed
+        forward so later turns see earlier exchanges. Consecutive turns are paced by a
+        short random delay (see ``_pace_between_turns``), but only after a turn that
+        actually reached the judge — a resumed turn costs no quota and so earns no pause.
+
+        An execution already ``completado`` returns immediately: it has nothing left to
+        score, and its ``average_score`` / ``status`` are already persisted. Note the
+        cost of that shortcut — it *shadows* the per-metric fingerprint, so a
+        ``completado`` execution will not re-score after a new prompt version is
+        published or the judge model is swapped, even though its keys no longer match.
+        The fingerprint remains the mechanism for ``parcial``/``fallido`` executions
+        and for a run interrupted mid-flight.
+
+        Individual metric scores are already committed as they are written (see
+        ``run_turn``); this final commit persists the execution roll-up
+        (``average_score`` / ``status``).
+        """
+        if platform_exec.status == STATUS_COMPLETADO:
+            logger.info(
+                "Plataforma %s ya completada: se omite la puntuación.",
+                platform_exec.platform,
+            )
+            return
+        scenario = platform_exec.scenario_result
+        platform_exec.started_at = _now()
         templates = self.templates
         if templates is None:
             # A caller entering here directly rather than through ``score_run`` is not
             # pinned; resolve the map ``score_run`` would have resolved so the
-            # fingerprint still sees which prompt versions scored this scenario. Not
-            # cached onto ``self.templates``: it covers only *this* scenario's metric
+            # fingerprint still sees which prompt versions scored this conversation. Not
+            # cached onto ``self.templates``: it covers only *this* use case's metric
             # names, and a partial map makes ``Metric.__init__`` raise for the next one.
             templates = await active_templates(
                 self.session, await metrics_for(self.session, scenario.use_case_id)
@@ -207,16 +221,16 @@ class EvalRunner:
         metrics = await resolve(self.session, scenario.use_case_id, templates)
         prompt_versions = _prompt_version_ids(templates)
         logger.info(
-            "Escenario %s (use_case=%s): %d turno(s), métricas=%s",
+            "Plataforma %s (escenario=%s): %d turno(s), métricas=%s",
+            platform_exec.platform,
             scenario.scenario_id,
-            scenario.use_case.name,
-            len(scenario.turns),
+            len(platform_exec.turns),
             [metric.name for metric in metrics],
         )
         history: list[tuple[str, str]] = []
         turn_scores: list[float | None] = []
         judged = False
-        for turn in scenario.turns:
+        for turn in platform_exec.turns:
             # Only selected turns are scored, but every turn feeds the conversation
             # history so a later selected turn's judge sees the full exchange.
             if turn.is_selected:
@@ -225,14 +239,15 @@ class EvalRunner:
                 judged |= await self.run_turn(turn, metrics, history, prompt_versions)
                 turn_scores.append(turn.turn_score)
             history.append((turn.prompt, turn.response))
-        scenario.average_score = scenario_average(turn_scores)
-        scenario.status = scenario_status(scenario)
+        platform_exec.average_score = execution_average(turn_scores)
+        platform_exec.status = execution_status(platform_exec)
+        platform_exec.finished_at = _now()
         await self.session.commit()
         logger.info(
-            "Escenario %s finalizado: estado=%s, promedio=%s",
-            scenario.scenario_id,
-            scenario.status,
-            scenario.average_score,
+            "Plataforma %s finalizada: estado=%s, promedio=%s",
+            platform_exec.platform,
+            platform_exec.status,
+            platform_exec.average_score,
         )
 
     async def _pace_between_turns(self) -> None:
@@ -519,15 +534,34 @@ def _prompt_version_ids(
     }
 
 
-def scenario_status(scenario: ScenarioResult) -> str:
-    """Classify a scored scenario as complete, partial, or fully failed.
+def execution_status(platform_exec: PlatformExecution) -> str:
+    """Classify one scored conversation as complete, partial, or fully failed.
 
     ``fallido`` when no turn scored, ``parcial`` when at least one turn failed to
     score, otherwise ``completado``.
     """
-    scores = [turn.turn_score for turn in scenario.turns]
+    scores = [turn.turn_score for turn in platform_exec.turns]
     if not scores or all(score is None for score in scores):
         return STATUS_FALLIDO
     if any(score is None for score in scores):
         return STATUS_PARCIAL
     return STATUS_COMPLETADO
+
+
+def rollup_status(statuses: list[str]) -> str:
+    """Roll child statuses up to their parent's.
+
+    ``fallido`` when there is nothing or every child failed, ``completado`` when they
+    all completed, otherwise ``parcial``. Shared by the scenario (over its platform
+    executions) and the run (over its scenarios).
+    """
+    if not statuses or all(status == STATUS_FALLIDO for status in statuses):
+        return STATUS_FALLIDO
+    if all(status == STATUS_COMPLETADO for status in statuses):
+        return STATUS_COMPLETADO
+    return STATUS_PARCIAL
+
+
+def scenario_status(scenario: ScenarioResult) -> str:
+    """Roll a scenario's platform executions up to its own status."""
+    return rollup_status([pe.status for pe in scenario.platform_executions])

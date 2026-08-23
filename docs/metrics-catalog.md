@@ -24,16 +24,16 @@ All rubrics, prompts and justifications are in Spanish.
 | [`faithfulness_ragas`](#faithfulness_ragas) | `rag` | `Unit()` 0–1 | 1.0 | more answer statements entailed by context (better) |
 | [`faithfulness_deepeval`](#faithfulness_deepeval) | `rag` | `Unit()` 0–1 | 1.0 | fewer answer claims contradicted by context (better) |
 | [`hallucination`](#hallucination) | `seguridad` | `Inverted(Unit())` 0–1 | 1.0 | more hallucination — worse raw score, but `Inverted` normalizes it to higher-is-better faithfulness |
-| [`relevancia`](#relevancia) | `calidad` | `Likert(0, 100)` | 1.0 | the answer addresses the query more directly (better) |
-| [`precision`](#precision) | `calidad` | `Likert(0, 100)` | 1.0 | fewer factual errors (better) |
-| [`completitud`](#completitud) | `calidad` | `Likert(0, 100)` | 1.0 | more of the question's relevant aspects covered (better) |
-| [`claridad`](#claridad) | `calidad` | `Likert(0, 100)` | 1.0 | easier to understand (better) |
-| [`razonamiento_logico`](#razonamiento_logico) | `calidad` | `Likert(0, 100)` | 1.0 | sounder logic and better-justified conclusions (better) |
-| [`contextualizacion`](#contextualizacion) | `calidad` | `Likert(0, 100)` | 1.0 | the scenario's context is understood and integrated (better) |
-| [`accionabilidad`](#accionabilidad) | `calidad` | `Likert(0, 100)` | 1.0 | more practically applicable and executable (better) |
-| [`estructura`](#estructura) | `calidad` | `Likert(0, 100)` | 1.0 | better organized and formatted (better) |
-| [`profundidad_analitica`](#profundidad_analitica) | `calidad` | `Likert(0, 100)` | 1.0 | deeper analysis of the topic (better) |
-| [`coherencia_multiturno`](#coherencia_multiturno) | `calidad` | `Likert(0, 100)` | 1.0 | more consistent across the conversation's turns (better) |
+| [`relevancia`](#relevancia) | `calidad` | `Unit()` | 1.0 | the answer addresses the query more directly (better) |
+| [`precision`](#precision) | `calidad` | `Unit()` | 1.0 | fewer factual errors (better) |
+| [`completitud`](#completitud) | `calidad` | `Unit()` | 1.0 | more of the question's relevant aspects covered (better) |
+| [`claridad`](#claridad) | `calidad` | `Unit()` | 1.0 | easier to understand (better) |
+| [`razonamiento_logico`](#razonamiento_logico) | `calidad` | `Unit()` | 1.0 | sounder logic and better-justified conclusions (better) |
+| [`contextualizacion`](#contextualizacion) | `calidad` | `Unit()` | 1.0 | the scenario's context is understood and integrated (better) |
+| [`accionabilidad`](#accionabilidad) | `calidad` | `Unit()` | 1.0 | more practically applicable and executable (better) |
+| [`estructura`](#estructura) | `calidad` | `Unit()` | 1.0 | better organized and formatted (better) |
+| [`profundidad_analitica`](#profundidad_analitica) | `calidad` | `Unit()` | 1.0 | deeper analysis of the topic (better) |
+| [`coherencia_multiturno`](#coherencia_multiturno) | `calidad` | `Unit()` | 1.0 | more consistent across the conversation's turns (better) |
 
 Which use case scores which metric is not shown here — it is data, not a property of the
 metric (see below).
@@ -448,20 +448,20 @@ Spanish rubric.**
 — one module per metric.
 
 Unlike the `rag`/`seguridad` metrics above, these are `SingleRubricMetric`s: the class is
-pure declaration (`name`, `category = MetricCategory.CALIDAD`, `scale = Likert(0.0, 100.0)`,
+pure declaration (`name`, `category = MetricCategory.CALIDAD`, `scale = Unit()`,
 `weight = 1.0`, one `rubric` prompt slot) and `SingleRubricMetric.evaluate` does the rest.
 They measure the answer as a piece of communication, so — unlike the RAG metrics — none of
 them require retrieved context, an expected output, or any other field beyond the turn
 itself.
 
 ```
-raw_score      = the judge's 0-100 verdict, clamped into the scale
-normalized     = raw / 100          # Likert(0, 100), higher is better
+raw_score      = the judge's 0.0-1.0 verdict, clamped into the scale
+normalized     = raw                # Unit is already [0, 1], higher is better
 ```
 
 The judge is told the range automatically (`judges.base.scale_spec` renders
-"Asigna una puntuación entre 0 y 100" for any `Likert`) and clamps whatever the model
-returns back into it, so a model answering `120` or `-3` cannot corrupt a rollup.
+"Asigna un número entre 0.0 y 1.0" for a `Unit`) and clamps whatever the model
+returns back into it, so a model answering `85` or `-3` cannot corrupt a rollup.
 
 ### Shared mechanics
 
@@ -485,8 +485,9 @@ returns back into it, so a model answering `120` or `-3` cannot corrupt a rollup
 
 ### The rubrics
 
-Every template states the facet under evaluation, then five bands — `90-100`, `70-89`,
-`50-69`, `30-49`, `0-29` — and asks for a score plus a brief Spanish justification. The
+Every template states the facet under evaluation, then five bands — `0.90-1.00`,
+`0.70-0.89`, `0.50-0.69`, `0.30-0.49`, `0.00-0.29` — and asks for a score plus a brief
+Spanish justification. The
 ten are listed [at the end of this section](#relevancia).
 
 The full Spanish text is seeded by migration `d7f2b6c1a840`, which also inserts the ten
@@ -533,7 +534,7 @@ selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 ### Tests
 
 `scorekeeper-engine/tests/core/metrics/test_quality_metrics.py` — the declaration of all
-ten (category, `Likert(0, 100)`, exactly one `rubric` slot with no required variables),
+ten (category, `Unit()`, exactly one `rubric` slot with no required variables),
 scoring a turn with the **shipped** Spanish rubric through a stub judge (80 → `0.8`, one
 `JudgeStep.SCORE` call), and that each seeded template really states its 0–100 bands.
 `tests/core/metrics/test_migration_prompts.py` additionally holds the new slots to the
@@ -542,53 +543,53 @@ LLM.
 
 ### `relevancia`
 
-**How directly the answer addresses the user's query.** `90-100`: addresses it fully, all
-of it pertinent. `0-29`: barely relevant, or does not address the query at all.
+**How directly the answer addresses the user's query.** `0.90-1.00`: addresses it fully, all
+of it pertinent. `0.00-0.29`: barely relevant, or does not address the query at all.
 
 ### `precision`
 
-**Accuracy of the facts, data and information given.** `90-100`: fully accurate and
-verifiable, no factual errors. `0-29`: fundamentally incorrect or unverifiable.
+**Accuracy of the facts, data and information given.** `0.90-1.00`: fully accurate and
+verifiable, no factual errors. `0.00-0.29`: fundamentally incorrect or unverifiable.
 
 ### `completitud`
 
-**How much of the question's relevant scope the answer covers.** `90-100`: exhaustive —
-every main and secondary aspect. `0-29`: very little of the topic covered.
+**How much of the question's relevant scope the answer covers.** `0.90-1.00`: exhaustive —
+every main and secondary aspect. `0.00-0.29`: very little of the topic covered.
 
 ### `claridad`
 
-**Ease of comprehension and quality of the writing.** `90-100`: extremely clear, well
-structured, precise language. `0-29`: confusing, disorganized, near unreadable.
+**Ease of comprehension and quality of the writing.** `0.90-1.00`: extremely clear, well
+structured, precise language. `0.00-0.29`: confusing, disorganized, near unreadable.
 
 ### `razonamiento_logico`
 
-**Quality of the logic, argument coherence and justification of conclusions.** `90-100`:
-sound reasoning, well-justified arguments, valid conclusions. `0-29`: fallacious or
+**Quality of the logic, argument coherence and justification of conclusions.** `0.90-1.00`:
+sound reasoning, well-justified arguments, valid conclusions. `0.00-0.29`: fallacious or
 logically incoherent.
 
 ### `contextualizacion`
 
-**Grasp and effective use of the context given in the query and the scenario.** `90-100`:
-deep understanding, expertly integrated. `0-29`: ignores or misunderstands the context.
+**Grasp and effective use of the context given in the query and the scenario.** `0.90-1.00`:
+deep understanding, expertly integrated. `0.00-0.29`: ignores or misunderstands the context.
 
 ### `accionabilidad`
 
-**Practical, executable usefulness of the information.** `90-100`: highly actionable, with
-clear implementation steps. `0-29`: not applicable, no practical direction.
+**Practical, executable usefulness of the information.** `0.90-1.00`: highly actionable, with
+clear implementation steps. `0.00-0.29`: not applicable, no practical direction.
 
 ### `estructura`
 
-**Organization, formatting and logical presentation of the information.** `90-100`: clear
-sections, headings or lists where appropriate. `0-29`: practically no organization.
+**Organization, formatting and logical presentation of the information.** `0.90-1.00`: clear
+sections, headings or lists where appropriate. `0.00-0.29`: practically no organization.
 
 ### `profundidad_analitica`
 
-**Depth of analysis and exploration of the topic.** `90-100`: deep and insightful, explores
-multiple dimensions. `0-29`: minimal or absent analysis.
+**Depth of analysis and exploration of the topic.** `0.90-1.00`: deep and insightful, explores
+multiple dimensions. `0.00-0.29`: minimal or absent analysis.
 
 ### `coherencia_multiturno`
 
-**Consistency and coherence across the conversation's turns.** `90-100`: perfectly
-coherent, thematically consistent throughout. `0-29`: incoherent, contradicts earlier
+**Consistency and coherence across the conversation's turns.** `0.90-1.00`: perfectly
+coherent, thematically consistent throughout. `0.00-0.29`: incoherent, contradicts earlier
 turns. The prior exchanges it judges arrive in `TurnView.history`, which the judge appends
 to the rubric — the metric orchestrates nothing itself.

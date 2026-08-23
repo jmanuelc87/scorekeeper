@@ -123,6 +123,40 @@ async def start_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
     return EvaluationEnqueuedResponse(run_id=run_id, status=status)
 
 
+@router.post(
+    "/{run_id}/resume",
+    response_model=EvaluationEnqueuedResponse,
+    status_code=202,
+)
+async def resume_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
+    """Re-enqueue a run that stopped before scoring every selected turn.
+
+    For a run left at ``fallido`` (its chain died on an error) or ``parcial`` (it
+    finished walking but some turns went unscored). Flips it back to ``en_cola`` and
+    enqueues the same chain: turns that already have a score are skipped rather than
+    re-judged, so a resume only pays for what is left. Returns ``202`` with ``status``
+    ``en_cola``; poll ``GET /evaluations/{run_id}`` for progress. ``404`` when the
+    ``run_id`` is unknown, ``409`` when the run is not resumable — ``en_cola`` /
+    ``en_proceso`` still have a live chain, ``ingerido`` has yet to start (use
+    ``/start``), and ``completado`` has nothing left to score.
+
+    Note that a turn abandoned after ``MAX_TURN_ATTEMPTS`` failed attempts stays
+    abandoned: resuming does not hand it more attempts.
+    """
+    try:
+        status = await run_service.resume_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
+
+    # Same off-loop enqueue as /start: kombu's SQLAlchemy transport publishes with a
+    # blocking DB round-trip.
+    await asyncio.to_thread(tasks.enqueue_run, run_id)
+    logger.info("POST /evaluations/%s/resume en cola", run_id)
+    return EvaluationEnqueuedResponse(run_id=run_id, status=status)
+
+
 @router.patch(
     "/{run_id}/turns/selection",
     response_model=TurnSelectionResponse,
