@@ -17,7 +17,7 @@ from scorekeeper.core.metrics.scale import Boolean, Inverted, Likert, Unit
 
 
 class _EjemploLikert(SingleRubricMetric):
-    """Minimal single-rubric metric on a 1-5 scale — the catalog's are all 0-100, so
+    """Minimal single-rubric metric on a 1-5 scale — the catalog's are all 0-1, so
     define one here to exercise ``SingleRubricMetric.evaluate`` and Likert normalization."""
 
     name = "_ejemplo_likert"

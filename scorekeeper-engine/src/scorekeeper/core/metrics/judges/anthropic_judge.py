@@ -33,6 +33,9 @@ if TYPE_CHECKING:
 T = TypeVar("T", bound=BaseModel)
 
 PROVIDER = "Anthropic"
+
+# Per-request timeout (seconds) for the provider client; see Settings.judge_timeout_seconds.
+DEFAULT_TIMEOUT_SECONDS = 900.0
 DEFAULT_MODEL = "claude-opus-4-8"
 # Models this judge is allowed to call. An exact-match allow-list (the provider's
 # model space is small and Anthropic-owned); extend it as new Claude models ship.
@@ -64,6 +67,7 @@ class AnthropicJudge:
         system_prompt: str | None = None,
         embedder: Any | None = None,
         step_models: StepModels | None = None,
+        timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self.model = model
         self.max_tokens = max_tokens
@@ -80,7 +84,7 @@ class AnthropicJudge:
             # max_retries=0: retrying is owned by ``judge_call``, which backs off with
             # jitter and honors Retry-After. Leaving the SDK's own retries on would
             # multiply the two budgets and make the total wait impossible to reason about.
-            client = anthropic.Anthropic(api_key=api_key, max_retries=0)
+            client = anthropic.Anthropic(api_key=api_key, max_retries=0, timeout=timeout)
         self._client: Any = client
 
     def _owns(self, model: str) -> bool:
@@ -93,7 +97,7 @@ class AnthropicJudge:
             self._step_models.for_step(step), owns=self._owns, provider=PROVIDER
         )
 
-    def _resolve(self, step: JudgeStep | None, model: str | None) -> str:
+    def resolve_model(self, step: JudgeStep | None, model: str | None) -> str:
         """An explicit ``model`` (validated) wins over ``step`` routing."""
         if model is not None:
             return owned_model(model, owns=self._owns, provider=PROVIDER)
@@ -136,7 +140,7 @@ class AnthropicJudge:
         model: str | None = None,
     ) -> JudgeVerdict:
         spec = scale_spec(scale)
-        model = self._resolve(step, model)
+        model = self.resolve_model(step, model)
         content = f"{render_prompt(rubric, turn)}\n\n{spec.instruction_es}"
         message = judge_call(
             lambda: self._client.messages.parse(
@@ -175,7 +179,7 @@ class AnthropicJudge:
         step: JudgeStep | None = None,
         model: str | None = None,
     ) -> T:
-        model = self._resolve(step, model)
+        model = self.resolve_model(step, model)
         message = judge_call(
             lambda: self._client.messages.parse(
                 model=model,

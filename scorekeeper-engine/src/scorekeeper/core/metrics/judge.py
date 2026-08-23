@@ -74,6 +74,16 @@ class Judge(Protocol):
         """
         ...
 
+    def resolve_model(self, step: JudgeStep | None, model: str | None) -> str:
+        """Resolve the model a call with ``step``/``model`` would actually run on.
+
+        Same precedence as :meth:`score`/:meth:`structured` — an explicit ``model``
+        wins over ``step`` routing — but a judge may remap it (the LM Studio judge
+        sends every pinned id to its one loaded model). Metrics that pin models call
+        it to report the model that really ran instead of the id they asked for.
+        """
+        ...
+
     def score(
         self,
         *,

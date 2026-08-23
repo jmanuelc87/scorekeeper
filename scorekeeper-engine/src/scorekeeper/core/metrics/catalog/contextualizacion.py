@@ -2,7 +2,7 @@
 
 Comprensión y uso efectivo del contexto proporcionado en la consulta y el escenario.
 
-Una sola rúbrica española de 0 a 100 y una sola llamada al juez, así que la clase
+Una sola rúbrica española de 0.0 a 1.0 y una sola llamada al juez, así que la clase
 es pura declaración: el texto de la rúbrica vive en ``prompt_versions`` y llega
 por inyección (ver :class:`~scorekeeper.core.metrics.base.SingleRubricMetric`).
 """
@@ -13,14 +13,14 @@ from scorekeeper.core.metrics.base import RUBRIC_SLOT, SingleRubricMetric
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.prompts import PromptSlot
 from scorekeeper.core.metrics.registry import register
-from scorekeeper.core.metrics.scale import Likert
+from scorekeeper.core.metrics.scale import Unit
 
 
 @register
 class Contextualizacion(SingleRubricMetric):
     name = "contextualizacion"
     category = MetricCategory.CALIDAD
-    scale = Likert(0.0, 100.0)
+    scale = Unit()  # 0-1
     prompts = (
         PromptSlot(
             slug=RUBRIC_SLOT,

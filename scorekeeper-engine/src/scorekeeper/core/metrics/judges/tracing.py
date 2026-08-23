@@ -95,17 +95,19 @@ class TracingJudge:
     def model_for(self, step: JudgeStep | None = None) -> str:
         return self._inner.model_for(step)
 
-    def _resolved_model(self, step: JudgeStep | None, model: str | None) -> str | None:
-        """Best-effort model for the trace: explicit wins, else step routing.
+    def resolve_model(self, step: JudgeStep | None, model: str | None) -> str:
+        return self._inner.resolve_model(step, model)
 
-        Mirrors the judges' own precedence (explicit ``model`` over ``step``).
+    def _resolved_model(self, step: JudgeStep | None, model: str | None) -> str | None:
+        """Best-effort model for the trace: whatever the inner judge would run on.
+
+        Asks the judge itself rather than echoing the requested id, so a judge that
+        remaps pinned models (LM Studio) is traced with the model that really runs.
         Resolution can raise for a foreign model; a trace must never mask that
         error, so fall back to ``None`` and let the real call raise.
         """
-        if model is not None:
-            return model
         try:
-            return self._inner.model_for(step)
+            return self._inner.resolve_model(step, model)
         except Exception:
             return None
 

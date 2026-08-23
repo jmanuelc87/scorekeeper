@@ -23,7 +23,11 @@ judge:
 
 Because both metrics name Anthropic models explicitly (see the per-call pins
 below), they require the Anthropic judge — under another provider the judge raises
-a Spanish ``ValueError`` for the unowned model.
+a Spanish ``ValueError`` for the unowned model. The exception is the LM Studio
+judge, which remaps every pinned id to its one loaded local model; the pins are
+therefore run through ``judge.resolve_model`` first, so the calls, the trace, and
+the reported ``judge_model`` all name the model that actually ran instead of the
+id the metric asked for.
 
 Neither metric touches ``retrieved_context`` directly. It is a single Spanish
 text blob on ``TurnView``; the judge layer renders it into every prompt (via the
@@ -139,14 +143,15 @@ class FaithfulnessRagas(MultiStepMetric):
     escalation_confidence: float = 0.7
 
     def _verify_claim(
-        self, turn: TurnView, judge: Judge, claim: str
+        self, turn: TurnView, judge: Judge, claim: str, bulk_model: str, audit_model: str
     ) -> tuple[bool, str, bool]:
         """Entailment cascade for one claim.
 
-        The cheap bulk model (Haiku) decides first; if it reports confidence below
-        ``self.escalation_confidence`` the claim is re-judged by the audit model
-        (Opus) and that verdict wins. Returns ``(entailed, justification,
-        escalated)`` where ``justification`` is from the model whose verdict is used.
+        The cheap bulk model decides first; if it reports confidence below
+        ``self.escalation_confidence`` the claim is re-judged by the audit model and
+        that verdict wins. ``bulk_model``/``audit_model`` are the pins already
+        resolved through the judge. Returns ``(entailed, justification, escalated)``
+        where ``justification`` is from the model whose verdict is used.
         """
         # Resolved once so both cascade tiers judge the exact same text.
         prompt = safe_format(self.prompt("verify"), claim=claim)
@@ -155,7 +160,7 @@ class FaithfulnessRagas(MultiStepMetric):
             turn=turn,
             schema=RagasEntailment,
             step=JudgeStep.VERIFY,
-            model=self.bulk_model,
+            model=bulk_model,
         )
         if bulk.confidence >= self.escalation_confidence:
             return bulk.entailed, bulk.justification, False
@@ -164,7 +169,7 @@ class FaithfulnessRagas(MultiStepMetric):
             turn=turn,
             schema=RagasEntailment,
             step=JudgeStep.SCORE,
-            model=self.audit_model,
+            model=audit_model,
         )
         return audit.entailed, audit.justification, True
 
@@ -190,11 +195,18 @@ class FaithfulnessRagas(MultiStepMetric):
         # Per-claim entailment via the Haiku→Opus cascade. Track which models
         # actually ran so ``judge_model`` reflects the escalations. Each claim is a
         # typed entry; escalation and the deciding model become metadata, not glue.
+        # The pins are a request: a judge may remap them (LM Studio serves one local
+        # model), so resolve them through the judge and report what actually ran.
+        bulk_model = judge.resolve_model(JudgeStep.VERIFY, self.bulk_model)
+        audit_model = judge.resolve_model(JudgeStep.SCORE, self.audit_model)
+
         supported = 0
         escalated_any = False
         verify_step = TraceStep(label="Verificación de afirmaciones")
         for claim in claims:
-            entailed, justification, escalated = self._verify_claim(turn, judge, claim)
+            entailed, justification, escalated = self._verify_claim(
+                turn, judge, claim, bulk_model, audit_model
+            )
             supported += int(entailed)
             escalated_any = escalated_any or escalated
             verify_step.entries.append(
@@ -204,7 +216,7 @@ class FaithfulnessRagas(MultiStepMetric):
                     justification=justification,
                     metadata={
                         "escalated": escalated,
-                        "model": self.audit_model if escalated else self.bulk_model,
+                        "model": audit_model if escalated else bulk_model,
                     },
                 )
             )
@@ -213,9 +225,9 @@ class FaithfulnessRagas(MultiStepMetric):
         # Fraction of statements entailed by the context = supported / n.
         raw = supported / len(claims)
         judge_model = (
-            f"{self.bulk_model} → {self.audit_model}"
-            if escalated_any
-            else self.bulk_model
+            f"{bulk_model} → {audit_model}"
+            if escalated_any and audit_model != bulk_model
+            else bulk_model
         )
         return MetricResult(
             metric_name=self.name,
@@ -285,7 +297,7 @@ class FaithfulnessDeepeval(MultiStepMetric):
             turn=turn,
             schema=Truths,
             step=JudgeStep.EXTRACT,
-            model=self.truths_model,
+            model=judge.resolve_model(JudgeStep.EXTRACT, self.truths_model),
         )
         steps.append(
             TraceStep(
@@ -326,7 +338,7 @@ class FaithfulnessDeepeval(MultiStepMetric):
                 scale=Boolean(),
                 rubric_version=self.rubric_version,
                 step=JudgeStep.VERIFY,
-                model=self.verdict_model,
+                model=judge.resolve_model(JudgeStep.VERIFY, self.verdict_model),
             )
             for claim in claims
         ]

@@ -43,6 +43,9 @@ class _RaisingJudge:
     def model_for(self, step=None) -> str:
         return "modelo-x"
 
+    def resolve_model(self, step=None, model=None) -> str:
+        return model if model is not None else "modelo-x"
+
     def score(self, **kwargs) -> JudgeVerdict:
         raise self._exc
 

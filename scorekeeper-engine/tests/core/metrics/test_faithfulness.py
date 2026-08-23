@@ -122,6 +122,30 @@ def test_ragas_low_confidence_escalates_to_audit(make_judge) -> None:
     assert entry.justification == "Confirmado"
 
 
+def test_ragas_reports_the_model_the_judge_actually_ran(make_judge) -> None:
+    # A judge that remaps every pinned id to one model (LM Studio serves a single
+    # local model): the pins must not leak into the calls, the trace, or judge_model.
+    turn = TurnView(
+        prompt="¿Cómo reinicio el router?",
+        response="El router se reinicia en 10s.",
+    )
+    judge = make_judge(
+        extractions=[
+            RagasEntailment(entailed=False, confidence=0.3, justification="Dudoso"),
+            RagasEntailment(entailed=True, confidence=1.0, justification="Confirmado"),
+        ],
+        model="local-model",
+    )
+    judge.resolve_model = lambda step=None, model=None: "local-model"
+
+    result = build(FaithfulnessRagas).evaluate(turn, judge)
+
+    assert judge.models == ["local-model", "local-model"]
+    # Both cascade tiers are the same model → no "a → b" arrow to report.
+    assert result.judge_model == "local-model"
+    assert result.trace.steps[1].entries[0].metadata["model"] == "local-model"
+
+
 def test_ragas_no_statements_is_not_applicable(make_judge) -> None:
     # Empty response → syntok yields no sentences → nothing to verify.
     turn = TurnView(prompt="¿Cómo reinicio el router?", response="")

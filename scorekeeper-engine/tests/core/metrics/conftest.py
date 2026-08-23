@@ -49,6 +49,10 @@ class StubJudge:
         # so metrics reporting judge.model_for(step) see the value tests pass in.
         return self.model
 
+    def resolve_model(self, step=None, model=None) -> str | None:
+        # Mirrors the real judges' precedence: an explicit pin wins over routing.
+        return model if model is not None else self.model
+
     def score(
         self, *, rubric, turn, scale, rubric_version=None, step=None, model=None
     ) -> JudgeVerdict:
