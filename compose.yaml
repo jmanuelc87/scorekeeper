@@ -1,6 +1,10 @@
 services:
   database:
-    image: postgres:17-alpine
+    # pgvector's image, not stock postgres: the schema has a ``vector`` column
+    # (retrieved_document_embeddings) and ``CREATE EXTENSION vector`` needs vector.so,
+    # which postgres:17-alpine does not ship. Same PG major, so the postgres_data volume
+    # carries over; the base image does change from alpine to debian.
+    image: pgvector/pgvector:pg17
     environment:
       POSTGRES_DB: scorekeeper
       POSTGRES_USER: scorekeeper
@@ -17,7 +21,13 @@ services:
 
   migrate:
     build: scorekeeper-engine
-    command: ["alembic", "upgrade", "head"]
+    # Two schemas, both created exactly once here: the application's (Alembic) and the
+    # Celery broker's. The broker's matters because kombu creates its tables lazily on
+    # first connect with a non-atomic check-then-create — three worker replicas booting
+    # together race and all but one die on "duplicate key ... pg_class_relname_nsp_index".
+    # Workers wait on this service completing, so by the time they connect there is
+    # nothing left to create. See scorekeeper.broker.
+    command: ["sh", "-c", "alembic upgrade head && scorekeeper-init-broker"]
     # Base settings (judge keys, etc.) come from .env; the values below override
     # the ones that must differ inside the Docker network (env wins over env_file).
     env_file: scorekeeper-engine/.env
@@ -48,6 +58,9 @@ services:
     environment: *backend-environment
     deploy:
       replicas: 3
+    # A worker that dies on a transient boot failure (broker not reachable yet, a lost
+    # database connection) should come back rather than leave the replica down.
+    restart: on-failure
     depends_on:
       database:
         condition: service_healthy

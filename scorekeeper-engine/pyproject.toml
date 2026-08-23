@@ -16,6 +16,10 @@ dependencies = [
   "httpx2>=2.7.0",
   "numpy>=2.1,<3",
   "openpyxl>=3.1,<4",
+  # Core, not an extra: db.models references the ``vector`` column type at module scope,
+  # and that module is imported by every process (API, worker, Alembic env). The lazy
+  # SDK-import convention used for the judge providers cannot apply to a column type.
+  "pgvector>=0.3,<1",
   # The app itself talks to Postgres over asyncpg; psycopg stays because kombu's
   # SQLAlchemy broker transport is sync-only (see Settings.broker_url, which rewrites
   # the async DSN back to postgresql+psycopg for Celery). Not dead weight — don't drop it.
@@ -60,6 +64,9 @@ retrieval = [
 
 [project.scripts]
 scorekeeper-api = "scorekeeper.main:main"
+# Pre-creates the SQLAlchemy broker's schema so concurrent workers do not race to
+# create it; see scorekeeper.broker. No-op when CELERY_BROKER_URL points elsewhere.
+scorekeeper-init-broker = "scorekeeper.broker:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/scorekeeper"]
