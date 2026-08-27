@@ -22,12 +22,12 @@ judge:
   truths extraction, Opus for the per-claim verdict).
 
 Because both metrics name Anthropic models explicitly (see the per-call pins
-below), they require the Anthropic judge — under another provider the judge raises
-a Spanish ``ValueError`` for the unowned model. The exception is the LM Studio
-judge, which remaps every pinned id to its one loaded local model; the pins are
-therefore run through ``judge.resolve_model`` first, so the calls, the trace, and
-the reported ``judge_model`` all name the model that actually ran instead of the
-id the metric asked for.
+below), they require a judge that owns those models — the Anthropic judge or the
+Claude Agent one; under another provider the judge raises a Spanish ``ValueError``
+for the unowned model. The pins are nonetheless run through ``judge.resolve_model``
+first (a judge may remap them), so the calls, the trace, and the reported
+``judge_model`` all name the model that actually ran instead of the id the metric
+asked for.
 
 Neither metric touches ``retrieved_context`` directly. It is a single Spanish
 text blob on ``TurnView``; the judge layer renders it into every prompt (via the
@@ -195,8 +195,8 @@ class FaithfulnessRagas(MultiStepMetric):
         # Per-claim entailment via the Haiku→Opus cascade. Track which models
         # actually ran so ``judge_model`` reflects the escalations. Each claim is a
         # typed entry; escalation and the deciding model become metadata, not glue.
-        # The pins are a request: a judge may remap them (LM Studio serves one local
-        # model), so resolve them through the judge and report what actually ran.
+        # The pins are a request: a judge may remap them, so resolve them through the
+        # judge and report what actually ran.
         bulk_model = judge.resolve_model(JudgeStep.VERIFY, self.bulk_model)
         audit_model = judge.resolve_model(JudgeStep.SCORE, self.audit_model)
 

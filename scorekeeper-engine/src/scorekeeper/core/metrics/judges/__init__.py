@@ -12,9 +12,9 @@ from typing import TYPE_CHECKING
 
 from scorekeeper.config.settings import get_settings
 from scorekeeper.core.metrics.judge import JudgeStep
+from scorekeeper.core.metrics.judges.agent_judge import AgentJudge
 from scorekeeper.core.metrics.judges.anthropic_judge import AnthropicJudge
 from scorekeeper.core.metrics.judges.base import JudgeError, StepModels
-from scorekeeper.core.metrics.judges.lmstudio_judge import LMStudioJudge
 from scorekeeper.core.metrics.judges.openai_judge import OpenAIJudge
 from scorekeeper.core.metrics.judges.tracing import TracingJudge
 
@@ -23,9 +23,9 @@ if TYPE_CHECKING:
     from scorekeeper.core.metrics.judge import Judge
 
 __all__ = [
+    "AgentJudge",
     "AnthropicJudge",
     "JudgeError",
-    "LMStudioJudge",
     "OpenAIJudge",
     "TracingJudge",
     "make_judge",
@@ -48,6 +48,25 @@ def _step_models(settings: Settings, default_model: str) -> StepModels:
             JudgeStep.EXTRACT: settings.judge_extract_model,
             JudgeStep.SCORE: settings.judge_score_model,
         },
+    )
+
+
+def _embedder(settings: Settings) -> Judge | None:
+    """OpenAI-backed embeddings backend for providers with no embeddings endpoint.
+
+    Anthropic and the Agent SDK offer none, so similarity metrics borrow this one.
+    ``openai_base_url`` points it at any OpenAI-compatible endpoint (e.g. a local
+    server), so such a run embeds without reaching api.openai.com. Returns ``None``
+    when no key is configured — ``embed()`` then raises only if a metric needs it.
+    """
+    if not settings.openai_api_key:
+        return None
+    return OpenAIJudge(
+        model=settings.openai_judge_model,
+        api_key=settings.openai_api_key,
+        base_url=settings.openai_base_url,
+        embedding_model=settings.openai_embedding_model,
+        timeout=settings.judge_timeout_seconds,
     )
 
 
@@ -79,16 +98,8 @@ def make_judge(settings: Settings | None = None) -> Judge:
                 "Falta ANTHROPIC_API_KEY para el juez de Anthropic."
             )
         # Anthropic has no embeddings endpoint: attach an OpenAI-backed embedder
-        # when a key is available so similarity metrics still work; otherwise leave
-        # it unset (embed() will raise only if a metric actually needs it).
-        embedder = None
-        if settings.openai_api_key:
-            embedder = OpenAIJudge(
-                model=settings.openai_judge_model,
-                api_key=settings.openai_api_key,
-                embedding_model=settings.openai_embedding_model,
-                timeout=settings.judge_timeout_seconds,
-            )
+        # when a key is available so similarity metrics still work.
+        embedder = _embedder(settings)
         return _traced(
             AnthropicJudge(
                 model=settings.anthropic_judge_model,
@@ -109,6 +120,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
             OpenAIJudge(
                 model=settings.openai_judge_model,
                 api_key=settings.openai_api_key,
+                base_url=settings.openai_base_url,
                 system_prompt=settings.judge_system_prompt,
                 embedding_model=settings.openai_embedding_model,
                 step_models=_step_models(settings, settings.openai_judge_model),
@@ -117,23 +129,26 @@ def make_judge(settings: Settings | None = None) -> Judge:
             settings,
         )
 
-    if provider in ("lmstudio", "local", "lm-studio"):
-        # Local OpenAI-compatible server (LM Studio). No API key gate: it needs none.
-        # Remaps every requested/pinned model to the loaded local model, so all
-        # metrics run end-to-end (see LMStudioJudge).
+    if provider in ("agent", "claude-agent", "claude_agent"):
+        # Claude Agent SDK judge. No API key gate: it authenticates through the local
+        # Claude Code session, or — where there is none, as in Docker — through the
+        # CLAUDE_CODE_OAUTH_TOKEN forwarded to the CLI. Like the Anthropic judge it has
+        # no embeddings endpoint, so an OpenAI-backed embedder is attached when a key
+        # is available.
+        embedder = _embedder(settings)
         return _traced(
-            LMStudioJudge(
-                model=settings.lmstudio_judge_model,
-                base_url=settings.lmstudio_base_url,
-                api_key=settings.lmstudio_api_key,
+            AgentJudge(
+                model=settings.agent_judge_model,
                 system_prompt=settings.judge_system_prompt,
-                embedding_model=settings.lmstudio_embedding_model,
+                embedder=embedder,
+                step_models=_step_models(settings, settings.agent_judge_model),
                 timeout=settings.judge_timeout_seconds,
+                oauth_token=settings.claude_code_oauth_token,
             ),
             settings,
         )
 
     raise ValueError(
         f"Proveedor de juez desconocido: {settings.judge_provider!r}. "
-        "Usa 'anthropic', 'openai' o 'lmstudio'."
+        "Usa 'anthropic', 'openai' o 'agent'."
     )

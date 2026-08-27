@@ -47,8 +47,8 @@ JsonColumn = JSON().with_variant(JSONB, "postgresql")
 
 # Width of a stored embedding, fixed by the default embedder: ``openai_embedding_model``
 # is ``text-embedding-3-small`` (1536 dimensions). Fixed rather than free because pgvector
-# can only index a column of known width. Note this excludes ``lmstudio_embedding_model``
-# (nomic-embed-text, 768) — a local-mode run cannot populate the table.
+# can only index a column of known width, so an embedder of a different width cannot
+# populate the table.
 EMBEDDING_DIMENSIONS = 1536
 
 # A real ``vector`` on PostgreSQL; JSON on the SQLite fallback, which has no such type.

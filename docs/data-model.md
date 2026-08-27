@@ -410,9 +410,8 @@ the consumer. The embedding *producer* already exists behind the `Judge.embed` s
 
 The width is fixed at **1536** (`db.models.EMBEDDING_DIMENSIONS`), matching the default
 embedder `openai_embedding_model` = `text-embedding-3-small`. Fixed rather than free
-because pgvector can only index a column of known width; the cost is that
-`lmstudio_embedding_model` (nomic-embed-text, 768 dimensions) does not fit, so a
-local-mode run cannot populate the table.
+because pgvector can only index a column of known width; the cost is that an embedder
+of a different width does not fit and cannot populate the table.
 
 The table is **PostgreSQL-only in practice**. It needs the `vector` extension — the
 Compose `database` service runs `pgvector/pgvector:pg17` for that reason — and carries an

@@ -3,7 +3,7 @@
 Every call a metric makes to a provider funnels through the ``Judge`` seam
 (:class:`scorekeeper.core.metrics.judge.Judge`) — ``score``/``structured``/``embed`` on
 the concrete judges are the only places that touch a real SDK client. Wrapping the
-seam therefore traces *all* providers (Anthropic, OpenAI, LM Studio) uniformly,
+seam therefore traces *all* providers (Anthropic, OpenAI, Claude Agent) uniformly,
 without importing any SDK and without changing a single metric.
 
 :class:`TracingJudge` wraps another judge, delegates every call to it, and emits a
@@ -102,7 +102,7 @@ class TracingJudge:
         """Best-effort model for the trace: whatever the inner judge would run on.
 
         Asks the judge itself rather than echoing the requested id, so a judge that
-        remaps pinned models (LM Studio) is traced with the model that really runs.
+        remaps pinned models is traced with the model that really runs.
         Resolution can raise for a foreign model; a trace must never mask that
         error, so fall back to ``None`` and let the real call raise.
         """
