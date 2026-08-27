@@ -78,9 +78,9 @@ class Judge(Protocol):
         """Resolve the model a call with ``step``/``model`` would actually run on.
 
         Same precedence as :meth:`score`/:meth:`structured` — an explicit ``model``
-        wins over ``step`` routing — but a judge may remap it (the LM Studio judge
-        sends every pinned id to its one loaded model). Metrics that pin models call
-        it to report the model that really ran instead of the id they asked for.
+        wins over ``step`` routing — but a judge may remap it (e.g. a backend that
+        serves a single model). Metrics that pin models call it to report the model
+        that really ran instead of the id they asked for.
         """
         ...
 

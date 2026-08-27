@@ -68,14 +68,24 @@ PostgreSQL instance from the host.
 ### Judge providers
 
 Scoring uses an LLM-as-a-judge selected by `JUDGE_PROVIDER` (`anthropic`, `openai`,
-or `lmstudio`); install the SDKs with `uv sync --extra judges`. For end-to-end
-testing with no API key or external cost, set `JUDGE_PROVIDER=lmstudio` and point
-`LMSTUDIO_BASE_URL` at a running [LM Studio](https://lmstudio.ai/) server (default
-`http://localhost:1234/v1`). The local judge remaps every requested/pinned model to
-the loaded model named by `LMSTUDIO_JUDGE_MODEL`, so every metric runs against
-whatever LM Studio has loaded; `answer_relevance` additionally needs an embedding
-model loaded (`LMSTUDIO_EMBEDDING_MODEL`). See `scorekeeper-engine/.env.example` for all
-knobs.
+or `agent`); install the SDKs with `uv sync --extra judges`. For end-to-end testing
+with no API key to configure, set `JUDGE_PROVIDER=agent`: that judge runs every call
+through the Claude Code CLI bundled with
+[claude-agent-sdk](https://github.com/anthropics/claude-agent-sdk-python) and
+authenticates with the local Claude Code session (log in once with `claude`). It
+calls the same Claude models as the Anthropic judge — `AGENT_JUDGE_MODEL` must name
+one of them — with the built-in tools disabled, so each call is a plain rubric
+evaluation.
+
+Under Docker the container has no Claude Code session to authenticate with, so set
+`CLAUDE_CODE_OAUTH_TOKEN` in `scorekeeper-engine/.env` (generate one with `claude
+setup-token`); the judge forwards it to the CLI it spawns. Compose already passes the
+whole `.env` to `api`, `worker` and `migrate`, so no extra wiring is needed.
+
+`answer_relevance` still needs embeddings, which run through an
+OpenAI-compatible endpoint (`OPENAI_API_KEY`); set `OPENAI_BASE_URL` to point them at a
+local server (LM Studio, Ollama, vLLM) and the run stays entirely local. See
+`scorekeeper-engine/.env.example` for all knobs.
 
 ### Reading results
 
