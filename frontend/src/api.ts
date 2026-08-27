@@ -190,6 +190,21 @@ export async function createUseCase(name: string, metrics: string[]): Promise<Us
 }
 
 /**
+ * List every use case with its metric names via GET /api/v1/use-cases.
+ * `default` comes back with an empty `metrics` list — it scores every
+ * registered metric rather than a composed subset.
+ */
+export async function fetchUseCases(): Promise<UseCase[]> {
+  const response = await fetch(`${API_URL}/api/v1/use-cases`);
+
+  if (!response.ok) {
+    throw new Error(`Request failed (${response.status})`);
+  }
+
+  return response.json() as Promise<UseCase[]>;
+}
+
+/**
  * Fetch every prompt slot the registered metrics render via GET /api/v1/prompts.
  * Each entry carries the version currently active, or null when none is published.
  */
