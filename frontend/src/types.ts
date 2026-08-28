@@ -199,3 +199,39 @@ export interface PromptSlot {
 export interface PromptSlotDetail extends Omit<PromptSlot, "active_version"> {
   versions: PromptVersion[];
 }
+
+/**
+ * A configured credential provider as returned by GET /api/v1/auth-providers.
+ * The certificate private key is write-only: reads only say whether one is stored.
+ */
+export interface AuthProvider {
+  id: string;
+  provider: string;
+  host: string;
+  enabled: boolean;
+  tenant_id: string | null;
+  client_id: string | null;
+  thumbprint: string | null;
+  site_url: string | null;
+  has_private_key: boolean;
+  settings: Record<string, unknown> | null;
+  created_at: string;
+  updated_at: string;
+}
+
+/**
+ * Body for creating or updating a credential provider. On an update only the keys
+ * present are changed; sending `private_key` rotates the stored key and an empty
+ * one clears it.
+ */
+export interface AuthProviderInput {
+  provider?: string;
+  host?: string;
+  enabled?: boolean;
+  tenant_id?: string | null;
+  client_id?: string | null;
+  thumbprint?: string | null;
+  site_url?: string | null;
+  settings?: Record<string, unknown> | null;
+  private_key?: string | null;
+}
