@@ -35,8 +35,10 @@ from scorekeeper.core.services.read_models import (
     retrieve_turn_traces,
 )
 from scorekeeper.core.services.scoring import run_evaluation
+from scorekeeper.core.services.serializers import serialize_metric_trace
 from scorekeeper.db.models import (
     BenchmarkRun,
+    JudgeCall,
     MetricScore,
     PlatformExecution,
     ScenarioResult,
@@ -258,9 +260,46 @@ async def test_retrieve_turn_traces_minimal_omits_provenance(session: AsyncSessi
     traces = await retrieve_turn_traces(str(turn.id), include_provenance=False, session=session)
 
     entry = traces[0]
-    assert set(entry) == {"metric_name", "trace"}
+    # ``judge_calls`` is not provenance — it is the trace itself, one entry per LLM
+    # call — so it stays in the minimal shape.
+    assert set(entry) == {"metric_name", "trace", "judge_calls"}
     assert entry["metric_name"] == "utilidad"
     assert entry["trace"]["steps"][0]["entries"][0]["value"] == pytest.approx(0.8)
+
+
+def test_serialize_metric_trace_lists_the_judge_calls() -> None:
+    """Each persisted call is surfaced whole: the exact prompt is the point of the row."""
+    score = MetricScore(
+        metric_name="utilidad",
+        score=0.8,
+        judge_calls=[
+            JudgeCall(
+                sequence=0,
+                step="score",
+                model="judge-test",
+                system_prompt="Sistema.",
+                prompt="Evalúa el turno",
+                latency_ms=42,
+                input_tokens=3,
+                output_tokens=1,
+            )
+        ],
+    )
+
+    entry = serialize_metric_trace(score, False)
+
+    assert entry["judge_calls"] == [
+        {
+            "sequence": 0,
+            "step": "score",
+            "model": "judge-test",
+            "system_prompt": "Sistema.",
+            "prompt": "Evalúa el turno",
+            "latency_ms": 42,
+            "input_tokens": 3,
+            "output_tokens": 1,
+        }
+    ]
 
 
 async def test_retrieve_turn_traces_unknown_or_malformed_is_none(session: AsyncSession, registry) -> None:

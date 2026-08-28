@@ -12,6 +12,7 @@ from scorekeeper.core.retrieval.types import (
     RetrievalOutcome,
     RetrievalReport,
     RetrievalStatus,
+    Sentence,
     SourceFormat,
     SourceRef,
 )
@@ -34,9 +35,17 @@ def test_to_document_maps_fields() -> None:
     doc = ExtractedContent(text="# Titulo\n- a", page=3).to_document(_ref(0), _loc())
     assert doc.name == "cognos"
     assert doc.document == "Rep.pdf"
-    assert doc.content == "# Titulo\n- a"
+    # No whole-document text survives assemble: the sentences do, and the embedding
+    # phase turns them into the chunks a judge eventually reads.
+    assert doc.content == ""
     # url keeps the #page anchor from the source reference (not the fetch key).
     assert doc.url == "https://h/Rep.pdf#page=3"
+
+
+def test_to_document_carries_the_segmented_sentences() -> None:
+    sentences = [Sentence(page=3, index=0, text="Una.")]
+    doc = ExtractedContent(text="Una.", page=3, sentences=sentences).to_document(_ref(0), _loc())
+    assert doc.sentences == sentences
 
 
 def test_to_document_falls_back_when_filename_empty() -> None:
@@ -60,7 +69,7 @@ def test_assembled_non_empty_is_retrieved() -> None:
     outcome = RetrievalOutcome.assembled(_ref(0), _loc(), ExtractedContent(text="# md"), auth=auth)
     assert outcome.status is RetrievalStatus.RETRIEVED
     assert outcome.document is not None
-    assert outcome.document.content == "# md"
+    assert outcome.document.document == "Rep.pdf"
     assert outcome.locator is not None  # threaded through
     assert outcome.auth is auth  # threaded through
     assert outcome.error is None
@@ -90,14 +99,26 @@ def test_to_context_excludes_empty_preserves_order_and_duplicates() -> None:
     assert len(context.documents) == 3
 
 
-def test_to_context_markdown_survives_into_judge_text() -> None:
-    outcome = RetrievalOutcome.assembled(
-        _ref(0, name="Reporte"), _loc(), ExtractedContent(text="# Titulo\n\n| A | B |\n| --- | --- |")
+def test_to_context_carries_sentences_not_markdown() -> None:
+    """Assemble hands on the segmented sentences; the markdown blob stops here.
+
+    Nothing is renderable yet — a document only gains judge-readable text once the
+    embedding phase has chunked those sentences.
+    """
+    extracted = ExtractedContent(
+        text="# Titulo\n\nUna oración. Otra oración.",
+        sentences=[
+            Sentence(page=1, index=0, text="Una oración."),
+            Sentence(page=1, index=1, text="Otra oración."),
+        ],
     )
+    outcome = RetrievalOutcome.assembled(_ref(0, name="Reporte"), _loc(), extracted)
     report = RetrievalReport(source_format=SourceFormat.PIPE_LABELLED, outcomes=[outcome])
     context = report.to_context()
-    rendered = context.render()
-    assert "# Titulo" in rendered
-    assert "| A | B |" in rendered
-    # node_texts feeds groundedness metrics; the markdown must be present there too.
-    assert any("# Titulo" in node for node in context.node_texts())
+    assert [s.text for s in context.documents[0].sentences] == [
+        "Una oración.",
+        "Otra oración.",
+    ]
+    # Only the header renders: there are no chunks yet.
+    assert context.render() == "Reporte (Rep.pdf — https://h/Rep.pdf#page=3)"
+    assert context.node_texts() == ["Rep.pdf"]

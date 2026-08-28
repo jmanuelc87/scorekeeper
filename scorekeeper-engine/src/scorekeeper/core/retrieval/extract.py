@@ -9,15 +9,27 @@ page happens here, inside ``extract``.
 
 Per document type:
 
-* **PDF** — the exact page (``locator.page`` from a ``#page=N`` fragment) is sliced out with
-  ``pypdf`` into a one-page document, then converted; with no page, the whole PDF is converted.
+* **PDF** — page by page. With ``locator.page`` (from a ``#page=N`` fragment) only that page
+  is sliced out with ``pypdf`` and converted; with no page **every** page is sliced and
+  converted in turn, so each sentence keeps the page it came from. That costs one conversion
+  per page instead of one for the whole file — the price of page attribution, since MarkItDown
+  emits no page boundaries — and the concatenated markdown is not byte-identical to converting
+  the file in one pass (a table straddling a page break is split).
 * **DOCX** (Word ``.docx``) — the whole document is converted; ``.docx`` stores no page
   boundaries, so the page selector is ignored. Legacy binary ``.doc`` is not supported.
 * **HTML** — the fetched page bytes are converted.
 
 Conversion goes through **MarkItDown** (imported lazily; ships in the optional ``retrieval``
-extra), preserving titles, lists, and tables. **Images/graphics are dropped**: MarkItDown
-keeps images as markdown, so this stage strips image markup from the result.
+extra), preserving titles, lists, and tables. **Images/graphics and links are dropped**:
+MarkItDown keeps both as markdown, so this stage strips image markup from the result and
+strips links out of it entirely — anchor text included, along with a URL that is only a URL
+(autolink or bare).
+
+Every converted document is then segmented into :class:`~scorekeeper.core.retrieved_context.Sentence`
+with ``syntok`` (``core.text.split_sentences``, the same segmenter ``faithfulness`` uses on the
+answer). The sentences carry their page and a document-wide 0-based index; they are working
+material for a later chunker, not judge input — ``ExtractedContent.text`` remains what a judge
+reads, so the assemble stage's blank-markdown rule is unchanged.
 """
 
 from __future__ import annotations
@@ -26,7 +38,14 @@ import re
 from io import BytesIO
 from typing import TYPE_CHECKING
 
-from scorekeeper.core.retrieval.types import DocType, DocumentLocator, ExtractedContent, FetchedDocument
+from scorekeeper.core.retrieval.types import (
+    DocType,
+    DocumentLocator,
+    ExtractedContent,
+    FetchedDocument,
+    Sentence,
+)
+from scorekeeper.core.text import split_sentences
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -37,12 +56,28 @@ _SUPPORTED = frozenset({DocType.PDF, DocType.DOCX, DocType.HTML})
 # MarkItDown ``file_extension`` hint per document type.
 _EXTENSIONS = {DocType.PDF: ".pdf", DocType.DOCX: ".docx", DocType.HTML: ".html"}
 
-# Image markup to remove (inline / reference markdown images and raw <img> tags), plus a
-# collapser for the blank-line runs their removal can leave behind.
+# Image markup to remove (inline / reference markdown images and raw <img> tags).
 _IMAGE_INLINE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _IMAGE_REFERENCE = re.compile(r"!\[[^\]]*\]\[[^\]]*\]")
 _IMAGE_TAG = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+
+# Link markup to remove: a link goes entirely — anchor text and target alike — and so does a
+# bare or autolinked URL.
+_LINK_INLINE = re.compile(r"\[[^\]]*\]\([^)]*\)")
+_LINK_REFERENCE = re.compile(r"\[[^\]]*\]\[[^\]]*\]")
+_LINK_DEFINITION = re.compile(r"^[ \t]*\[[^\]]*\]:[ \t]*\S+.*$", re.MULTILINE)
+_LINK_TAG = re.compile(r"<a\b[^>]*>.*?</a>|</?a\b[^>]*>", re.IGNORECASE | re.DOTALL)
+_AUTOLINK = re.compile(r"<(?:https?://|mailto:)[^>\s]*>", re.IGNORECASE)
+_BARE_URL = re.compile(
+    r"\(?(?:https?://|www\.)[^\s<>)\]]*[^\s<>)\].,;:!?\"']\)?", re.IGNORECASE
+)
+
+# Collapsers for the blank-line / space runs the removals above can leave behind. The
+# space run is any horizontal whitespace but a newline — tabs and the non-breaking /
+# unicode spaces an HTML conversion emits (``&nbsp;``) included — so two words never stay
+# separated by more than one space.
 _BLANK_RUN = re.compile(r"\n{3,}")
+_SPACE_RUN = re.compile(r"[^\S\n\r\f\v]{2,}")
 
 
 class ExtractError(Exception):
@@ -75,22 +110,36 @@ class MarkdownContentExtractor:
     def extract(
         self, document: FetchedDocument, locator: DocumentLocator
     ) -> ExtractedContent:
-        """Convert ``document`` to markdown, filtering a PDF to ``locator.page`` when set."""
+        """Convert ``document`` to markdown per page and segment it into sentences.
+
+        A PDF yields one markdown block per page (only ``locator.page`` when set, else every
+        page); DOCX/HTML yield a single pageless block. The blocks are joined into ``text``
+        and segmented, in order, into ``sentences``.
+        """
         if document.doc_type is DocType.PDF:
-            markdown = self._extract_pdf(document.body, locator.page)
+            pages = self._extract_pdf(document.body, locator.page)
         elif document.doc_type in (DocType.DOCX, DocType.HTML):
-            markdown = self._convert(document.body, _EXTENSIONS[document.doc_type])
+            pages = [(None, self._convert(document.body, _EXTENSIONS[document.doc_type]))]
         else:
             raise ExtractError(f"Tipo de documento no soportado: {document.doc_type}")
-        return ExtractedContent(text=_strip_images(markdown).strip(), page=locator.page)
+
+        # Strip images and links before segmenting so no sentence is built out of markup.
+        blocks = [(page, _strip_markup(markdown).strip()) for page, markdown in pages]
+        sentences: list[Sentence] = []
+        for page, block in blocks:
+            for sentence in split_sentences(block):
+                sentences.append(Sentence(page=page, index=len(sentences), text=sentence))
+        text = "\n\n".join(block for _, block in blocks if block)
+        return ExtractedContent(text=text, page=locator.page, sentences=sentences)
 
     # -- helpers ------------------------------------------------------------------------
 
-    def _extract_pdf(self, body: bytes, page: int | None) -> str:
-        """Convert the whole PDF, or just ``page`` (1-based) sliced out with ``pypdf``."""
-        if page is None:
-            return self._convert(body, ".pdf")
+    def _extract_pdf(self, body: bytes, page: int | None) -> list[tuple[int, str]]:
+        """Convert ``page`` (1-based), or every page, as ``(page number, markdown)`` pairs.
 
+        Each page is sliced into its own one-page document with ``pypdf`` before conversion,
+        which is what attributes a sentence to a page. A PDF with no pages yields ``[]``.
+        """
         from pypdf import PdfReader, PdfWriter
 
         try:
@@ -98,15 +147,19 @@ class MarkdownContentExtractor:
             total = len(reader.pages)
         except Exception as exc:  # malformed PDF
             raise ExtractError(f"No se pudo leer el PDF: {exc}") from exc
-        if not 1 <= page <= total:
+        if page is not None and not 1 <= page <= total:
             raise PageNotFoundError(
                 f"La página {page} no existe (el documento tiene {total} página(s))"
             )
-        writer = PdfWriter()
-        writer.add_page(reader.pages[page - 1])
-        sliced = BytesIO()
-        writer.write(sliced)
-        return self._convert(sliced.getvalue(), ".pdf")
+        numbers = [page] if page is not None else range(1, total + 1)
+        converted: list[tuple[int, str]] = []
+        for number in numbers:
+            writer = PdfWriter()
+            writer.add_page(reader.pages[number - 1])
+            sliced = BytesIO()
+            writer.write(sliced)
+            converted.append((number, self._convert(sliced.getvalue(), ".pdf")))
+        return converted
 
     def _convert(self, body: bytes, file_extension: str) -> str:
         """Convert ``body`` to markdown via the injected converter or MarkItDown."""
@@ -127,9 +180,20 @@ class MarkdownContentExtractor:
         return result.text_content
 
 
-def _strip_images(markdown: str) -> str:
-    """Remove image markup (markdown images and raw ``<img>`` tags) from ``markdown``."""
+def _strip_markup(markdown: str) -> str:
+    """Remove image and link markup from ``markdown``.
+
+    Images (markdown and raw ``<img>``) go entirely, and so does every link — markdown links,
+    reference links and their definitions, ``<a>`` elements — anchor text included, along with
+    a URL that is only a URL (autolink or bare).
+    """
     markdown = _IMAGE_INLINE.sub("", markdown)
     markdown = _IMAGE_REFERENCE.sub("", markdown)
     markdown = _IMAGE_TAG.sub("", markdown)
-    return _BLANK_RUN.sub("\n\n", markdown)
+    markdown = _LINK_INLINE.sub("", markdown)
+    markdown = _LINK_REFERENCE.sub("", markdown)
+    markdown = _LINK_DEFINITION.sub("", markdown)
+    markdown = _LINK_TAG.sub("", markdown)
+    markdown = _AUTOLINK.sub("", markdown)
+    markdown = _BARE_URL.sub("", markdown)
+    return _BLANK_RUN.sub("\n\n", _SPACE_RUN.sub(" ", markdown))

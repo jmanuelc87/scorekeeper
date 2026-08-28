@@ -47,6 +47,7 @@ from scorekeeper.core.metrics.judges.base import (
     clamp,
     judge_call,
     owned_model,
+    record_judge_call,
     record_usage,
     render_prompt,
     require_parsed,
@@ -184,9 +185,10 @@ class AgentJudge:
         options = self._client.ClaudeAgentOptions(
             model=model,
             system_prompt=self.system_prompt,
-            # No tools, one turn: this judge evaluates a rubric, it does not act.
+            # No tools: this judge evaluates a rubric, it does not act. The turn
+            # budget leaves room for the SDK to retry a malformed structured answer.
             tools=[],
-            max_turns=1,
+            max_turns=5,
             output_format={"type": "json_schema", "schema": schema.model_json_schema()},
             env=self._env,
             **self._thinking_kwargs(model),
@@ -246,12 +248,16 @@ class AgentJudge:
     ) -> JudgeVerdict:
         spec = scale_spec(scale)
         model = self.resolve_model(step, model)
-        parsed = self._call(
-            prompt=f"{render_prompt(rubric, turn)}\n\n{spec.instruction_es}",
-            model=model,
-            schema=_ScoreResponse,
-            action="la puntuación",
-        )
+        prompt = f"{render_prompt(rubric, turn)}\n\n{spec.instruction_es}"
+        with record_judge_call(
+            step=step, model=model, system_prompt=self.system_prompt, prompt=prompt
+        ):
+            parsed = self._call(
+                prompt=prompt,
+                model=model,
+                schema=_ScoreResponse,
+                action="la puntuación",
+            )
         return JudgeVerdict(
             score=clamp(parsed.score, spec),
             justification=parsed.justification,
@@ -268,12 +274,16 @@ class AgentJudge:
         model: str | None = None,
     ) -> T:
         model = self.resolve_model(step, model)
-        return self._call(
-            prompt=render_prompt(instruction, turn),
-            model=model,
-            schema=schema,
-            action="la extracción",
-        )
+        prompt = render_prompt(instruction, turn)
+        with record_judge_call(
+            step=step, model=model, system_prompt=self.system_prompt, prompt=prompt
+        ):
+            return self._call(
+                prompt=prompt,
+                model=model,
+                schema=schema,
+                action="la extracción",
+            )
 
     def embed(self, *, texts: list[str], model: str | None = None) -> list[list[float]]:
         """Embed ``texts`` via the configured embeddings backend.

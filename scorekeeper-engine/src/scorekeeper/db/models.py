@@ -40,16 +40,19 @@ from sqlalchemy.orm import (
     relationship,
 )
 
-from scorekeeper.core.retrieved_context import RetrievedDocument
+from scorekeeper.core.retrieved_context import Chunk, RetrievedDocument
 
 # JSONB on PostgreSQL, plain JSON on the SQLite fallback.
 JsonColumn = JSON().with_variant(JSONB, "postgresql")
 
-# Width of a stored embedding, fixed by the default embedder: ``openai_embedding_model``
-# is ``text-embedding-3-small`` (1536 dimensions). Fixed rather than free because pgvector
-# can only index a column of known width, so an embedder of a different width cannot
-# populate the table.
-EMBEDDING_DIMENSIONS = 1536
+# Width of a stored embedding. 768 is nomic-embed-text, the model an OpenAI-compatible
+# local server (LM Studio, reached through ``openai_base_url``) serves. Fixed rather than
+# free because pgvector can only index a column of known width — so this and
+# ``openai_embedding_model`` must agree: an embedder of another width (OpenAI's
+# ``text-embedding-3-small`` is 1536) cannot populate the table, and
+# ``retrieval.embed.OpenAIEmbedder`` rejects its vectors before the INSERT.
+# Changing it takes a migration *and* a re-embed; the stored vectors cannot be cast.
+EMBEDDING_DIMENSIONS = 768
 
 # A real ``vector`` on PostgreSQL; JSON on the SQLite fallback, which has no such type.
 # Same escape hatch as ``JsonColumn``, and it is what keeps ``Base.metadata.create_all``
@@ -286,8 +289,11 @@ class RetrievedContextDocument(Base):
     rank: Mapped[int | float] = mapped_column(Float)  # retriever order (int or float).
     name: Mapped[str] = mapped_column(Text)  # Short label/title for the retrieved item.
     document: Mapped[str] = mapped_column(Text)  # Source document reference.
-    content: Mapped[str] = mapped_column(Text)  # The retrieved text.
     url: Mapped[str | None] = mapped_column(Text, default=None)  # Source URL, if any.
+    # The document's text, segmented into ``[{page, index, text}, ...]`` by the extract
+    # stage — the chunker's input, not judge input. NULL on rows retrieved before
+    # segmentation existed; those rows carry no text at all and are re-retrieved.
+    sentences: Mapped[list[dict[str, Any]] | None] = mapped_column(JsonColumn, default=None)
 
     turn: Mapped[Turn] = relationship(back_populates="retrieved_documents")
     embeddings: Mapped[list[RetrievedDocumentEmbedding]] = relationship(
@@ -305,28 +311,46 @@ class RetrievedContextDocument(Base):
             rank=rank,
             name=doc.name,
             document=doc.document,
-            content=doc.content,
             url=doc.url,
+            sentences=[s.model_dump() for s in doc.sentences],
+            # Set explicitly: once the row is flushed, a collection that was never
+            # touched lazy-loads on first access — a MissingGreenlet under asyncio.
+            # A freshly retrieved document provably has no chunks until the embedding
+            # phase writes them.
+            embeddings=[],
         )
 
-    def to_document(self) -> RetrievedDocument:
-        """Project this row back into a pydantic ``RetrievedDocument``."""
+    def to_document(self, chunks: list[Chunk] | None = None) -> RetrievedDocument:
+        """Project this row into the ``RetrievedDocument`` a judge reads.
+
+        ``chunks`` are the ones already selected for this turn — ranked and limited in SQL
+        by ``db.repositories.embeddings.chunks_for_turn``, never here: the row's own
+        ``embeddings`` relationship is not eager-loaded any more, precisely so the vectors
+        stay in the database. A document with no chunks carries no text at all.
+        ``sentences`` stays empty: it is the chunker's input, not judge input.
+        """
         return RetrievedDocument(
             name=self.name,
             document=self.document,
-            content=self.content,
             url=self.url,
+            chunks=list(chunks or []),
         )
 
 
 class RetrievedDocumentEmbedding(Base):
     """One chunk of a retrieved document, with its embedding.
 
-    A document is stored whole on ``RetrievedContextDocument.content``; this is the
-    chunked projection of that text, one row per chunk in ``chunk_index`` order, so a
-    consumer can retrieve or re-rank at chunk granularity instead of handing a judge the
-    entire document. Nothing writes these rows yet — the table is the storage layer, and
-    the producer seam is ``Judge.embed`` (``core.metrics.judge``).
+    The document's only stored text. ``RetrievedContextDocument.sentences`` is grouped
+    into overlapping windows of ``embedding_chunk_sentences`` (sharing
+    ``embedding_chunk_overlap``), one row per window in ``chunk_index`` order, each with
+    its embedding. At scoring time only the ``embedding_top_k`` chunks closest to the
+    turn's prompt are handed to a judge, so a judge never sees a whole document.
+
+    Written by ``core.services.embedding``; the vectors come from
+    ``core.retrieval.embed.OpenAIEmbedder``, which owns its own OpenAI client rather than
+    going through the judge. Alongside the text each row records **where it came from** —
+    page and sentence range — which the retrieval query does not read: that is stored for
+    citation and auditing, not for the judge.
 
     PostgreSQL-only in practice: ``embedding`` degrades to JSON on the SQLite fallback,
     which supports no similarity search.
@@ -364,7 +388,19 @@ class RetrievedDocumentEmbedding(Base):
     # The chunk's own text — what was embedded, kept so a hit can be read back without
     # re-splitting the parent document.
     content: Mapped[str] = mapped_column(Text)
-    embedding: Mapped[list[float]] = mapped_column(EmbeddingColumn)
+    # Nullable: chunking and embedding are separable. Without ``openai_api_key`` the
+    # chunks are still written — they are the document's only text — and simply carry no
+    # vector, so a judge still reads the document and only the cosine narrowing is lost.
+    embedding: Mapped[list[float] | None] = mapped_column(EmbeddingColumn, default=None)
+    # Where in the document the chunk came from. The page is the **first** sentence's:
+    # a window of several sentences can straddle a page break and only one page is kept,
+    # so such a chunk is filed under the page its head came from. NULL for DOCX/HTML,
+    # which have no pages, and on rows written before this metadata existed.
+    page: Mapped[int | None] = mapped_column(Integer, default=None)
+    # The ``Sentence.index`` range the chunk spans, inclusive both ends — what makes it
+    # traceable back to ``RetrievedContextDocument.sentences``.
+    sentence_start: Mapped[int | None] = mapped_column(Integer, default=None)
+    sentence_end: Mapped[int | None] = mapped_column(Integer, default=None)
 
     retrieved_document: Mapped[RetrievedContextDocument] = relationship(
         back_populates="embeddings"
@@ -399,6 +435,12 @@ class MetricScore(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    # Every LLM call the judge made to produce this score, in the order they ran.
+    judge_calls: Mapped[list[JudgeCall]] = relationship(
+        back_populates="metric_score",
+        cascade="all, delete-orphan",
+        order_by="JudgeCall.sequence",
+    )
 
 
 class MetricTrace(Base):
@@ -420,6 +462,39 @@ class MetricTrace(Base):
     steps: Mapped[list[Any] | None] = mapped_column(JsonColumn, default=None)
 
     metric_score: Mapped[MetricScore] = relationship(back_populates="trace")
+
+
+class JudgeCall(Base):
+    """One LLM call a judge made while producing a ``MetricScore``.
+
+    A metric can issue many calls for a single score (one per claim, per document,
+    per generated question), so this is the only place the exact text sent to the
+    model survives: the judge renders it and would otherwise discard it. ``sequence``
+    orders the calls within their score, starting at 0.
+    """
+
+    __tablename__ = "judge_calls"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    metric_score_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("metric_scores.id", ondelete="CASCADE"), index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer)
+    # The JudgeStep the call was labelled with ("extract"/"verify"/"score"), when known.
+    step: Mapped[str | None] = mapped_column(String(16), default=None)
+    # The model that really ran, after the judge resolved the step's override.
+    model: Mapped[str] = mapped_column(String(128))
+    system_prompt: Mapped[str] = mapped_column(Text)
+    prompt: Mapped[str] = mapped_column(Text)
+    latency_ms: Mapped[int] = mapped_column(Integer)
+    input_tokens: Mapped[int] = mapped_column(Integer, server_default="0", default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, server_default="0", default=0)
+
+    metric_score: Mapped[MetricScore] = relationship(back_populates="judge_calls")
+
+    __table_args__ = (
+        UniqueConstraint("metric_score_id", "sequence", name="uq_judge_call_sequence"),
+    )
 
 
 class TurnTokenUsage(Base):

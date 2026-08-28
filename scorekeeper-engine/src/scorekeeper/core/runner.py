@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import uuid
 from collections.abc import Mapping
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -55,6 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scorekeeper.config.settings import get_settings
 from scorekeeper.db.models import (
     BenchmarkRun,
+    JudgeCall,
     MetricScore,
     MetricTrace,
     PlatformExecution,
@@ -68,10 +70,18 @@ from scorekeeper.core.metrics.base import Metric, MetricResult, TurnView
 from scorekeeper.core.metrics.fingerprint import scoring_key
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
 from scorekeeper.core.metrics.judges import make_judge
-from scorekeeper.core.metrics.judges.base import UsageAccumulator, collect_usage
+from scorekeeper.core.metrics.judges.base import (
+    CallRecorder,
+    JudgeCallRecord,
+    UsageAccumulator,
+    collect_calls,
+    collect_usage,
+)
 from scorekeeper.core.metrics.rollup import execution_average, turn_score
 from scorekeeper.core.metrics.selection import active_templates, metrics_for, resolve
-from scorekeeper.core.retrieved_context import RetrievedContext
+from scorekeeper.core.retrieval.embed import Embedder, EmbedError
+from scorekeeper.core.retrieved_context import Chunk, RetrievedContext
+from scorekeeper.db.repositories import embeddings as embeddings_repo
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +125,10 @@ class EvalRunner:
 
     Construct with an ``AsyncSession`` and, optionally, a ``Judge`` (defaults to the
     configured judge from ``make_judge()``). Tests inject a stub judge.
+
+    ``embedder`` narrows what context a judge sees: the turn's prompt is embedded once
+    and each document keeps only its ``embedding_top_k`` closest chunks. ``None`` — no
+    embedder configured, or none passed — hands over every stored chunk instead.
     """
 
     def __init__(
@@ -122,9 +136,11 @@ class EvalRunner:
         session: AsyncSession,
         judge: Judge | None = None,
         templates: Mapping[str, dict[str, PromptVersion]] | None = None,
+        embedder: Embedder | None = None,
     ) -> None:
         self.session = session
         self.judge = judge or make_judge()
+        self.embedder = embedder
         # The prompt versions this run is pinned to, resolved once by ``score_run``.
         # Per-run immutable configuration, like ``judge`` — which is why it lives here
         # rather than being threaded through ``run_benchmark``: every level of the
@@ -307,7 +323,16 @@ class EvalRunner:
         ``history`` is in the key, so editing one turn's text invalidates every later
         turn of that conversation; that is correct, since their judges saw it.
         """
-        view = self._to_turn_view(turn, history or [])
+        query_embedding = await self._query_embedding(turn)
+        chunks = await embeddings_repo.chunks_for_turn(
+            self.session,
+            turn_id=turn.id,
+            query_embedding=query_embedding,
+            # Only meaningful with something to rank against; without it every chunk is
+            # returned whatever ``k`` says, so settings are not consulted at all.
+            k=get_settings().embedding_top_k if query_embedding is not None else 0,
+        )
+        view = self._to_turn_view(turn, history or [], chunks)
         # ``run_scenario`` passes the ids it already flattened; a per-turn caller
         # (``services.chain``) only pins them on the runner, so fall back to those —
         # otherwise the same turn would fingerprint differently on each path.
@@ -395,7 +420,8 @@ class EvalRunner:
         # One accumulator for the whole turn — every metric thread adds each judge
         # call's tokens to it (see _evaluate_metrics), so the snapshot is the turn total.
         usage = UsageAccumulator()
-        for result in await self._evaluate_metrics(view, pending, turn.turn_number, usage):
+        evaluated = await self._evaluate_metrics(view, pending, turn.turn_number, usage)
+        for result, calls in evaluated:
             turn.metric_scores.append(
                 MetricScore(
                     metric_name=result.metric_name,
@@ -404,6 +430,12 @@ class EvalRunner:
                     judge_model=result.judge_model,
                     rubric_version=result.rubric_version,
                     scoring_key=keys[result.metric_name],
+                    # One row per LLM call the metric made, in call order: the only
+                    # place the exact prompt sent to the judge survives.
+                    judge_calls=[
+                        JudgeCall(sequence=i, **call.model_dump())
+                        for i, call in enumerate(calls)
+                    ],
                 )
             )
             await self.session.commit()  # persist each surviving metric's score
@@ -432,33 +464,38 @@ class EvalRunner:
         metrics: list[Metric],
         turn_number: int,
         usage: UsageAccumulator,
-    ) -> list[MetricResult]:
+    ) -> list[tuple[MetricResult, list[JudgeCallRecord]]]:
         """Evaluate every metric concurrently — one worker thread each — and return the
-        surviving results in metric-declaration order.
+        surviving results, each with its judge calls, in metric-declaration order.
 
         Only ``metric.evaluate`` runs off the event loop: it takes the ORM-free ``view``
         and the shared, thread-safe ``judge``, touches no session state, and drives a
         *blocking* LLM SDK — hence ``to_thread`` rather than a bare await. Each worker
-        activates the shared per-turn ``usage`` accumulator for the duration of its
-        evaluate() and resets it on exit, so nothing leaks to the next task on a reused
-        thread. ``gather`` yields results in *argument* order, which is what keeps the
-        ``MetricScore`` rows in a stable order regardless of which judge call finishes
-        first; ``return_exceptions`` is what keeps a failing metric from cancelling its
-        siblings (skip-metric-continue) — it is logged and dropped.
+        activates the shared per-turn ``usage`` accumulator plus a ``CallRecorder`` of
+        its *own* for the duration of its evaluate() and resets both on exit, so nothing
+        leaks to the next task on a reused thread. The recorder is per metric because its
+        snapshot is persisted per ``MetricScore``; since no metric fans its judge calls
+        out across threads, the recorded order is the real call order. ``gather`` yields
+        results in *argument* order, which is what keeps the ``MetricScore`` rows in a
+        stable order regardless of which judge call finishes first; ``return_exceptions``
+        is what keeps a failing metric from cancelling its siblings
+        (skip-metric-continue) — it is logged and dropped.
         """
         if not metrics:
             return []
 
-        def _evaluate(metric: Metric) -> MetricResult:
-            with collect_usage(usage):
-                return metric.evaluate(view, self.judge)
+        def _evaluate(metric: Metric) -> tuple[MetricResult, list[JudgeCallRecord]]:
+            recorder = CallRecorder()
+            with collect_usage(usage), collect_calls(recorder):
+                result = metric.evaluate(view, self.judge)
+            return result, recorder.snapshot()
 
         outcomes = await asyncio.gather(
             *(asyncio.to_thread(_evaluate, metric) for metric in metrics),
             return_exceptions=True,
         )
 
-        results: list[MetricResult] = []
+        results: list[tuple[MetricResult, list[JudgeCallRecord]]] = []
         for metric, outcome in zip(metrics, outcomes):
             if isinstance(outcome, BaseException):  # skip-metric-continue
                 logger.warning(
@@ -503,8 +540,42 @@ class EvalRunner:
             turn.token_usage.output_tokens = snapshot.output_tokens
 
     # ---- Helpers ------------------------------------------------------------
-    def _to_turn_view(self, turn: Turn, history: list[tuple[str, str]]) -> TurnView:
-        """Project an ORM ``Turn`` into the SDK-free ``TurnView`` metrics consume."""
+    async def _query_embedding(self, turn: Turn) -> list[float] | None:
+        """Embed the turn's prompt, once, to rank its documents' chunks against it.
+
+        ``None`` whenever ranking is impossible or pointless — no embedder, no retrieved
+        documents — and also when embedding fails: losing the *narrowing* is survivable
+        (every chunk is rendered instead), losing the *turn* is not.
+        """
+        if self.embedder is None or not turn.retrieved_documents:
+            return None
+        try:
+            # The SDK call is blocking; keep it off the event loop.
+            vectors = await asyncio.to_thread(self.embedder.embed, [turn.prompt])
+        except EmbedError:
+            logger.warning(
+                "No se pudo embeber el prompt del turno %s; se usa todo el contexto",
+                turn.turn_number,
+                exc_info=True,
+            )
+            return None
+        return vectors[0] if vectors else None
+
+    def _to_turn_view(
+        self,
+        turn: Turn,
+        history: list[tuple[str, str]],
+        chunks: dict[uuid.UUID, list[Chunk]] | None = None,
+    ) -> TurnView:
+        """Project an ORM ``Turn`` into the SDK-free ``TurnView`` metrics consume.
+
+        Documents keep their ``rank`` — the *platform's* retriever order, which
+        ``contextual_precision`` scores — while ``chunks`` carries the narrowing done
+        *within* each document by ``db.repositories.embeddings.chunks_for_turn``. Ranking
+        documents by our own cosine instead would make that metric measure our retriever
+        rather than the one under test.
+        """
+        chunks = chunks or {}
         return TurnView(
             prompt=turn.prompt,
             response=turn.response,
@@ -512,7 +583,7 @@ class EvalRunner:
             history=list(history),
             retrieved_context=RetrievedContext(
                 documents=[
-                    row.to_document()
+                    row.to_document(chunks.get(row.id))
                     for row in sorted(turn.retrieved_documents, key=lambda r: r.rank)
                 ]
             ),

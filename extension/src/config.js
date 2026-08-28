@@ -24,7 +24,7 @@ const LEGACY_RUN_KEY = "lastRun";
 /** How many runs to keep; the oldest beyond this are dropped on insert. */
 const RUNS_CAP = 25;
 
-/** Run statuses that will never change again, so polling can stop. */
+/** Run statuses that will never change again, so refreshing is pointless. */
 export const TERMINAL_STATUSES = ["completado", "parcial", "fallido"];
 
 /** Spanish labels for the API's run statuses, shown across every surface. */
@@ -211,8 +211,8 @@ export function runScenarioIds(run) {
 /**
  * The most recently updated run, or `null`.
  *
- * Not `runs[0]`: `pollRuns` upserts sequentially and `upsertRun` prepends, so a poll
- * cycle leaves the list in reverse order of polling, not of activity.
+ * Not `runs[0]`: `upsertRun` prepends, so the list is in order of the last write,
+ * which a refresh of an older run reorders against activity.
  */
 export function newestRun(runs) {
   return (runs ?? []).reduce(

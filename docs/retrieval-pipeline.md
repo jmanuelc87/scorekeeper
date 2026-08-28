@@ -37,6 +37,7 @@ plain-text blob). `SourceFormat` names them:
 flowchart LR
     parse[parse] --> locate[locate] --> auth[authorize] --> fetch[fetch]
     fetch --> extract["filter + extract"] --> assemble[assemble]
+    assemble --> embed[embed]
 ```
 
 There is no standalone *filter* stage: the page/section selection the diagram once split out
@@ -48,8 +49,9 @@ is performed inside the `ContentExtractor` (see [Extract](#extract)).
 | locate | `DocumentLocatorResolver` | `SourceRef` → `DocumentLocator` | Derive the document URL (minus fragment), filename, `DocType`, scheme, host, and page/section from a `#page=N` fragment. |
 | authorize | `AuthProvider` | `DocumentLocator` → `AuthDecision` (+ `client`) | Classify the auth requirement, resolve it against available credentials, and expose the generic `AuthClient`. |
 | fetch | `DocumentFetcher` | `DocumentLocator`, `AuthClient \| None` → `FetchedDocument` | Fetch the document bytes through the auth client (gated) or a public GET, cached on disk by `document_url`. |
-| filter + extract | `ContentExtractor` | `FetchedDocument`, `DocumentLocator` → `ExtractedContent` | Select the requested PDF page and convert the document to markdown (titles/lists/tables; images dropped). |
+| filter + extract | `ContentExtractor` | `FetchedDocument`, `DocumentLocator` → `ExtractedContent` | Convert the document to markdown page by page (titles/lists/tables; images and links dropped) and segment it into page-attributed sentences. |
 | assemble | `RetrievalReport.to_context` | outcomes → `RetrievedContext` | Collect the successfully-retrieved documents, in rank order; they persist as [`RetrievedDocument`](data-model.md#retrieveddocument) child rows of the turn. |
+| embed | `Embedder` | `Sentence` list → chunk rows | Group the sentences into overlapping chunks and embed each one; see [Embedding](#embedding). A phase of its own, after retrieval and before scoring. |
 
 The orchestrator (`RetrievalPipeline.run`) runs all stages over one cell and returns a
 `RetrievalReport` — the `SourceFormat` plus one `RetrievalOutcome` per source reference.
@@ -140,19 +142,143 @@ stage: `supports(doc_type)` + `extract(document, locator) → ExtractedContent`,
 **markdown**. It also *is* the filter — page selection happens here, not in a separate stage.
 By document type:
 
-- **PDF** → `pypdf` slices out the exact page (`locator.page`, 1-based from `#page=N`) into a
-  one-page document before conversion; no page → the whole PDF. A page outside the document
-  raises `PageNotFoundError` (→ `RetrievalStatus.LOCATOR_NOT_FOUND`).
+- **PDF** → **page by page**. `pypdf` slices each page into a one-page document before
+  conversion: with `#page=N` only that page (`locator.page`, 1-based); **without a fragment,
+  every page in turn**. A page outside the document raises `PageNotFoundError`
+  (→ `RetrievalStatus.LOCATOR_NOT_FOUND`); a PDF with no pages yields no text
+  (→ `EMPTY_CONTENT`).
 - **DOCX** (Word `.docx`) → the whole document is converted; `.docx` stores no page boundaries,
   so the page selector is ignored. Legacy binary `.doc` is unmapped (`UNKNOWN`) → unsupported.
 - **HTML** → the fetched page bytes are converted.
 
 Conversion runs through **MarkItDown** (imported lazily; in the optional `retrieval` extra),
 preserving **titles, lists, and tables**. **Images/graphics are dropped** — MarkItDown keeps
-images as markdown, so the stage strips image markup (`![…](…)`, `<img>`) from the result. A
-type outside {PDF, DOCX, HTML} fails `supports()` (→ `UNSUPPORTED_TYPE`); a corrupt file or
-conversion failure raises `ExtractError`. The markdown flows verbatim into `RetrievedDocument.content`
-and thus into the LLM-judge prompts, which treat it as structured plain text.
+images as markdown, so the stage strips image markup (`![…](…)`, `<img>`) from the result.
+**Links are dropped too, for every document type**, anchor text included: `[texto](url)`,
+`[texto][ref]` and its `[ref]: url` definition, and the whole `<a href=…>…</a>` element go, as
+does a URL that is only a URL — an autolink `<https://…>` or a bare `https://…` / `www.…`. A
+link is retriever plumbing, not prose: it adds no claim a judge can check, and its tokens would
+otherwise ride into every chunk.
+
+A type outside {PDF, DOCX, HTML} fails `supports()` (→ `UNSUPPORTED_TYPE`); a corrupt file or
+conversion failure raises `ExtractError`. The markdown is not persisted: it is the source of
+the sentences below, and the emptiness gate the assemble stage reads.
+
+**Why page by page costs something.** MarkItDown emits no page boundaries, so attributing text
+to a page requires slicing the page out first. A PDF referenced without `#page=N` therefore runs
+**one conversion per page** instead of one for the whole file: extract time grows linearly with
+the page count (it is CPU work, already pushed off the event loop with `asyncio.to_thread`), and
+the concatenated markdown is not byte-identical to a single-pass conversion — a table or
+paragraph straddling a page break is split at the boundary.
+
+### Sentences
+
+Each converted block is then segmented into `Sentence` values — `{page, index, text}` — with
+**syntok** (`scorekeeper.core.text.split_sentences`, the same deterministic segmenter
+`faithfulness` uses on the assistant's answer; no LLM call). `page` is the 1-based PDF page the
+sentence came from, `None` for DOCX/HTML; `index` orders the sentence across the **whole**
+document (0-based, never restarting per page), so it lines up with
+`RetrievedDocumentEmbedding.chunk_index`. Segmentation runs on the image- and link-stripped markdown,
+so neither image markup nor a URL ever becomes a sentence.
+
+Sentences are the **chunker's input**, not judge input, and they are not what a judge
+reads. They persist on `retrieved_documents.sentences` (JSONB, nullable — rows retrieved
+before segmentation existed are `NULL` and carry no text at all). The embedding phase
+below turns them into the chunks that *are* read.
+
+## Embedding
+
+A phase of its own between retrieval and scoring
+(`scorekeeper.core.services.embedding`). It groups a document's sentences into
+**overlapping windows** and stores one
+[`RetrievedDocumentEmbedding`](data-model.md#retrieveddocumentembedding) row per window:
+
+- `chunk_sentences` (`scorekeeper.core.retrieval.chunk`) advances by
+  `embedding_chunk_sentences - embedding_chunk_overlap` sentences per chunk, so
+  consecutive chunks share `embedding_chunk_overlap` sentences. The overlap is what keeps
+  a claim straddling a chunk boundary readable in at least one chunk. An overlap not
+  smaller than the window would never advance, and is rejected. Each window carries **where
+  it came from**, not just its text — otherwise grouping would throw away the page the
+  extract stage attributed to every sentence.
+- `OpenAIEmbedder` (`scorekeeper.core.retrieval.embed`) embeds the chunks in batches of
+  `embedding_batch_size`. It owns **its own OpenAI client** rather than going through
+  `Judge.embed`: embedding retrieved documents is retrieval work, and it has to keep
+  working whatever judge provider a run uses (Anthropic has no embedding endpoint, LM
+  Studio's model is the wrong width). A vector whose width is not
+  `EMBEDDING_DIMENSIONS` (768, the pgvector column's fixed width) is rejected as
+  `EmbedError` rather than left to fail inside an INSERT.
+
+**Chunking and embedding are separable, deliberately.** The chunks are the document's
+*only* stored text, so they are written whatever happens; the vector is the enrichment
+that lets scoring narrow them. With no `openai_api_key`, or when the embeddings call
+fails, the chunks are stored with a `NULL` embedding and a judge still reads the whole
+document — only the narrowing is lost.
+
+**Provenance travels with the chunk.** Each row records the page its first sentence came
+from and the inclusive `Sentence.index` range it spans, so a chunk can be cited or checked
+against `retrieved_documents.sentences`. Because only one page is kept, a window straddling
+a page break is filed under the page its *head* came from — its tail is mis-attributed, which
+is the price of a single column. These fields are storage only: the retrieval query does not
+select them and no judge sees them.
+
+**Best-effort and idempotent**, like retrieval: a failure is logged, never raised, and a
+document that already has chunks is skipped, so a retried turn re-downloads nothing and
+re-embeds nothing.
+
+### What the judge reads
+
+At scoring time `EvalRunner` embeds the turn's **prompt** once, and each document keeps
+only its `embedding_top_k` chunks closest to it by cosine, put back in `chunk_index`
+order — a judge reads a document in its own order, never shuffled by relevance. That is
+the whole point of the phase: a 300-page PDF no longer enters every judge prompt in full.
+
+**Documents are never reordered.** Only the chunks *within* a document are narrowed;
+the documents keep their `rank`, which is the *platform's* retriever order and the thing
+`contextual_precision` scores. Ranking documents by our own cosine would make that metric
+measure our retriever instead of the one under test.
+
+**The ranking runs in SQL.** `db.repositories.embeddings.chunks_for_turn` issues one
+statement per turn — a `LATERAL` top-`k` per document over pgvector's `<=>` cosine-distance
+operator:
+
+```sql
+SELECT d.id, s.chunk_index, s.content
+FROM retrieved_documents d
+CROSS JOIN LATERAL (
+    SELECT e.chunk_index, e.content
+    FROM retrieved_document_embeddings e
+    WHERE e.retrieved_document_id = d.id
+    ORDER BY e.embedding <=> :prompt_embedding
+    LIMIT :k
+) s
+WHERE d.turn_id = :turn_id
+```
+
+The `embedding` column is never selected, and `Turn.retrieved_documents` is no longer
+loaded down to its chunks — so a run's vectors stay in the database instead of
+being pulled into the worker for every turn.
+
+**About the HNSW index.** `ORDER BY <=> … LIMIT` is written bare on purpose: it is the only
+form `ix_retrieved_document_embeddings_hnsw` (HNSW, `vector_cosine_ops`) can serve, and any
+extra ordering key ahead of the distance would silently make the index unusable. Two things
+follow, and both are worth knowing before claiming the index is doing work:
+
+- **Whether the planner picks it is its call.** Filtered to one `retrieved_document_id`,
+  the candidate set is a handful of rows, and an exact scan over the foreign-key index is
+  both faster and — unlike HNSW, which is approximate — exact. Check with `EXPLAIN` rather
+  than assume. Filtered HNSW scans also need `hnsw.iterative_scan` (pgvector ≥ 0.8 on the
+  *server*) to return reliably; `compose.yaml` pins only the floating `pgvector/pgvector:pg17`
+  tag, so that is not enabled here.
+- **Unvectorised chunks behave differently per plan.** `<=>` on a `NULL` embedding yields
+  `NULL`, and `NULL`s sort last — so an exact scan puts them at the end, where `LIMIT` may
+  drop them. An HNSW index scan does not index `NULL`s at all, so it omits them outright.
+  Either way a partially embedded document can be truncated.
+
+**Outside PostgreSQL there is no ranking.** The SQLite fallback has no `<=>`
+(`EmbeddingColumn` degrades to JSON), so every chunk is returned in `chunk_index` order —
+the same degradation `db.connection.run_lock` applies to advisory locks. The same happens
+whenever there is no prompt embedding to rank against: no `openai_api_key`, or an embedding
+call that failed. Handing a judge the whole document beats handing it nothing.
 
 ## Assemble
 
@@ -161,8 +287,9 @@ The assemble stage turns each reference's extract result into the stored
 
 - `ExtractedContent.to_document(source, locator)` (`scorekeeper.core.retrieval.types`) maps a
   reference to a `RetrievedDocument` — `name` from the reference label, `document` from the
-  filename (falling back to the label, then the URL), `content` = the extracted markdown, and
-  `url` = the original `source.url` (keeping any `#page=N` citation anchor).
+  filename (falling back to the label, then the URL), `sentences` = the segmented text, and
+  `url` = the original `source.url` (keeping any `#page=N` citation anchor). No
+  whole-document text is carried: `ExtractedContent.text` stops here.
 - `RetrievalOutcome.assembled(source, locator, extracted, *, auth=…)` produces the reference's
   terminal outcome: non-blank markdown → `RETRIEVED` carrying that document; blank text →
   `EMPTY_CONTENT` with no document.
@@ -170,8 +297,9 @@ The assemble stage turns each reference's extract result into the stored
   **in retriever-rank order** and **preserving duplicates** (the same URL referenced twice
   yields two documents, matching the fetch stage's 1:1 result-per-reference contract).
 
-Pure value-object logic — no I/O. The resulting markdown flows into `RetrievedDocument.content`
-and thus into the groundedness metrics' node text and the judge prompts.
+Pure value-object logic — no I/O. What is assembled is not yet readable by a judge: the
+sentences become judge-visible text only once the [embedding](#embedding) phase has chunked
+them.
 
 ## Per-document outcome
 
@@ -203,7 +331,12 @@ retrieves):
 | other `ExtractError` (corrupt/convert failure) | `FETCH_FAILED` |
 | whole-cell parse failure (e.g. the LLM path) | one `PARSE_ERROR` outcome |
 
-**Run wiring.** The Celery worker runs retrieval *then* scoring for a run via one task,
+**Run wiring.** Note the description below predates the per-turn chain: production runs
+one Celery job per turn (`core.services.chain._work_turn`), which retrieves, embeds and
+scores that turn, committing each phase separately. The whole-run functions described
+here are the in-process `ingest -> retrieve -> embed -> score` path.
+
+The Celery worker runs retrieval *then* scoring for a run via one task,
 `run_pipeline_task(run_id)` (`scorekeeper.tasks`): `services.retrieval.retrieve_run` then
 `services.scoring.score_run`. `retrieve_run` marks the run `en_recuperacion`, and for each turn
 parses/fetches/extracts its raw `Turn.retrieved_context_source` (captured at ingest) into
@@ -235,6 +368,11 @@ bound, and the same document referenced by a later run is fetched again.
 
 Not yet implemented:
 
+- Vector search across the whole corpus. Ranking is scoped to one turn's documents, so no
+  query is selective-free enough for the HNSW index to be the obvious plan; see
+  [What the judge reads](#what-the-judge-reads).
+- Enabling `hnsw.iterative_scan` for reliable filtered index scans, which needs the server
+  extension pinned to pgvector ≥ 0.8 (`compose.yaml` uses a floating image tag today).
 - `GET /evaluations` surfacing per-run retrieval stats: `RetrievalSummary` counts and the
   `recuperacion_parcial` / `recuperacion_fallida` rollups documented in
   [Retrieval taxonomy](retrieval-taxonomy.md#run-level-status). Retrieval currently logs its

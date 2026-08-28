@@ -27,18 +27,20 @@ from scorekeeper.core.metrics.judges import (
 from scorekeeper.core.metrics.judges import base as judges_base
 from scorekeeper.core.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
+    CallRecorder,
     JudgeError,
     RetryPolicy,
     StepModels,
     UsageAccumulator,
     _ScoreResponse,
     clamp,
+    collect_calls,
     collect_usage,
     render_prompt,
     scale_spec,
 )
 from scorekeeper.core.metrics.scale import Boolean, Likert, Unit
-from scorekeeper.core.retrieved_context import RetrievedContext, RetrievedDocument
+from scorekeeper.core.retrieved_context import Chunk, RetrievedContext, RetrievedDocument
 
 
 class Claims(BaseModel):
@@ -106,6 +108,13 @@ class FakeAnthropicMessages:
 
 
 class FakeAnthropicClient:
+    """Fake with both namespaces, each recording its own calls.
+
+    ``fallbacks`` lives on ``client.beta.messages``, so the two logs are what lets a
+    test assert *which* namespace a call took — the judge must only reach for the beta
+    one when it actually sends the parameter.
+    """
+
     def __init__(
         self,
         parsed: object,
@@ -113,6 +122,9 @@ class FakeAnthropicClient:
         usage: object | None = None,
     ) -> None:
         self.messages = FakeAnthropicMessages(parsed, raises, usage)
+        self.beta = SimpleNamespace(
+            messages=FakeAnthropicMessages(parsed, raises, usage)
+        )
 
 
 class FakeCompletions:
@@ -258,8 +270,8 @@ def test_render_prompt_includes_retrieved_context() -> None:
                 RetrievedDocument(
                     name="Política de devoluciones",
                     document="manual.pdf",
-                    content="Devoluciones en 30 días. Requiere recibo.",
                     url="https://ejemplo.com/manual",
+                    chunks=[Chunk(index=0, text="Devoluciones en 30 días. Requiere recibo.")],
                 )
             ]
         ),
@@ -267,6 +279,9 @@ def test_render_prompt_includes_retrieved_context() -> None:
     rendered = render_prompt("Evalúa la fidelidad.", turn)
 
     assert "--- Contexto recuperado ---" in rendered
+    # The context is delimited with <contexto> tags so the judge can tell it apart.
+    assert "<contexto>\n" in rendered
+    assert "\n</contexto>" in rendered
     # The rendered context surfaces the content plus its label and source metadata.
     assert "Devoluciones en 30 días. Requiere recibo." in rendered
     assert "Política de devoluciones" in rendered
@@ -278,12 +293,20 @@ def test_render_prompt_substitutes_context_placeholder() -> None:
     turn = TurnView(
         prompt="p",
         response="r",
-        retrieved_context=RetrievedContext.from_blob("pasaje A\npasaje B"),
+        retrieved_context=RetrievedContext(
+            documents=[
+                RetrievedDocument(
+                    name="",
+                    document="",
+                    chunks=[Chunk(index=0, text="pasaje A\npasaje B")],
+                )
+            ]
+        ),
     )
     rendered = render_prompt("Contexto: {context}", turn)
 
-    # The {context} placeholder expands to the rendered retrieved context.
-    assert "Contexto: pasaje A\npasaje B" in rendered
+    # The {context} placeholder expands to the retrieved context inside <contexto> tags.
+    assert "Contexto: <contexto>\npasaje A\npasaje B\n</contexto>" in rendered
 
 
 def test_render_prompt_renders_web_citations_as_readable_docs() -> None:
@@ -296,10 +319,10 @@ def test_render_prompt_renders_web_citations_as_readable_docs() -> None:
         retrieved_context=RetrievedContext(
             documents=[
                 RetrievedDocument(
-                    name="Política", document="", content="", url="https://a/pol"
+                    name="Política", document="", url="https://a/pol"
                 ),
                 RetrievedDocument(
-                    name="", document="", content="", url="https://b/x"
+                    name="", document="", url="https://b/x"
                 ),
             ]
         ),
@@ -317,6 +340,14 @@ def test_render_prompt_omits_context_section_when_absent(turn: TurnView) -> None
     # The default fixture has no retrieved_context, so no section is emitted.
     rendered = render_prompt("Evalúa (1-5): {prompt}", turn)
     assert "--- Contexto recuperado ---" not in rendered
+
+
+def test_render_prompt_leaves_context_placeholder_empty_without_context(
+    turn: TurnView,
+) -> None:
+    # No context → the placeholder expands to nothing, not to empty <contexto> tags.
+    rendered = render_prompt("Contexto: {context}", turn)
+    assert "<contexto>" not in rendered
 
 
 def test_render_prompt_tolerates_stray_braces(turn: TurnView) -> None:
@@ -446,6 +477,14 @@ def test_anthropic_thinking_is_per_model(turn: TurnView) -> None:
     assert client.messages.calls[-1]["thinking"] == {"type": "adaptive"}
 
     judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-sonnet-5")
+    assert client.messages.calls[-1]["thinking"] == {"type": "adaptive"}
+
+    # Opus 5 thinks by default and Fable 5 always thinks: for both, ``adaptive`` is
+    # the only configuration the API accepts, so it must never be omitted.
+    judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-opus-5")
+    assert client.messages.calls[-1]["thinking"] == {"type": "adaptive"}
+
+    judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-fable-5")
     assert client.messages.calls[-1]["thinking"] == {"type": "adaptive"}
 
     # Haiku (bulk tier) via both seam methods → no thinking kwarg at all.
@@ -673,9 +712,9 @@ def test_agent_score_returns_verdict_and_clamps(turn: TurnView) -> None:
     )
 
 
-def test_agent_query_is_tool_free_single_turn_with_a_json_schema(turn: TurnView) -> None:
-    # The agent judge evaluates a rubric, it does not act: no tools, one turn, and the
-    # answer is pinned to the score schema. Adaptive thinking follows the model.
+def test_agent_query_is_tool_free_with_a_json_schema(turn: TurnView) -> None:
+    # The agent judge evaluates a rubric, it does not act: no tools, and the answer is
+    # pinned to the score schema. Adaptive thinking follows the model.
     client = FakeAgentSdk({"score": 1.0, "justification": "ok"})
     judge = AgentJudge(model="claude-opus-4-8", client=client, system_prompt="Juez.")
 
@@ -683,7 +722,7 @@ def test_agent_query_is_tool_free_single_turn_with_a_json_schema(turn: TurnView)
 
     options = client.calls[0]["options"]
     assert options.tools == []
-    assert options.max_turns == 1
+    assert options.max_turns == 5
     assert options.model == "claude-opus-4-8"
     assert options.system_prompt == "Juez."
     assert options.thinking == {"type": "adaptive"}
@@ -1088,6 +1127,94 @@ def test_usage_not_recorded_outside_a_collect_scope(turn: TurnView) -> None:
     assert verdict.score == 2.0
 
 
+# --- Per-call prompt recording ------------------------------------------------
+# The judges keep no memory of the text they send, so the recorder is the only place
+# a score's exact prompt survives. Same ambient shape as the usage accumulator.
+
+
+def test_anthropic_records_the_prompt_of_each_call(turn: TurnView) -> None:
+    client = FakeAnthropicClient(
+        _ScoreResponse(score=3.0, justification="ok"),
+        usage=SimpleNamespace(input_tokens=12, output_tokens=5),
+    )
+    judge = AnthropicJudge(
+        model="claude-opus-4-8", client=client, system_prompt="Eres un juez."
+    )
+    recorder = CallRecorder()
+    with collect_calls(recorder):
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert(), step=JudgeStep.SCORE)
+
+    (call,) = recorder.snapshot()
+    assert call.step == "score"
+    assert call.model == "claude-opus-4-8"
+    assert call.system_prompt == "Eres un juez."
+    # The record carries exactly the user content the client was handed.
+    assert call.prompt == client.messages.calls[0]["messages"][0]["content"]
+    assert turn.prompt in call.prompt
+    # ``record_usage`` attributes the response's tokens to the open call, not only to
+    # the turn accumulator, so the judges need no per-call bookkeeping of their own.
+    assert (call.input_tokens, call.output_tokens) == (12, 5)
+
+
+def test_openai_structured_records_its_rendered_instruction(turn: TurnView) -> None:
+    client = FakeOpenAIClient(
+        Claims(claims=["a"]), usage=SimpleNamespace(prompt_tokens=20, completion_tokens=8)
+    )
+    judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
+    recorder = CallRecorder()
+    with collect_calls(recorder):
+        judge.structured(
+            instruction="Extrae", turn=turn, schema=Claims, step=JudgeStep.EXTRACT
+        )
+
+    (call,) = recorder.snapshot()
+    assert call.step == "extract"
+    assert call.model == "gpt-5.6-sol"
+    assert call.system_prompt == DEFAULT_SYSTEM_PROMPT
+    assert call.prompt == render_prompt("Extrae", turn)
+    assert (call.input_tokens, call.output_tokens) == (20, 8)
+
+
+def test_agent_records_one_entry_per_call_in_order(turn: TurnView) -> None:
+    client = FakeAgentSdk({"score": 3.0, "justification": "ok"})
+    judge = AgentJudge(model="claude-opus-4-8", client=client)
+    recorder = CallRecorder()
+    with collect_calls(recorder):
+        judge.score(rubric="Primera", turn=turn, scale=Likert())
+        judge.score(rubric="Segunda", turn=turn, scale=Likert())
+
+    calls = recorder.snapshot()
+    assert len(calls) == 2
+    assert calls[0].prompt.startswith("Primera")
+    assert calls[1].prompt.startswith("Segunda")
+    assert all(c.step is None for c in calls)  # no step given → none recorded
+
+
+def test_a_failed_call_is_still_recorded(turn: TurnView) -> None:
+    # The prompt was sent and paid for; a failing call is precisely the one worth
+    # reading back, so the record is appended even though score() raised.
+    client = FakeAnthropicClient(None, raises=RuntimeError("caída"))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+    recorder = CallRecorder()
+    with collect_calls(recorder), pytest.raises(JudgeError):
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    (call,) = recorder.snapshot()
+    assert call.prompt.startswith("Evalúa")
+
+
+def test_calls_not_recorded_outside_a_collect_scope(turn: TurnView) -> None:
+    # Without an active recorder, recording is a silent no-op — judges stay usable
+    # standalone, exactly like the usage accumulator.
+    client = FakeAnthropicClient(_ScoreResponse(score=2.0, justification="ok"))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    verdict = judge.score(rubric="r", turn=turn, scale=Likert())  # no collect_calls
+
+    assert verdict.score == 2.0
+    assert CallRecorder().snapshot() == []
+
+
 # --- Retry / backoff on provider throttling -----------------------------------
 # The between-turn pause is per-process, so it cannot bound the aggregate request rate
 # once a run spreads across workers and concurrent metrics. ``judge_call`` is the
@@ -1332,3 +1459,124 @@ def test_retry_policy_clamps_nonsensical_settings(monkeypatch: pytest.MonkeyPatc
         ),
     )
     assert judges_base.retry_policy() == RetryPolicy(1, 0.0, 0.0)
+
+
+def test_anthropic_owns_the_claude_5_family(turn: TurnView) -> None:
+    """The allow-list gates before the SDK, so an unlisted model never reaches it."""
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    for model in ("claude-fable-5", "claude-opus-5", "claude-sonnet-5"):
+        assert judge.resolve_model(None, model) == model
+
+    with pytest.raises(ValueError):
+        judge.resolve_model(None, "claude-opus-6")
+
+
+def test_agent_judge_shares_the_anthropic_allow_list() -> None:
+    """One list, two judges: the Agent judge calls the same Claude models."""
+    from scorekeeper.core.metrics.judges import agent_judge, anthropic_judge
+
+    assert agent_judge.KNOWN_MODELS is anthropic_judge.KNOWN_MODELS
+    assert agent_judge.ADAPTIVE_THINKING_MODELS is anthropic_judge.ADAPTIVE_THINKING_MODELS
+
+
+# -- server-side refusal fallback -------------------------------------------------------------
+
+
+def _fallback_judge(client: FakeAnthropicClient, **kwargs) -> AnthropicJudge:
+    return AnthropicJudge(
+        model="claude-opus-4-8", client=client, fallback_model="claude-opus-4-8", **kwargs
+    )
+
+
+def test_refusal_fallback_is_sent_only_for_the_models_that_accept_it(
+    turn: TurnView,
+) -> None:
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = _fallback_judge(client)
+
+    judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-opus-5")
+    call = client.beta.messages.calls[-1]
+    assert call["fallbacks"] == [{"model": "claude-opus-4-8"}]
+    assert call["betas"] == ["server-side-fallback-2026-06-01"]
+
+    judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-fable-5")
+    assert client.beta.messages.calls[-1]["fallbacks"] == [{"model": "claude-opus-4-8"}]
+
+    # Sonnet 5 and Opus 4.8 do not take the parameter: sending it would be a 400 on
+    # every call, so they stay on the plain namespace untouched.
+    judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-sonnet-5")
+    assert "fallbacks" not in client.messages.calls[-1]
+    assert len(client.beta.messages.calls) == 2
+
+
+def test_refusal_fallback_never_falls_back_to_the_refusing_model(turn: TurnView) -> None:
+    """Retrying on the model that just declined would only buy a second refusal."""
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = AnthropicJudge(
+        model="claude-opus-5", client=client, fallback_model="claude-opus-5"
+    )
+
+    judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-opus-5")
+
+    assert client.beta.messages.calls == []
+    assert "fallbacks" not in client.messages.calls[-1]
+
+
+def test_without_a_fallback_model_the_request_is_unchanged(turn: TurnView) -> None:
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    judge = AnthropicJudge(model="claude-opus-5", client=client)  # no fallback_model
+
+    judge.score(rubric="s", turn=turn, scale=Unit(), model="claude-opus-5")
+
+    assert client.beta.messages.calls == []
+    assert "fallbacks" not in client.messages.calls[-1]
+    assert "betas" not in client.messages.calls[-1]
+
+
+def test_an_unowned_fallback_model_fails_when_the_judge_is_built() -> None:
+    """A configuration typo should not wait for the first refusal to surface."""
+    client = FakeAnthropicClient(_ScoreResponse(score=1.0, justification="ok"))
+    with pytest.raises(ValueError):
+        AnthropicJudge(model="claude-opus-5", client=client, fallback_model="gpt-4o")
+
+
+def test_the_fallback_also_covers_structured_calls(turn: TurnView) -> None:
+    client = FakeAnthropicClient(Claims(claims=["a"]))
+    judge = _fallback_judge(client)
+
+    judge.structured(instruction="x", turn=turn, schema=Claims, model="claude-fable-5")
+
+    assert client.beta.messages.calls[-1]["fallbacks"] == [{"model": "claude-opus-4-8"}]
+
+
+def test_make_judge_passes_the_configured_fallback_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: dict = {}
+
+    class DummyAnthropic:
+        def __init__(self, **kwargs) -> None:
+            built.update(**kwargs)
+
+    monkeypatch.setattr(judges_pkg, "AnthropicJudge", DummyAnthropic)
+
+    make_judge(
+        Settings(
+            judge_provider="anthropic",
+            anthropic_api_key="sk-a",
+            judge_fallback_model="claude-sonnet-5",
+        )
+    )
+    assert built["fallback_model"] == "claude-sonnet-5"
+
+    built.clear()
+    make_judge(
+        Settings(
+            judge_provider="anthropic",
+            anthropic_api_key="sk-a",
+            judge_fallback_model=None,
+        )
+    )
+    assert built["fallback_model"] is None

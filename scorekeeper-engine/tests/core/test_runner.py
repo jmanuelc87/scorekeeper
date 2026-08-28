@@ -17,10 +17,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scorekeeper.db.repositories.runs import run_tree_options
 from scorekeeper.db.models import (
     BenchmarkRun,
+    JudgeCall,
     MetricDefinition,
     MetricScore,
     PlatformExecution,
     RetrievedContextDocument,
+    RetrievedDocumentEmbedding,
     ScenarioResult,
     Turn,
     TurnTokenUsage,
@@ -37,9 +39,11 @@ from scorekeeper.core.metrics.base import (
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import JudgeVerdict
-from scorekeeper.core.metrics.judges.base import record_usage
+from scorekeeper.core.metrics.judges.base import record_judge_call, record_usage
 from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.core.metrics.scale import Unit
+from scorekeeper.core.retrieval.embed import EmbedError
+from scorekeeper.core.retrieved_context import Chunk
 from scorekeeper.core.runner import (
     MAX_TURN_ATTEMPTS,
     STATUS_COMPLETADO,
@@ -142,12 +146,48 @@ class _JudgeMetric(Metric):
         )
 
 
+class CallRecordingJudge(RecordingJudge):
+    """A ``RecordingJudge`` that opens a ``record_judge_call`` around each ``score``.
+
+    Simulates what a real concrete judge does around its model call, so runner tests
+    can assert the persisted per-call prompt rows without any SDK fakes.
+    """
+
+    def score(self, *, rubric, turn, scale, rubric_version=None, step=None) -> JudgeVerdict:
+        with record_judge_call(
+            step=step, model=self.model, system_prompt="Sistema.", prompt=rubric
+        ):
+            record_usage(input_tokens=3, output_tokens=1)
+            return super().score(
+                rubric=rubric, turn=turn, scale=scale, rubric_version=rubric_version, step=step
+            )
+
+
 class Utilidad(_JudgeMetric):
     name = "utilidad"
 
 
 class Correccion(_JudgeMetric):
     name = "correccion"
+
+
+class DosLlamadas(Metric):
+    """A metric that issues two judge calls, to exercise per-call ordering."""
+
+    name = "doble"
+    category = MetricCategory.RAG
+    scale = Unit()
+
+    def evaluate(self, turn: TurnView, judge) -> MetricResult:
+        first = judge.score(rubric="Primera pregunta", turn=turn, scale=self.scale)
+        judge.score(rubric="Segunda pregunta", turn=turn, scale=self.scale)
+        return MetricResult(
+            metric_name=self.name,
+            raw_score=first.score,
+            normalized_score=self.normalize(first.score),
+            trace=MetricTrace(steps=[]),
+            judge_model=first.model,
+        )
 
 
 class MetricaRota(Metric):
@@ -169,7 +209,7 @@ def registry():
     """Register the fake metrics into an isolated registry, then restore."""
     saved = MetricRegistry.all()
     MetricRegistry.clear()
-    for metric_cls in (Utilidad, Correccion, MetricaRota):
+    for metric_cls in (Utilidad, Correccion, DosLlamadas, MetricaRota):
         MetricRegistry.add(metric_cls)
     try:
         yield
@@ -237,6 +277,17 @@ async def _seed_scenario(
     return run, platform_exec, scenario
 
 
+def _document(
+    *, rank: float, name: str, document: str, text: str, url: str | None = None
+) -> RetrievedContextDocument:
+    """A retrieved document whose text lives on a single chunk row, as in production."""
+    row = RetrievedContextDocument(rank=rank, name=name, document=document, url=url)
+    row.embeddings = [
+        RetrievedDocumentEmbedding(chunk_index=0, content=text, embedding=[1.0, 0.0])
+    ]
+    return row
+
+
 # --- Tests --------------------------------------------------------------------
 
 
@@ -244,19 +295,92 @@ async def test_to_turn_view_rebuilds_context_from_child_rows(session: AsyncSessi
     _, platform_exec, scenario = await _seed_scenario(session, [("hola", "respuesta")])
     turn = platform_exec.turns[0]
     # Insert out of order to prove the ordered relationship sorts by rank.
+    turn.retrieved_documents.append(_document(rank=1, name="b", document="d2.pdf", text="dos"))
     turn.retrieved_documents.append(
-        RetrievedContextDocument(rank=1, name="b", document="d2.pdf", content="dos", url=None)
-    )
-    turn.retrieved_documents.append(
-        RetrievedContextDocument(rank=0, name="a", document="d1.pdf", content="uno", url="http://x")
+        _document(rank=0, name="a", document="d1.pdf", text="uno", url="http://x")
     )
     await session.flush()
 
-    view = EvalRunner(session, RecordingJudge())._to_turn_view(turn, [])
+    texts = {"d1.pdf": "uno", "d2.pdf": "dos"}
+    chunks = {
+        row.id: [Chunk(index=0, text=texts[row.document])]
+        for row in turn.retrieved_documents
+    }
+    view = EvalRunner(session, RecordingJudge())._to_turn_view(turn, [], chunks)
 
+    # Documents keep the platform's rank order; their text is whatever the chunk query
+    # returned for each of them.
     assert [d.content for d in view.retrieved_context.documents] == ["uno", "dos"]
     assert view.retrieved_context.documents[0].url == "http://x"
     assert view.retrieved_context.node_texts() == ["d1.pdf\nuno", "d2.pdf\ndos"]
+
+
+class _StubEmbedder:
+    """Embeds any prompt as the same fixed direction, so ranking is predictable."""
+
+    def __init__(self, vector: list[float]) -> None:
+        self.vector = vector
+        self.calls = 0
+
+    def embed(self, texts):
+        self.calls += 1
+        return [self.vector]
+
+
+async def test_to_turn_view_uses_the_chunks_it_is_handed(session: AsyncSession) -> None:
+    """The narrowing itself runs in SQL; the runner only maps the result onto documents."""
+    _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])
+    turn = platform_exec.turns[0]
+    row = RetrievedContextDocument(rank=0, name="a", document="d.pdf")
+    turn.retrieved_documents.append(row)
+    await session.flush()
+
+    view = EvalRunner(session, RecordingJudge())._to_turn_view(
+        turn, [], {row.id: [Chunk(index=2, text="cerca")]}
+    )
+
+    assert view.retrieved_context.documents[0].content == "cerca"
+
+
+async def test_to_turn_view_without_chunks_leaves_documents_textless(
+    session: AsyncSession,
+) -> None:
+    _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])
+    turn = platform_exec.turns[0]
+    turn.retrieved_documents.append(
+        RetrievedContextDocument(rank=0, name="a", document="d.pdf")
+    )
+    await session.flush()
+
+    view = EvalRunner(session, RecordingJudge())._to_turn_view(turn, [], {})
+
+    assert view.retrieved_context.documents[0].content == ""
+
+
+async def test_query_embedding_is_skipped_without_documents(session: AsyncSession) -> None:
+    _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])
+    embedder = _StubEmbedder([1.0])
+    runner = EvalRunner(session, RecordingJudge(), embedder=embedder)
+
+    assert await runner._query_embedding(platform_exec.turns[0]) is None
+    assert embedder.calls == 0  # nothing to rank, so nothing to pay for
+
+
+async def test_a_failed_prompt_embedding_falls_back_to_the_whole_document(
+    session: AsyncSession,
+) -> None:
+    _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])
+    turn = platform_exec.turns[0]
+    turn.retrieved_documents.append(_document(rank=0, name="a", document="d.pdf", text="uno"))
+    await session.flush()
+
+    class _Failing:
+        def embed(self, texts):
+            raise EmbedError("sin cuota")
+
+    runner = EvalRunner(session, RecordingJudge(), embedder=_Failing())
+    # Losing the narrowing is survivable; losing the turn is not.
+    assert await runner._query_embedding(turn) is None
 
 
 async def test_to_turn_view_empty_context_when_no_child_rows(session: AsyncSession) -> None:
@@ -671,6 +795,61 @@ async def test_rescoring_updates_single_token_usage_row(session: AsyncSession, r
     assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (7, 3)
 
 
+# --- Judge-call persistence ---------------------------------------------------
+
+
+async def test_persists_one_row_per_judge_call_in_order(session: AsyncSession, registry) -> None:
+    await _select_metrics(session, ["doble"])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+
+    await EvalRunner(session, CallRecordingJudge()).run_scenario(scenario)
+    await session.commit()
+
+    calls = (
+        await session.execute(select(JudgeCall).order_by(JudgeCall.sequence))
+    ).scalars().all()
+    # The metric made two calls; ``sequence`` numbers them in call order, from 0.
+    assert [c.sequence for c in calls] == [0, 1]
+    assert [c.prompt for c in calls] == ["Primera pregunta", "Segunda pregunta"]
+    (score,) = platform_exec.turns[0].metric_scores
+    assert {c.metric_score_id for c in calls} == {score.id}
+    assert all(c.system_prompt == "Sistema." for c in calls)
+    assert all(c.model == "judge-test" for c in calls)
+    # Each call carries the tokens its own response reported.
+    assert [(c.input_tokens, c.output_tokens) for c in calls] == [(3, 1), (3, 1)]
+
+
+async def test_rescoring_drops_the_previous_judge_calls(session: AsyncSession, registry) -> None:
+    await _select_metrics(session, ["utilidad"])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+
+    await EvalRunner(session, CallRecordingJudge()).run_scenario(scenario)
+    await session.commit()
+
+    # A different judge model invalidates the scoring key, so the stale MetricScore is
+    # deleted and re-written — its calls go with it (CASCADE), leaving only the new one.
+    _interrupt(scenario)
+    await EvalRunner(session, CallRecordingJudge(model="otro-juez")).run_scenario(scenario)
+    await session.commit()
+
+    calls = (await session.execute(select(JudgeCall))).scalars().all()
+    assert [(c.sequence, c.model) for c in calls] == [(0, "otro-juez")]
+
+
+async def test_a_judge_that_records_nothing_writes_no_calls(
+    session: AsyncSession, registry
+) -> None:
+    # The plain RecordingJudge never opens a record_judge_call, so the score is written
+    # with an empty call list rather than failing.
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+
+    await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
+    await session.commit()
+
+    assert (await session.execute(select(func.count()).select_from(JudgeCall))).scalar_one() == 0
+
+
 # --- Metric-level resume ------------------------------------------------------
 
 
@@ -730,7 +909,7 @@ async def test_changed_input_forces_a_rescore(
         turn.response = "una respuesta distinta"
     elif changed == "retrieved_context":
         turn.retrieved_documents.append(
-            RetrievedContextDocument(rank=0, name="a", document="d.pdf", content="uno")
+            _document(rank=0, name="a", document="d.pdf", text="uno")
         )
     await session.flush()
     if changed == "judge_model":

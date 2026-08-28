@@ -157,6 +157,37 @@ async def resume_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
     return EvaluationEnqueuedResponse(run_id=run_id, status=status)
 
 
+@router.post(
+    "/{run_id}/rerun",
+    response_model=EvaluationEnqueuedResponse,
+    status_code=202,
+)
+async def rerun_evaluation(run_id: str) -> EvaluationEnqueuedResponse:
+    """Score a finished run again from scratch, under the currently active prompts.
+
+    For a run at ``completado``: drops its metric scores, traces, judge calls and token
+    usage, releases its pinned prompt versions, and enqueues the chain again, so every
+    selected turn is judged afresh under whatever prompt versions are active now. Turn
+    selection and retrieved context are kept, so nothing is re-downloaded or re-embedded
+    — but every selected turn costs judge calls again. Returns ``202`` with ``status``
+    ``en_cola``; poll ``GET /evaluations/{run_id}`` for progress. ``404`` when the
+    ``run_id`` is unknown, ``409`` when the run is not ``completado`` — a run that
+    stopped early belongs on ``/resume``, which keeps the scores it did produce.
+    """
+    try:
+        status = await run_service.rerun_run(run_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    if status is None:
+        raise HTTPException(status_code=404, detail=f"El run {run_id!r} no existe.")
+
+    # Same off-loop enqueue as /start: kombu's SQLAlchemy transport publishes with a
+    # blocking DB round-trip.
+    await asyncio.to_thread(tasks.enqueue_run, run_id)
+    logger.info("POST /evaluations/%s/rerun en cola", run_id)
+    return EvaluationEnqueuedResponse(run_id=run_id, status=status)
+
+
 @router.patch(
     "/{run_id}/turns/selection",
     response_model=TurnSelectionResponse,

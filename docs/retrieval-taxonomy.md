@@ -9,7 +9,8 @@ and `RetrievalSummary.from_outcomes`. The stage *implementations* live behind th
 interfaces in `scorekeeper.core.retrieval.protocols`.
 
 Every stage ultimately targets the storage contract in `scorekeeper.core.retrieved_context`:
-a `{"documents": [{name, document, content, url}, ...]}` object ordered by retriever rank,
+a `{"documents": [{name, document, url, sentences, chunks}, ...]}` object ordered by
+retriever rank,
 persisted as [`RetrievedDocument`](data-model.md#retrieveddocument) child rows of a turn.
 
 ## Value objects
@@ -49,6 +50,12 @@ classDiagram
     class ExtractedContent {
         +str text
         +int|None page
+        +list~Sentence~ sentences
+    }
+    class Sentence {
+        +int|None page
+        +int index
+        +str text
     }
     class RetrievalOutcome {
         +RetrievalStatus status
@@ -66,8 +73,13 @@ classDiagram
     class RetrievedDocument {
         +str name
         +str document
-        +str content
         +str|None url
+        +list~Sentence~ sentences
+        +list~Chunk~ chunks
+    }
+    class Chunk {
+        +int index
+        +str text
     }
 
     RetrievalReport "1" o-- "*" RetrievalOutcome : outcomes
@@ -76,6 +88,9 @@ classDiagram
     RetrievalOutcome ..> AuthDecision : auth?
     RetrievalOutcome ..> RetrievedDocument : document?
     RetrievalSummary ..> RetrievalOutcome : tallies
+    ExtractedContent "1" o-- "*" Sentence : sentences
+    RetrievedDocument "1" o-- "*" Sentence : sentences
+    RetrievedDocument "1" o-- "*" Chunk : chunks
 ```
 
 Which stage produces each value object:
@@ -86,7 +101,9 @@ Which stage produces each value object:
 | `DocumentLocator` | locate | `DocumentLocatorResolver` | Fetch target: URL minus fragment, filename, `DocType`, scheme, host, page/section. |
 | `AuthDecision` | authorize | `AuthProvider` | Requirement + resolution against available credentials. |
 | `FetchedDocument` | fetch | `DocumentFetcher` | Raw bytes (never persisted); `cached` flags a local-cache hit. |
-| `ExtractedContent` | filter + extract | `ContentExtractor` | Markdown for the requested PDF page / whole document (titles, lists, tables; images dropped). |
+| `ExtractedContent` | filter + extract | `ContentExtractor` | Markdown for the requested PDF page, or for every page when the reference carries no `#page=N` (titles, lists, tables; images dropped). |
+| `Sentence` | filter + extract | `ContentExtractor` | One syntok-segmented sentence of that markdown, carrying its page and a document-wide 0-based `index`. The chunker's input; no judge reads it. |
+| `Chunk` | embed (read back) | `RetrievedContextDocument.to_document` | One stored overlapping window of a document, already narrowed to the ones closest to the turn's prompt. **The only text a judge reads** — a `RetrievedDocument` has no whole-document field. The vector never leaves the database: the ranking is a SQL `ORDER BY embedding <=> :q LIMIT :k` in `db.repositories.embeddings`. |
 | `RetrievalOutcome` | assemble | `RetrievalOutcome.assembled` | Builds one reference's terminal outcome from its `ExtractedContent`: `RETRIEVED` with a `RetrievedDocument` (via `ExtractedContent.to_document`), or `EMPTY_CONTENT` when the markdown is blank. |
 | `RetrievalReport` | assemble | `RetrievalReport.to_context` | Pure: keeps rank order (duplicates preserved), includes only `RETRIEVED` outcomes with a `document`. |
 | `RetrievalSummary` | reporting | `RetrievalSummary.from_outcomes` | Pure per-status tally for `GET /evaluations`. |

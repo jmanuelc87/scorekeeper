@@ -23,9 +23,13 @@ async def _load(db: AsyncSession, turn_id: str, *options) -> Turn | None:
 
 
 async def get_turn_with_traces(session: AsyncSession, turn_id: str) -> Turn | None:
-    """Load a turn with its metric scores and each score's structured trace."""
+    """Load a turn with its metric scores, each score's structured trace and judge calls."""
+    scores = selectinload(Turn.metric_scores)
     return await _load(
-        session, turn_id, selectinload(Turn.metric_scores).selectinload(MetricScore.trace)
+        session,
+        turn_id,
+        scores.selectinload(MetricScore.trace),
+        scores.selectinload(MetricScore.judge_calls),
     )
 
 

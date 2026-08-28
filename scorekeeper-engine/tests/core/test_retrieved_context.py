@@ -5,27 +5,43 @@ from __future__ import annotations
 import pytest
 from pydantic import ValidationError
 
-from scorekeeper.core.retrieved_context import RetrievedContext, RetrievedDocument
+from scorekeeper.core.retrieved_context import Chunk, RetrievedContext, RetrievedDocument
+
+
+def _doc(*texts: str, name: str = "", document: str = "", url: str | None = None) -> RetrievedDocument:
+    """A document whose text is ``texts``, one chunk each, in order."""
+    return RetrievedDocument(
+        name=name,
+        document=document,
+        url=url,
+        chunks=[Chunk(index=i, text=t) for i, t in enumerate(texts)],
+    )
+
+
+def test_document_content_joins_its_chunks() -> None:
+    assert _doc("uno", "dos").content == "uno\ndos"
 
 
 def test_document_node_text_joins_source_and_content() -> None:
-    doc = RetrievedDocument(
-        name="Política §3", document="manual.pdf", content="Reembolso en 30 días."
-    )
+    doc = _doc("Reembolso en 30 días.", name="Política §3", document="manual.pdf")
     assert doc.node_text() == "manual.pdf\nReembolso en 30 días."
 
 
 def test_document_node_text_strips_when_source_missing() -> None:
-    doc = RetrievedDocument(name="", document="", content="solo contenido")
-    assert doc.node_text() == "solo contenido"
+    assert _doc("solo contenido").node_text() == "solo contenido"
+
+
+def test_document_without_chunks_has_no_node_text() -> None:
+    """A document the embedding phase could not process carries no text at all."""
+    assert RetrievedDocument(name="n", document="").node_text() == ""
 
 
 def test_node_texts_preserve_order_and_drop_empty() -> None:
     context = RetrievedContext(
         documents=[
-            RetrievedDocument(name="a", document="d1", content="uno"),
-            RetrievedDocument(name="b", document="", content=""),
-            RetrievedDocument(name="c", document="d2", content="dos"),
+            _doc("uno", name="a", document="d1"),
+            _doc(name="b", document=""),
+            _doc("dos", name="c", document="d2"),
         ]
     )
     # Rank order kept; the empty-node document is dropped.
@@ -34,18 +50,16 @@ def test_node_texts_preserve_order_and_drop_empty() -> None:
 
 def test_is_empty() -> None:
     assert RetrievedContext().is_empty
-    assert not RetrievedContext(
-        documents=[RetrievedDocument(name="", document="", content="x")]
-    ).is_empty
+    assert not RetrievedContext(documents=[_doc("x")]).is_empty
 
 
 def test_render_includes_label_source_url_and_content() -> None:
     context = RetrievedContext(
         documents=[
-            RetrievedDocument(
+            _doc(
+                "Reembolso en 30 días.",
                 name="Política de reembolsos",
                 document="manual.pdf",
-                content="Reembolso en 30 días.",
                 url="https://ejemplo.com/manual",
             )
         ]
@@ -61,33 +75,15 @@ def test_render_empty_is_blank() -> None:
     assert RetrievedContext().render() == ""
 
 
-def test_from_blob_blank_line_splits_into_content_only_docs() -> None:
-    context = RetrievedContext.from_blob("doc uno\ncon dos líneas\n\ndoc dos")
-    assert context.documents == [
-        RetrievedDocument(name="", document="", content="doc uno\ncon dos líneas"),
-        RetrievedDocument(name="", document="", content="doc dos"),
-    ]
-
-
-def test_from_blob_empty_and_whitespace_yield_no_docs() -> None:
-    assert RetrievedContext.from_blob("").documents == []
-    assert RetrievedContext.from_blob("  \n  ").documents == []
-    assert RetrievedContext.from_blob(None).documents == []
-
-
-def test_from_blob_single_document() -> None:
-    context = RetrievedContext.from_blob("único documento")
-    assert context.node_texts() == ["único documento"]
-
-
 def test_model_validate_round_trip() -> None:
     payload = {
         "documents": [
             {
                 "name": "n",
                 "document": "d",
-                "content": "c",
                 "url": "https://ejemplo.com",
+                "sentences": [{"page": 1, "index": 0, "text": "c"}],
+                "chunks": [{"index": 0, "text": "c"}],
             }
         ]
     }
@@ -96,10 +92,9 @@ def test_model_validate_round_trip() -> None:
 
 
 def test_url_defaults_to_none() -> None:
-    doc = RetrievedDocument(name="n", document="d", content="c")
-    assert doc.url is None
+    assert _doc("c", name="n", document="d").url is None
 
 
 def test_required_fields_enforced() -> None:
     with pytest.raises(ValidationError):
-        RetrievedDocument(name="n", content="c")  # missing ``document``
+        RetrievedDocument(name="n")  # missing ``document``

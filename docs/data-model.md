@@ -381,20 +381,30 @@ assembled from these rows; a turn with no rows has no retrieved context.
 | `rank` | Float | Retriever order within the turn (integer or float; 0-based); `contextual_precision` relies on it. |
 | `name` | Text | Short label/title for the retrieved item. |
 | `document` | Text | Source document reference (filename, title, id). |
-| `content` | Text | The retrieved text. |
 | `url` | Text | Source URL for retrieved web documents; `NULL` otherwise. |
+| `sentences` | JSONB | The document's text as the extract stage segmented it, `[{page, index, text}, ...]`. The chunker's input. `NULL` on rows retrieved before segmentation existed — those carry no text at all. |
 
-Groundedness metrics evaluate each document's *node text* — its `document` plus
-`content` — via `RetrievedContext.node_texts()`. Legacy plain-text spreadsheet cells
-still import: `RetrievedContext.from_blob` blank-line-splits them into content-only
-documents.
+**A document holds no whole-document text.** Its text lives on its chunks
+(`RetrievedDocumentEmbedding`), and groundedness metrics evaluate its *node text* — the
+`document` reference plus the chunks selected for that turn — via
+`RetrievedContext.node_texts()`. A document whose chunks were never written (a row
+retrieved before segmentation existed, or one whose sentences could not be chunked)
+therefore contributes no node at all.
+
+`sentences` is **the chunker's input, not judge input**: the retrieval pipeline's extract stage
+splits the markdown with syntok (`scorekeeper.core.text.split_sentences`), keeping the 1-based
+PDF page each sentence came from (`NULL` for DOCX/HTML, which have no pages) and a
+document-wide 0-based `index` that lines up with `RetrievedDocumentEmbedding.chunk_index`. It
+is the granularity a chunker groups into embedding rows — see
+[Retrieval pipeline → Sentences](retrieval-pipeline.md#sentences). The cost is that a document's
+text is stored roughly twice (once as `content`, once across `sentences`).
 
 ### RetrievedDocumentEmbedding
 
-One chunk of a retrieved document, with its embedding — the chunked projection of
-`RetrievedDocument.content`, one row per chunk in `chunk_index` order. It exists so a
-consumer can retrieve or re-rank at *chunk* granularity instead of handing a judge the
-whole document, which is what every context-reading metric does today.
+One chunk of a retrieved document, with its embedding — **the document's only stored
+text**, one row per overlapping sentence window in `chunk_index` order. At scoring time a
+judge is handed only the `embedding_top_k` chunks closest to the turn's prompt, so it
+never sees a whole document.
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -402,16 +412,46 @@ whole document, which is what every context-reading metric does today.
 | `retrieved_document_id` | UUID | FK → `retrieved_documents.id`, `ON DELETE CASCADE` (indexed). |
 | `chunk_index` | Integer | Order of the chunk within its document, 0-based. Unique per document (`uq_retrieved_document_embeddings_chunk`), so re-embedding replaces chunks instead of accumulating them. |
 | `content` | Text | The chunk's own text — what was embedded, kept so a hit reads back without re-splitting the parent. |
-| `embedding` | vector(1536) | The chunk's embedding. JSON on the SQLite fallback. |
+| `embedding` | vector(768) | The chunk's embedding; `NULL` when it was stored without one. JSON on the SQLite fallback. |
+| `page` | Integer | 1-based page the chunk's **first** sentence came from. `NULL` for DOCX/HTML, and on rows written before this column existed. |
+| `sentence_start` | Integer | First `Sentence.index` the chunk spans, indexing `retrieved_documents.sentences`. |
+| `sentence_end` | Integer | Last `Sentence.index` the chunk spans, **inclusive**. |
 
-**Nothing populates this table yet** — it is the storage layer, ahead of the chunker and
-the consumer. The embedding *producer* already exists behind the `Judge.embed` seam
-(`scorekeeper.core.metrics.judge`), used in memory today by `answer_relevance`.
+The last three are **provenance, stored but never read back**: they exist to cite a chunk
+(«informe.pdf, p. 3») or audit it against the document's sentences, and the retrieval query
+deliberately does not select them — putting them in the `Chunk` value object would change
+the `TurnView` that `metrics.fingerprint` hashes and re-score the whole corpus. Note the
+page is the *first* sentence's: a window of several sentences can straddle a page break,
+and only one page is kept, so such a chunk is filed under the page its head came from.
 
-The width is fixed at **1536** (`db.models.EMBEDDING_DIMENSIONS`), matching the default
-embedder `openai_embedding_model` = `text-embedding-3-small`. Fixed rather than free
-because pgvector can only index a column of known width; the cost is that an embedder
-of a different width does not fit and cannot populate the table.
+Read back by `db.repositories.embeddings.chunks_for_turn`, which ranks the chunks of each
+document against the turn's prompt **in SQL** (`ORDER BY embedding <=> :q LIMIT :k`, one
+`LATERAL` per document) and never selects the vector itself. A chunk with a `NULL`
+embedding sorts last and may fall outside the top-`k`, so a partially embedded document can
+be truncated — see
+[Retrieval pipeline → What the judge reads](retrieval-pipeline.md#what-the-judge-reads) for
+the HNSW caveats.
+
+Written by the **embedding phase** (`scorekeeper.core.services.embedding`), which groups
+`RetrievedContextDocument.sentences` into windows of `embedding_chunk_sentences` sharing
+`embedding_chunk_overlap` and embeds each one through
+`core.retrieval.embed.OpenAIEmbedder` — a client of its own, not the judge's
+`Judge.embed`. See [Retrieval pipeline → Embedding](retrieval-pipeline.md#embedding).
+
+**`embedding` is nullable because chunking and embedding are separable.** The chunks are
+the document's only text, so they are written whatever happens; the vector is the
+enrichment that lets scoring narrow them to the turn's prompt. A deployment with no
+`openai_api_key` stores chunks with a `NULL` embedding, and a judge still reads the whole
+document — only the narrowing is lost.
+
+The width is fixed at **768** (`db.models.EMBEDDING_DIMENSIONS`) — nomic-embed-text, the
+model an OpenAI-compatible local server (LM Studio, reached through `openai_base_url`)
+serves. Fixed rather than free because pgvector can only index a column of known width,
+so this and `openai_embedding_model` have to agree: OpenAI's `text-embedding-3-small` is
+1536 wide and its vectors are rejected by `retrieval.embed.OpenAIEmbedder` before the
+INSERT. Changing the width takes a migration **and** a re-embed — pgvector cannot cast a
+stored vector to another width, so the migration empties the table (the text is rebuilt
+from `retrieved_documents.sentences`, the embeddings are paid for again).
 
 The table is **PostgreSQL-only in practice**. It needs the `vector` extension — the
 Compose `database` service runs `pgvector/pgvector:pg17` for that reason — and carries an

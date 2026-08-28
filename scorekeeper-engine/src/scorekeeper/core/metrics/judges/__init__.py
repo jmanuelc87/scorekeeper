@@ -108,6 +108,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
                 system_prompt=settings.judge_system_prompt,
                 embedder=embedder,
                 step_models=_step_models(settings, settings.anthropic_judge_model),
+                fallback_model=settings.judge_fallback_model,
                 timeout=settings.judge_timeout_seconds,
             ),
             settings,

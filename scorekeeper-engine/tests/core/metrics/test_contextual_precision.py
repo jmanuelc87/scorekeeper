@@ -7,6 +7,8 @@ tests are independent of the isolated ``registered_metrics`` registry.
 
 from __future__ import annotations
 
+import re
+
 import pytest
 
 from scorekeeper.core.metrics.base import NOT_APPLICABLE, TurnView
@@ -14,7 +16,11 @@ from scorekeeper.core.metrics.catalog.contextual_precision import (
     ContextualPrecision,
     RelevanceVerdict,
 )
-from scorekeeper.core.retrieved_context import RetrievedContext
+from scorekeeper.core.retrieved_context import (
+    Chunk,
+    RetrievedContext,
+    RetrievedDocument,
+)
 from seeded_prompts import build
 
 
@@ -26,11 +32,27 @@ def _verdicts(*relevant: bool):
     ]
 
 
+def _context(blob: str) -> RetrievedContext:
+    """Blank-line-separated blocks as content-only documents, one chunk each.
+
+    Stands in for the retired ``RetrievedContext.from_blob``: these tests care about how
+    many nodes a judge sees and in what order, not about where the text came from.
+    """
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", blob)]
+    return RetrievedContext(
+        documents=[
+            RetrievedDocument(name="", document="", chunks=[Chunk(index=0, text=b)])
+            for b in blocks
+            if b
+        ]
+    )
+
+
 def _turn(context: str, *, expected_output: str = "La respuesta correcta.") -> TurnView:
     return TurnView(
         prompt="¿Cuál es la política de devoluciones?",
         response="Puedes devolver en 30 días con recibo.",
-        retrieved_context=RetrievedContext.from_blob(context),
+        retrieved_context=_context(context),
         expected_output=expected_output,
     )
 

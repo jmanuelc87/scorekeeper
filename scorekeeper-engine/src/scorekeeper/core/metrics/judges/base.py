@@ -108,11 +108,20 @@ def record_usage(*, input_tokens: int | None, output_tokens: int | None) -> None
 
     ``None`` counts are treated as 0 so a provider (or a test fake) that omits
     ``usage`` contributes nothing rather than raising.
+
+    The same counts are also attributed to the judge call currently open under
+    ``record_judge_call`` (see below), so per-call rows carry their own tokens
+    without every judge having to thread them through its ``_record_usage``.
     """
+    inputs = int(input_tokens or 0)
+    outputs = int(output_tokens or 0)
     accumulator = _usage_var.get()
-    if accumulator is None:
-        return
-    accumulator.add(input_tokens=int(input_tokens or 0), output_tokens=int(output_tokens or 0))
+    if accumulator is not None:
+        accumulator.add(input_tokens=inputs, output_tokens=outputs)
+    record = _call_var.get()
+    if record is not None:
+        record.input_tokens += inputs
+        record.output_tokens += outputs
 
 
 @contextmanager
@@ -128,6 +137,105 @@ def collect_usage(accumulator: UsageAccumulator) -> Generator[UsageAccumulator]:
         yield accumulator
     finally:
         _usage_var.reset(token)
+
+
+# --- Per-call prompt recording ------------------------------------------------
+# Same shape, same reason as the usage collection above: the text actually sent to the
+# model has nowhere to live on the ``Judge`` seam's return types, and it is exactly what
+# makes a score auditable — a multi-call metric (one call per claim, per document)
+# collapses into a single ``MetricScore`` row. So each judge wraps its model call in
+# ``record_judge_call``; the runner activates a recorder per metric with ``collect_calls``
+# and persists the snapshot. Outside a scope everything is a no-op.
+
+
+class JudgeCallRecord(BaseModel):
+    """One LLM call a judge made: what was sent, on which model, and what it cost."""
+
+    step: str | None = None
+    model: str
+    system_prompt: str
+    prompt: str
+    latency_ms: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+
+
+class CallRecorder:
+    """A thread-safe, ordered log of :class:`JudgeCallRecord`.
+
+    One recorder per metric evaluation (see ``scorekeeper.core.runner``). No metric
+    fans its judge calls out across threads, so append order is call order — but the
+    lock is kept anyway, mirroring :class:`UsageAccumulator`, so a future concurrent
+    metric cannot corrupt the list.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._calls: list[JudgeCallRecord] = []
+
+    def add(self, record: JudgeCallRecord) -> None:
+        with self._lock:
+            self._calls.append(record)
+
+    def snapshot(self) -> list[JudgeCallRecord]:
+        with self._lock:
+            return list(self._calls)
+
+
+# The recorder active on the current context, and the call currently open inside it.
+# Both are ``ContextVar``s for the same reason ``_usage_var`` is: each ``to_thread``
+# worker gets a copy of the context, so a metric's activation cannot leak to a sibling.
+_calls_var: contextvars.ContextVar[CallRecorder | None] = contextvars.ContextVar(
+    "scorekeeper_call_recorder", default=None
+)
+_call_var: contextvars.ContextVar[JudgeCallRecord | None] = contextvars.ContextVar(
+    "scorekeeper_open_judge_call", default=None
+)
+
+
+@contextmanager
+def collect_calls(recorder: CallRecorder) -> Generator[CallRecorder]:
+    """Activate ``recorder`` for judge calls made inside the ``with`` block."""
+    token = _calls_var.set(recorder)
+    try:
+        yield recorder
+    finally:
+        _calls_var.reset(token)
+
+
+@contextmanager
+def record_judge_call(
+    *,
+    step: JudgeStep | str | None,
+    model: str,
+    system_prompt: str,
+    prompt: str,
+) -> Generator[None]:
+    """Record the call made inside the block on the active recorder; no-op without one.
+
+    The record is appended in ``finally``, so a call that raised is still logged: the
+    prompt was sent and the tokens were paid for, and a failed call is precisely the
+    one worth reading back. Timed with ``perf_counter`` (monotonic), which includes any
+    ``judge_call`` retry — that is the latency the pipeline really waited.
+    """
+    recorder = _calls_var.get()
+    if recorder is None:
+        yield
+        return
+    record = JudgeCallRecord(
+        step=JudgeStep(step).value if step is not None else None,
+        model=model,
+        system_prompt=system_prompt,
+        prompt=prompt,
+    )
+    token = _call_var.set(record)
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        record.latency_ms = int((time.perf_counter() - started) * 1000)
+        _call_var.reset(token)
+        recorder.add(record)
 
 
 class StepModels:
@@ -387,19 +495,31 @@ class _SafeDict(dict):
         return "{" + key + "}"
 
 
+def _tagged_context(turn: TurnView) -> str:
+    """Retrieved context wrapped in ``<contexto>`` tags (``""`` when there is none).
+
+    The tags delimit where the retrieved context starts and ends so the judge can
+    tell it apart from the rubric and the turn's own text.
+    """
+    if turn.retrieved_context.is_empty:
+        return ""
+    return f"<contexto>\n{turn.retrieved_context.render()}\n</contexto>"
+
+
 def _fill_placeholders(template: str, turn: TurnView) -> str:
     """Substitute ``{prompt}``/``{response}``/``{context}`` in ``template``.
 
-    ``{context}`` expands to the retrieved-context blob (empty when there is none).
-    Rubric text may contain stray braces (e.g. JSON examples); fall back to the raw
-    template if it cannot be formatted rather than raising.
+    ``{context}`` expands to the retrieved-context blob wrapped in ``<contexto>``
+    tags (empty when there is none). Rubric text may contain stray braces (e.g. JSON
+    examples); fall back to the raw template if it cannot be formatted rather than
+    raising.
     """
     try:
         return template.format_map(
             _SafeDict(
                 prompt=turn.prompt,
                 response=turn.response,
-                context=turn.retrieved_context.render(),
+                context=_tagged_context(turn),
             )
         )
     except (ValueError, IndexError, KeyError):
@@ -423,7 +543,7 @@ def render_prompt(instructions: str, turn: TurnView) -> str:
             parts.append(f"      Asistente: {response}")
     if not turn.retrieved_context.is_empty:
         parts.append("--- Contexto recuperado ---")
-        parts.append(turn.retrieved_context.render())
+        parts.append(_tagged_context(turn))
     parts.append(f"Usuario: {turn.prompt}")
     parts.append(f"Asistente: {turn.response}")
     return "\n".join(parts)

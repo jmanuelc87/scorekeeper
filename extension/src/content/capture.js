@@ -419,7 +419,8 @@
    * Serialized as a JSON array of `{name, url}` records — one element per retrieved
    * source — so the backend persists structured JSON in the column and splits it
    * into one document per element (`split_context_docs`), which is what
-   * `contextual_precision` ranks. `name` is omitted when a source has no title.
+   * `contextual_precision` ranks. `name` is omitted when a source has no title and
+   * capped at 100 characters when it has a long one.
    *
    * Only what was actually *retrieved* is recorded, never the sentence the chip is
    * anchored to: that text is the model's own output, and grounding a response
@@ -460,8 +461,27 @@
     }
 
     if (seen.size === 0) return "";
-    const sources = Array.from(seen, ([url, name]) => (name ? { name, url } : { url }));
+    const sources = Array.from(seen, ([url, name]) => {
+      const title = capName(name);
+      return title ? { name: title, url } : { url };
+    });
     return JSON.stringify(sources);
+  }
+
+  /** The longest `name` a citation record may carry, ellipsis included. */
+  const MAX_NAME_LENGTH = 100;
+
+  /**
+   * A citation `name` capped at `MAX_NAME_LENGTH`, ending in `…` when it was cut.
+   *
+   * Some chips spell out a whole headline (or the first sentence of the source) as
+   * their label; the column only needs enough to recognise the source, and the URL
+   * identifies it either way. The ellipsis keeps the truncation visible to whoever
+   * reads the turn.
+   */
+  function capName(name) {
+    if (name.length <= MAX_NAME_LENGTH) return name;
+    return `${name.slice(0, MAX_NAME_LENGTH - 1)}…`;
   }
 
   /**

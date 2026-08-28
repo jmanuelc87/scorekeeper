@@ -21,24 +21,55 @@ from scorekeeper.db.models import (
     Turn,
 )
 from scorekeeper.core.retrieval.credentials.secrets import SecretError
-from scorekeeper.core.retrieved_context import RetrievedDocument
+from scorekeeper.core.retrieved_context import Chunk, RetrievedDocument, Sentence
 
 
 def test_from_document_maps_fields_and_rank() -> None:
-    doc = RetrievedDocument(name="n", document="d.pdf", content="c", url="http://x")
+    doc = RetrievedDocument(name="n", document="d.pdf", url="http://x")
     row = RetrievedContextDocument.from_document(doc, rank=3)
-    assert (row.rank, row.name, row.document, row.content, row.url) == (
-        3,
-        "n",
-        "d.pdf",
-        "c",
-        "http://x",
+    assert (row.rank, row.name, row.document, row.url) == (3, "n", "d.pdf", "http://x")
+
+
+def test_sentences_round_trip_as_json() -> None:
+    doc = RetrievedDocument(
+        name="n",
+        document="d.pdf",
+        sentences=[
+            Sentence(page=1, index=0, text="Una."),
+            Sentence(page=2, index=1, text="Dos."),
+        ],
     )
+    row = RetrievedContextDocument.from_document(doc, rank=0)
+    assert row.sentences == [
+        {"page": 1, "index": 0, "text": "Una."},
+        {"page": 2, "index": 1, "text": "Dos."},
+    ]
 
 
-def test_to_document_round_trips() -> None:
-    doc = RetrievedDocument(name="n", document="d.pdf", content="c", url=None)
-    assert RetrievedContextDocument.from_document(doc, rank=0).to_document() == doc
+def test_to_document_reads_the_text_off_the_chunks_it_is_given() -> None:
+    """Sentences go in; chunks come out — the write and read paths are not symmetric.
+
+    The chunks arrive already ranked and limited by ``repositories.embeddings``; the row
+    never consults its own ``embeddings`` relationship, which is not eager-loaded.
+    """
+    row = RetrievedContextDocument(rank=0, name="n", document="d.pdf")
+    doc = row.to_document([Chunk(index=0, text="uno"), Chunk(index=1, text="dos")])
+    assert [(c.index, c.text) for c in doc.chunks] == [(0, "uno"), (1, "dos")]
+    assert doc.content == "uno\ndos"
+    assert doc.sentences == []  # the chunker's input, not judge input
+
+
+def test_to_document_without_chunks_has_no_text() -> None:
+    row = RetrievedContextDocument(rank=0, name="n", document="d.pdf")
+    assert row.to_document().content == ""
+    assert row.to_document(None).chunks == []
+
+
+def test_row_without_sentences_projects_to_an_empty_list() -> None:
+    """A row stored before segmentation existed carries NULL, not a JSON array."""
+    row = RetrievedContextDocument(rank=0, name="n", document="d.pdf")
+    assert row.sentences is None
+    assert row.to_document().sentences == []
 
 
 def test_auth_provider_from_sharepoint_encrypts_and_round_trips() -> None:
@@ -236,7 +267,7 @@ async def test_deleting_a_run_cascades_into_document_embeddings(
     turn = Turn(turn_number=1, prompt="p", response="r")
     PlatformExecution(platform="claude", scenario_result=scenario).turns.append(turn)
     document = RetrievedContextDocument(
-        rank=0, name="doc", document="d.pdf", content="uno dos", url=None
+        rank=0, name="doc", document="d.pdf", url=None
     )
     turn.retrieved_documents.append(document)
     # Two chunks of the one document. The vectors are short on purpose: this asserts the
@@ -274,7 +305,7 @@ async def test_document_embedding_chunk_index_is_unique_per_document(
     turn = Turn(turn_number=1, prompt="p", response="r")
     PlatformExecution(platform="claude", scenario_result=scenario).turns.append(turn)
     document = RetrievedContextDocument(
-        rank=0, name="doc", document="d.pdf", content="uno", url=None
+        rank=0, name="doc", document="d.pdf", url=None
     )
     turn.retrieved_documents.append(document)
     document.embeddings.append(

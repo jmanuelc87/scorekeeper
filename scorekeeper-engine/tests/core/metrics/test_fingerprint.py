@@ -13,7 +13,7 @@ from scorekeeper.core.metrics.base import Metric, MetricResult, TurnView
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.fingerprint import scoring_key
 from scorekeeper.core.metrics.scale import Unit
-from scorekeeper.core.retrieved_context import RetrievedContext, RetrievedDocument
+from scorekeeper.core.retrieved_context import Chunk, RetrievedContext, RetrievedDocument
 
 
 class Utilidad(Metric):
@@ -37,8 +37,8 @@ def _view(**overrides) -> TurnView:
         history=[("hola", "buenas")],
         retrieved_context=RetrievedContext(
             documents=[
-                RetrievedDocument(name="a", document="d1.pdf", content="uno", url=None),
-                RetrievedDocument(name="b", document="d2.pdf", content="dos", url=None),
+                RetrievedDocument(name="a", document="d1.pdf", chunks=[Chunk(index=0, text="uno")], url=None),
+                RetrievedDocument(name="b", document="d2.pdf", chunks=[Chunk(index=0, text="dos")], url=None),
             ]
         ),
         expected_output="Renovar desde el portal.",
@@ -99,16 +99,16 @@ class _OtraRubrica(Utilidad):
                     retrieved_context=RetrievedContext(
                         documents=[
                             RetrievedDocument(
-                                name="a", document="d1.pdf", content="UNO", url=None
+                                name="a", document="d1.pdf", chunks=[Chunk(index=0, text="UNO")], url=None
                             ),
                             RetrievedDocument(
-                                name="b", document="d2.pdf", content="dos", url=None
+                                name="b", document="d2.pdf", chunks=[Chunk(index=0, text="dos")], url=None
                             ),
                         ]
                     )
                 )
             ),
-            id="context_content",
+            id="context_chunk_text",
         ),
         pytest.param(
             lambda: _key(
@@ -116,10 +116,10 @@ class _OtraRubrica(Utilidad):
                     retrieved_context=RetrievedContext(
                         documents=[
                             RetrievedDocument(
-                                name="b", document="d2.pdf", content="dos", url=None
+                                name="b", document="d2.pdf", chunks=[Chunk(index=0, text="dos")], url=None
                             ),
                             RetrievedDocument(
-                                name="a", document="d1.pdf", content="uno", url=None
+                                name="a", document="d1.pdf", chunks=[Chunk(index=0, text="uno")], url=None
                             ),
                         ]
                     )

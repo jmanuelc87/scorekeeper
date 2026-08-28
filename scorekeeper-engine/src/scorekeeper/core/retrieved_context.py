@@ -1,32 +1,54 @@
 """Structured retrieved context for a turn.
 
-A turn's ``retrieved_context`` is the set of documents a RAG answer was grounded
-on. It is stored on the ``Turn`` row as a JSON object with the canonical shape::
+A turn's ``retrieved_context`` is the set of documents a RAG answer was grounded on,
+assembled from the ``retrieved_documents`` rows of that turn::
 
-    {"documents": [{"name": ..., "document": ..., "content": ..., "url": ...}, ...]}
+    {"documents": [{"name": ..., "document": ..., "url": ..., "chunks": [...]}, ...]}
 
 The array is **ordered by retriever rank** (rank 1 first) — ``contextual_precision``
-relies on that order. Each ``RetrievedDocument`` carries a ``name`` (label/title), a
-``document`` (source reference such as a filename or title), the ``content`` (the
-retrieved text), and an optional ``url`` for web documents.
+relies on that order, which is the *platform's* retriever order and never ours.
+
+A document carries no whole-document text. Its text arrives as ``chunks``: the
+overlapping sentence windows the embedding phase stored, already narrowed to the ones
+most similar to the turn's prompt (``db.repositories.embeddings``). The
+``sentences`` field is the other direction — what the extract stage produced on the way
+*in*, and the chunker's input; it is left empty when a document is read back for scoring.
 
 Groundedness metrics (``hallucination``, ``contextual_precision``) evaluate each
-document's *node text* — its ``document`` plus ``content`` — via :meth:`node_texts`,
-which replaces the old ``split_context_docs`` blank-line splitter. Judges render the
-whole context to Spanish text via :meth:`RetrievedContext.render`.
-
-``from_blob`` keeps legacy plain-text spreadsheet cells importing losslessly by
-blank-line-splitting them into content-only documents.
+document's *node text* — its ``document`` plus its selected chunks — via
+:meth:`node_texts`. Judges render the whole context to Spanish text via
+:meth:`RetrievedContext.render`.
 """
 
 from __future__ import annotations
 
-import re
-
 from pydantic import BaseModel
 
-# Legacy blank-line document delimiter, kept for plain-text ``.xlsx`` cells.
-_BLANK_LINE = re.compile(r"\n\s*\n")
+
+class Sentence(BaseModel):
+    """One sentence segmented out of a retrieved document.
+
+    The chunker's input, not judge input: what a judge reads is the selected
+    :class:`Chunk` list. ``page`` is the 1-based PDF page the sentence came from
+    (``None`` for DOCX/HTML, which carry no page boundaries), and ``index`` orders
+    the sentence within its whole document (0-based, never restarting per page).
+    """
+
+    page: int | None = None
+    index: int
+    text: str
+
+
+class Chunk(BaseModel):
+    """One stored, embedded window of a document, as handed to a judge.
+
+    The embedding itself never leaves the database: the ranking runs in SQL
+    (``db.repositories.embeddings``), so the vectors never enter the ``TurnView``
+    that ``metrics.fingerprint`` hashes whole.
+    """
+
+    index: int  # Order of the chunk within its document, 0-based.
+    text: str
 
 
 class RetrievedDocument(BaseModel):
@@ -34,13 +56,21 @@ class RetrievedDocument(BaseModel):
 
     name: str  # Short label/title for the retrieved item.
     document: str  # Source document reference (filename, title, id).
-    content: str  # The retrieved text.
     url: str | None = None  # Source URL, for retrieved web documents.
+    # Write path (extract -> database): the document's sentences, page-attributed.
+    sentences: list[Sentence] = []
+    # Read path (database -> judge): the chunks selected for this turn, in document order.
+    chunks: list[Chunk] = []
+
+    @property
+    def content(self) -> str:
+        """The selected chunks as one block of text."""
+        return "\n".join(chunk.text for chunk in self.chunks)
 
     def node_text(self) -> str:
         """Text a groundedness judge evaluates for this document.
 
-        The premise/node is the source ``document`` followed by its ``content``.
+        The premise/node is the source ``document`` followed by its selected chunks.
         """
         return f"{self.document}\n{self.content}".strip()
 
@@ -81,20 +111,3 @@ class RetrievedContext(BaseModel):
             if block:
                 blocks.append(block)
         return "\n\n".join(blocks)
-
-    @classmethod
-    def from_blob(cls, text: str | None) -> "RetrievedContext":
-        """Build a context from a legacy plain-text cell.
-
-        Blank-line-separated blocks become content-only documents (``name`` and
-        ``document`` empty, ``url`` ``None``), preserving the old splitting
-        behaviour for spreadsheets that predate the JSON schema.
-        """
-        blocks = [block.strip() for block in _BLANK_LINE.split(text or "")]
-        return cls(
-            documents=[
-                RetrievedDocument(name="", document="", content=block)
-                for block in blocks
-                if block
-            ]
-        )

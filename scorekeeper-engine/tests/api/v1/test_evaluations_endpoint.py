@@ -237,6 +237,55 @@ async def test_resume_endpoint_not_resumable_409(monkeypatch) -> None:
     assert "enqueued" not in captured  # a live chain never gets a second job
 
 
+async def test_rerun_endpoint_enqueues_and_returns_queued(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_rerun(run_id, **kw):
+        captured["rerun"] = run_id
+        return "en_cola"
+
+    monkeypatch.setattr(run_service, "rerun_run", fake_rerun)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/evaluations/run-123/rerun")
+
+    # 202 Accepted; the finished run is wiped back to en_cola and scored again.
+    assert response.status_code == 202
+    assert response.json() == {"run_id": "run-123", "status": "en_cola"}
+    assert captured["rerun"] == "run-123"
+    assert captured["enqueued"] == "run-123"
+
+
+async def test_rerun_endpoint_unknown_run_404(monkeypatch) -> None:
+    captured: dict = {}
+
+    monkeypatch.setattr(run_service, "rerun_run", _async_none)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/evaluations/does-not-exist/rerun")
+
+    assert response.status_code == 404
+    assert "enqueued" not in captured  # nothing enqueued for an unknown run
+
+
+async def test_rerun_endpoint_unfinished_run_409(monkeypatch) -> None:
+    captured: dict = {}
+
+    async def fake_rerun(run_id, **kw):
+        raise ValueError("El run no se puede re-ejecutar desde el estado 'parcial'.")
+
+    monkeypatch.setattr(run_service, "rerun_run", fake_rerun)
+    monkeypatch.setattr(tasks, "enqueue_run", lambda run_id: captured.update(enqueued=run_id))
+
+    with TestClient(app) as client:
+        response = client.post("/api/v1/evaluations/run-123/rerun")
+
+    assert response.status_code == 409
+    assert "enqueued" not in captured  # a run that is not finished never re-runs
+
+
 async def test_selection_endpoint_returns_updated_count(monkeypatch) -> None:
     captured: dict = {}
 
