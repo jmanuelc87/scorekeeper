@@ -15,8 +15,8 @@ network, PDF, HTML, or auth logic. The only behaviour here is the trivial, pure
 assembly helpers ``RetrievalReport.to_context`` and ``RetrievalSummary.from_outcomes``.
 
 Every stage ultimately targets the storage contract in
-``scorekeeper.core.retrieved_context``: ``{"documents": [{name, document, content, url}, ...]}``
-ordered by retriever rank.
+``scorekeeper.core.retrieved_context``:
+``{"documents": [{name, document, content, url, sentences}, ...]}`` ordered by retriever rank.
 """
 
 from __future__ import annotations
@@ -26,7 +26,7 @@ from enum import StrEnum
 
 from pydantic import BaseModel
 
-from scorekeeper.core.retrieved_context import RetrievedContext, RetrievedDocument
+from scorekeeper.core.retrieved_context import RetrievedContext, RetrievedDocument, Sentence
 
 # Run-level status a benchmark run carries while its documents are being retrieved,
 # so ``GET /evaluations`` can surface the retrieval phase. Defined here alongside the
@@ -134,10 +134,15 @@ class FetchedDocument(BaseModel):
 
 
 class ExtractedContent(BaseModel):
-    """Text selected for the requested page/section (Filter+Extract-stage output)."""
+    """Text selected for the requested page/section (Filter+Extract-stage output).
+
+    ``text`` is the markdown a judge will read; ``sentences`` is the same text
+    segmented per page for a later chunker (see :class:`Sentence`).
+    """
 
     text: str
     page: int | None = None
+    sentences: list[Sentence] = []
 
     def to_document(
         self, source: "SourceRef", locator: "DocumentLocator"
@@ -154,6 +159,7 @@ class ExtractedContent(BaseModel):
             document=locator.filename or source.name or locator.document_url,
             content=self.text,
             url=source.url or None,
+            sentences=self.sentences,
         )
 
 

@@ -6,7 +6,7 @@ import json
 
 from collections.abc import Mapping
 
-from scorekeeper.core.retrieved_context import RetrievedDocument
+from scorekeeper.core.retrieved_context import Chunk, RetrievedDocument
 from scorekeeper.core.retrieval import (
     STATUS_EN_RECUPERACION,
     AuthDecision,
@@ -118,7 +118,10 @@ def _retrieved(rank: int, content: str) -> RetrievalOutcome:
         source=SourceRef(name=f"n{rank}", url=f"u{rank}", rank=rank),
         status=RetrievalStatus.RETRIEVED,
         document=RetrievedDocument(
-            name=f"n{rank}", document=f"doc{rank}.pdf", content=content, url=f"u{rank}"
+            name=f"n{rank}",
+            document=f"doc{rank}.pdf",
+            url=f"u{rank}",
+            chunks=[Chunk(index=0, text=content)],
         ),
     )
 

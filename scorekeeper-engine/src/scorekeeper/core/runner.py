@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import uuid
 from collections.abc import Mapping
 
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -71,7 +72,9 @@ from scorekeeper.core.metrics.judges import make_judge
 from scorekeeper.core.metrics.judges.base import UsageAccumulator, collect_usage
 from scorekeeper.core.metrics.rollup import execution_average, turn_score
 from scorekeeper.core.metrics.selection import active_templates, metrics_for, resolve
-from scorekeeper.core.retrieved_context import RetrievedContext
+from scorekeeper.core.retrieval.embed import Embedder, EmbedError
+from scorekeeper.core.retrieved_context import Chunk, RetrievedContext
+from scorekeeper.db.repositories import embeddings as embeddings_repo
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +118,10 @@ class EvalRunner:
 
     Construct with an ``AsyncSession`` and, optionally, a ``Judge`` (defaults to the
     configured judge from ``make_judge()``). Tests inject a stub judge.
+
+    ``embedder`` narrows what context a judge sees: the turn's prompt is embedded once
+    and each document keeps only its ``embedding_top_k`` closest chunks. ``None`` — no
+    embedder configured, or none passed — hands over every stored chunk instead.
     """
 
     def __init__(
@@ -122,9 +129,11 @@ class EvalRunner:
         session: AsyncSession,
         judge: Judge | None = None,
         templates: Mapping[str, dict[str, PromptVersion]] | None = None,
+        embedder: Embedder | None = None,
     ) -> None:
         self.session = session
         self.judge = judge or make_judge()
+        self.embedder = embedder
         # The prompt versions this run is pinned to, resolved once by ``score_run``.
         # Per-run immutable configuration, like ``judge`` — which is why it lives here
         # rather than being threaded through ``run_benchmark``: every level of the
@@ -307,7 +316,16 @@ class EvalRunner:
         ``history`` is in the key, so editing one turn's text invalidates every later
         turn of that conversation; that is correct, since their judges saw it.
         """
-        view = self._to_turn_view(turn, history or [])
+        query_embedding = await self._query_embedding(turn)
+        chunks = await embeddings_repo.chunks_for_turn(
+            self.session,
+            turn_id=turn.id,
+            query_embedding=query_embedding,
+            # Only meaningful with something to rank against; without it every chunk is
+            # returned whatever ``k`` says, so settings are not consulted at all.
+            k=get_settings().embedding_top_k if query_embedding is not None else 0,
+        )
+        view = self._to_turn_view(turn, history or [], chunks)
         # ``run_scenario`` passes the ids it already flattened; a per-turn caller
         # (``services.chain``) only pins them on the runner, so fall back to those —
         # otherwise the same turn would fingerprint differently on each path.
@@ -503,8 +521,42 @@ class EvalRunner:
             turn.token_usage.output_tokens = snapshot.output_tokens
 
     # ---- Helpers ------------------------------------------------------------
-    def _to_turn_view(self, turn: Turn, history: list[tuple[str, str]]) -> TurnView:
-        """Project an ORM ``Turn`` into the SDK-free ``TurnView`` metrics consume."""
+    async def _query_embedding(self, turn: Turn) -> list[float] | None:
+        """Embed the turn's prompt, once, to rank its documents' chunks against it.
+
+        ``None`` whenever ranking is impossible or pointless — no embedder, no retrieved
+        documents — and also when embedding fails: losing the *narrowing* is survivable
+        (every chunk is rendered instead), losing the *turn* is not.
+        """
+        if self.embedder is None or not turn.retrieved_documents:
+            return None
+        try:
+            # The SDK call is blocking; keep it off the event loop.
+            vectors = await asyncio.to_thread(self.embedder.embed, [turn.prompt])
+        except EmbedError:
+            logger.warning(
+                "No se pudo embeber el prompt del turno %s; se usa todo el contexto",
+                turn.turn_number,
+                exc_info=True,
+            )
+            return None
+        return vectors[0] if vectors else None
+
+    def _to_turn_view(
+        self,
+        turn: Turn,
+        history: list[tuple[str, str]],
+        chunks: dict[uuid.UUID, list[Chunk]] | None = None,
+    ) -> TurnView:
+        """Project an ORM ``Turn`` into the SDK-free ``TurnView`` metrics consume.
+
+        Documents keep their ``rank`` — the *platform's* retriever order, which
+        ``contextual_precision`` scores — while ``chunks`` carries the narrowing done
+        *within* each document by ``db.repositories.embeddings.chunks_for_turn``. Ranking
+        documents by our own cosine instead would make that metric measure our retriever
+        rather than the one under test.
+        """
+        chunks = chunks or {}
         return TurnView(
             prompt=turn.prompt,
             response=turn.response,
@@ -512,7 +564,7 @@ class EvalRunner:
             history=list(history),
             retrieved_context=RetrievedContext(
                 documents=[
-                    row.to_document()
+                    row.to_document(chunks.get(row.id))
                     for row in sorted(turn.retrieved_documents, key=lambda r: r.rank)
                 ]
             ),

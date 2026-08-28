@@ -37,7 +37,7 @@ from scorekeeper.core.metrics.judges.base import (
     scale_spec,
 )
 from scorekeeper.core.metrics.scale import Boolean, Likert, Unit
-from scorekeeper.core.retrieved_context import RetrievedContext, RetrievedDocument
+from scorekeeper.core.retrieved_context import Chunk, RetrievedContext, RetrievedDocument
 
 
 class Claims(BaseModel):
@@ -209,8 +209,8 @@ def test_render_prompt_includes_retrieved_context() -> None:
                 RetrievedDocument(
                     name="Política de devoluciones",
                     document="manual.pdf",
-                    content="Devoluciones en 30 días. Requiere recibo.",
                     url="https://ejemplo.com/manual",
+                    chunks=[Chunk(index=0, text="Devoluciones en 30 días. Requiere recibo.")],
                 )
             ]
         ),
@@ -229,7 +229,15 @@ def test_render_prompt_substitutes_context_placeholder() -> None:
     turn = TurnView(
         prompt="p",
         response="r",
-        retrieved_context=RetrievedContext.from_blob("pasaje A\npasaje B"),
+        retrieved_context=RetrievedContext(
+            documents=[
+                RetrievedDocument(
+                    name="",
+                    document="",
+                    chunks=[Chunk(index=0, text="pasaje A\npasaje B")],
+                )
+            ]
+        ),
     )
     rendered = render_prompt("Contexto: {context}", turn)
 
@@ -247,10 +255,10 @@ def test_render_prompt_renders_web_citations_as_readable_docs() -> None:
         retrieved_context=RetrievedContext(
             documents=[
                 RetrievedDocument(
-                    name="Política", document="", content="", url="https://a/pol"
+                    name="Política", document="", url="https://a/pol"
                 ),
                 RetrievedDocument(
-                    name="", document="", content="", url="https://b/x"
+                    name="", document="", url="https://b/x"
                 ),
             ]
         ),

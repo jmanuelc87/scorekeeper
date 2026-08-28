@@ -17,17 +17,30 @@ from scorekeeper.core.retrieval.types import DocType, DocumentLocator, Extracted
 
 
 class _RecordingConverter:
-    """Fake markitdown seam: records (body, file_extension) and returns canned markdown."""
+    """Fake markitdown seam: records every (body, file_extension) call.
 
-    def __init__(self, markdown: str = "# md") -> None:
+    ``markdown`` may be a single string (returned for every call) or one string per
+    call, so a per-page conversion can be given distinct page text.
+    """
+
+    def __init__(self, markdown: str | list[str] = "# md") -> None:
         self.markdown = markdown
-        self.body: bytes | None = None
-        self.file_extension: str | None = None
+        self.calls: list[tuple[bytes, str]] = []
 
     def __call__(self, body: bytes, file_extension: str) -> str:
-        self.body = body
-        self.file_extension = file_extension
-        return self.markdown
+        self.calls.append((body, file_extension))
+        if isinstance(self.markdown, str):
+            return self.markdown
+        return self.markdown[len(self.calls) - 1]
+
+    @property
+    def body(self) -> bytes | None:
+        """Body of the last call (the only one, for a single-conversion document)."""
+        return self.calls[-1][0] if self.calls else None
+
+    @property
+    def file_extension(self) -> str | None:
+        return self.calls[-1][1] if self.calls else None
 
 
 def _doc(doc_type: DocType, body: bytes) -> FetchedDocument:
@@ -71,15 +84,39 @@ def test_pdf_page_is_sliced_to_one_page() -> None:
     conv = _RecordingConverter()
     result = MarkdownContentExtractor(converter=conv).extract(_doc(DocType.PDF, _pdf(3)), _loc(page=2))
     assert conv.file_extension == ".pdf"
-    # The converter receives just the requested page.
+    # Only the requested page is converted, and it reaches the converter alone.
+    assert len(conv.calls) == 1
     assert len(PdfReader(BytesIO(conv.body)).pages) == 1
     assert result.page == 2
 
 
-def test_pdf_without_page_converts_whole_document() -> None:
+def test_pdf_without_page_converts_every_page_separately() -> None:
     conv = _RecordingConverter()
     MarkdownContentExtractor(converter=conv).extract(_doc(DocType.PDF, _pdf(3)), _loc(page=None))
-    assert len(PdfReader(BytesIO(conv.body)).pages) == 3
+    # One conversion per page, each a one-page document — that is what attributes a
+    # sentence to its page.
+    assert len(conv.calls) == 3
+    assert [len(PdfReader(BytesIO(body)).pages) for body, _ in conv.calls] == [1, 1, 1]
+    assert {ext for _, ext in conv.calls} == {".pdf"}
+
+
+def test_pdf_without_page_joins_every_page_into_text() -> None:
+    conv = _RecordingConverter(markdown=["uno", "dos", "tres"])
+    result = MarkdownContentExtractor(converter=conv).extract(
+        _doc(DocType.PDF, _pdf(3)), _loc(page=None)
+    )
+    assert result.text == "uno\n\ndos\n\ntres"
+    assert result.page is None
+
+
+def test_empty_pdf_yields_no_text_and_no_sentences() -> None:
+    conv = _RecordingConverter()
+    result = MarkdownContentExtractor(converter=conv).extract(
+        _doc(DocType.PDF, _pdf(0)), _loc(page=None)
+    )
+    assert conv.calls == []
+    assert result.text == ""  # the orchestrator turns this into EMPTY_CONTENT
+    assert result.sentences == []
 
 
 def test_pdf_page_out_of_range_raises() -> None:
@@ -129,6 +166,52 @@ def test_extracted_content_type() -> None:
     conv = _RecordingConverter()
     result = MarkdownContentExtractor(converter=conv).extract(_doc(DocType.HTML, b"x"), _loc(DocType.HTML))
     assert isinstance(result, ExtractedContent)
+
+
+# -- sentence segmentation ------------------------------------------------------------------
+
+
+def test_pdf_sentences_carry_their_page_and_a_document_wide_index() -> None:
+    conv = _RecordingConverter(
+        markdown=["La BMV cerró al alza. Ganó 0.8%.", "El volumen fue menor."]
+    )
+    result = MarkdownContentExtractor(converter=conv).extract(
+        _doc(DocType.PDF, _pdf(2)), _loc(page=None)
+    )
+    assert [(s.page, s.index, s.text) for s in result.sentences] == [
+        (1, 0, "La BMV cerró al alza."),
+        (1, 1, "Ganó 0.8%."),
+        (2, 2, "El volumen fue menor."),  # index is document-wide, not per page
+    ]
+
+
+def test_selected_pdf_page_sentences_carry_that_page() -> None:
+    conv = _RecordingConverter(markdown="Una sola oración.")
+    result = MarkdownContentExtractor(converter=conv).extract(
+        _doc(DocType.PDF, _pdf(3)), _loc(page=2)
+    )
+    assert [(s.page, s.index) for s in result.sentences] == [(2, 0)]
+
+
+def test_docx_and_html_sentences_have_no_page() -> None:
+    for doc_type, body in ((DocType.DOCX, b"DOCX-BYTES"), (DocType.HTML, b"<p>x</p>")):
+        conv = _RecordingConverter(markdown="Primera. Segunda.")
+        result = MarkdownContentExtractor(converter=conv).extract(
+            _doc(doc_type, body), _loc(doc_type)
+        )
+        assert [(s.page, s.index, s.text) for s in result.sentences] == [
+            (None, 0, "Primera."),
+            (None, 1, "Segunda."),
+        ]
+
+
+def test_image_markup_never_becomes_a_sentence() -> None:
+    conv = _RecordingConverter(markdown="Texto uno. ![alt](img.png) <img src='y.png'> Texto dos.")
+    result = MarkdownContentExtractor(converter=conv).extract(
+        _doc(DocType.HTML, b"x"), _loc(DocType.HTML)
+    )
+    joined = " ".join(s.text for s in result.sentences)
+    assert "![" not in joined and "<img" not in joined and "img.png" not in joined
 
 
 # -- real markitdown integration (skips if the optional extra is absent) --------------------

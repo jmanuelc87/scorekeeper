@@ -9,8 +9,12 @@ page happens here, inside ``extract``.
 
 Per document type:
 
-* **PDF** — the exact page (``locator.page`` from a ``#page=N`` fragment) is sliced out with
-  ``pypdf`` into a one-page document, then converted; with no page, the whole PDF is converted.
+* **PDF** — page by page. With ``locator.page`` (from a ``#page=N`` fragment) only that page
+  is sliced out with ``pypdf`` and converted; with no page **every** page is sliced and
+  converted in turn, so each sentence keeps the page it came from. That costs one conversion
+  per page instead of one for the whole file — the price of page attribution, since MarkItDown
+  emits no page boundaries — and the concatenated markdown is not byte-identical to converting
+  the file in one pass (a table straddling a page break is split).
 * **DOCX** (Word ``.docx``) — the whole document is converted; ``.docx`` stores no page
   boundaries, so the page selector is ignored. Legacy binary ``.doc`` is not supported.
 * **HTML** — the fetched page bytes are converted.
@@ -18,6 +22,12 @@ Per document type:
 Conversion goes through **MarkItDown** (imported lazily; ships in the optional ``retrieval``
 extra), preserving titles, lists, and tables. **Images/graphics are dropped**: MarkItDown
 keeps images as markdown, so this stage strips image markup from the result.
+
+Every converted document is then segmented into :class:`~scorekeeper.core.retrieved_context.Sentence`
+with ``syntok`` (``core.text.split_sentences``, the same segmenter ``faithfulness`` uses on the
+answer). The sentences carry their page and a document-wide 0-based index; they are working
+material for a later chunker, not judge input — ``ExtractedContent.text`` remains what a judge
+reads, so the assemble stage's blank-markdown rule is unchanged.
 """
 
 from __future__ import annotations
@@ -26,7 +36,14 @@ import re
 from io import BytesIO
 from typing import TYPE_CHECKING
 
-from scorekeeper.core.retrieval.types import DocType, DocumentLocator, ExtractedContent, FetchedDocument
+from scorekeeper.core.retrieval.types import (
+    DocType,
+    DocumentLocator,
+    ExtractedContent,
+    FetchedDocument,
+    Sentence,
+)
+from scorekeeper.core.text import split_sentences
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -75,22 +92,36 @@ class MarkdownContentExtractor:
     def extract(
         self, document: FetchedDocument, locator: DocumentLocator
     ) -> ExtractedContent:
-        """Convert ``document`` to markdown, filtering a PDF to ``locator.page`` when set."""
+        """Convert ``document`` to markdown per page and segment it into sentences.
+
+        A PDF yields one markdown block per page (only ``locator.page`` when set, else every
+        page); DOCX/HTML yield a single pageless block. The blocks are joined into ``text``
+        and segmented, in order, into ``sentences``.
+        """
         if document.doc_type is DocType.PDF:
-            markdown = self._extract_pdf(document.body, locator.page)
+            pages = self._extract_pdf(document.body, locator.page)
         elif document.doc_type in (DocType.DOCX, DocType.HTML):
-            markdown = self._convert(document.body, _EXTENSIONS[document.doc_type])
+            pages = [(None, self._convert(document.body, _EXTENSIONS[document.doc_type]))]
         else:
             raise ExtractError(f"Tipo de documento no soportado: {document.doc_type}")
-        return ExtractedContent(text=_strip_images(markdown).strip(), page=locator.page)
+
+        # Strip images before segmenting so no sentence is built out of image markup.
+        blocks = [(page, _strip_images(markdown).strip()) for page, markdown in pages]
+        sentences: list[Sentence] = []
+        for page, block in blocks:
+            for sentence in split_sentences(block):
+                sentences.append(Sentence(page=page, index=len(sentences), text=sentence))
+        text = "\n\n".join(block for _, block in blocks if block)
+        return ExtractedContent(text=text, page=locator.page, sentences=sentences)
 
     # -- helpers ------------------------------------------------------------------------
 
-    def _extract_pdf(self, body: bytes, page: int | None) -> str:
-        """Convert the whole PDF, or just ``page`` (1-based) sliced out with ``pypdf``."""
-        if page is None:
-            return self._convert(body, ".pdf")
+    def _extract_pdf(self, body: bytes, page: int | None) -> list[tuple[int, str]]:
+        """Convert ``page`` (1-based), or every page, as ``(page number, markdown)`` pairs.
 
+        Each page is sliced into its own one-page document with ``pypdf`` before conversion,
+        which is what attributes a sentence to a page. A PDF with no pages yields ``[]``.
+        """
         from pypdf import PdfReader, PdfWriter
 
         try:
@@ -98,15 +129,19 @@ class MarkdownContentExtractor:
             total = len(reader.pages)
         except Exception as exc:  # malformed PDF
             raise ExtractError(f"No se pudo leer el PDF: {exc}") from exc
-        if not 1 <= page <= total:
+        if page is not None and not 1 <= page <= total:
             raise PageNotFoundError(
                 f"La página {page} no existe (el documento tiene {total} página(s))"
             )
-        writer = PdfWriter()
-        writer.add_page(reader.pages[page - 1])
-        sliced = BytesIO()
-        writer.write(sliced)
-        return self._convert(sliced.getvalue(), ".pdf")
+        numbers = [page] if page is not None else range(1, total + 1)
+        converted: list[tuple[int, str]] = []
+        for number in numbers:
+            writer = PdfWriter()
+            writer.add_page(reader.pages[number - 1])
+            sliced = BytesIO()
+            writer.write(sliced)
+            converted.append((number, self._convert(sliced.getvalue(), ".pdf")))
+        return converted
 
     def _convert(self, body: bytes, file_extension: str) -> str:
         """Convert ``body`` to markdown via the injected converter or MarkItDown."""

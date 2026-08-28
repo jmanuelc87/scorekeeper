@@ -21,6 +21,7 @@ from scorekeeper.db.models import (
     MetricScore,
     PlatformExecution,
     RetrievedContextDocument,
+    RetrievedDocumentEmbedding,
     ScenarioResult,
     Turn,
     TurnTokenUsage,
@@ -40,6 +41,8 @@ from scorekeeper.core.metrics.judge import JudgeVerdict
 from scorekeeper.core.metrics.judges.base import record_usage
 from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.core.metrics.scale import Unit
+from scorekeeper.core.retrieval.embed import EmbedError
+from scorekeeper.core.retrieved_context import Chunk
 from scorekeeper.core.runner import (
     MAX_TURN_ATTEMPTS,
     STATUS_COMPLETADO,
@@ -237,6 +240,17 @@ async def _seed_scenario(
     return run, platform_exec, scenario
 
 
+def _document(
+    *, rank: float, name: str, document: str, text: str, url: str | None = None
+) -> RetrievedContextDocument:
+    """A retrieved document whose text lives on a single chunk row, as in production."""
+    row = RetrievedContextDocument(rank=rank, name=name, document=document, url=url)
+    row.embeddings = [
+        RetrievedDocumentEmbedding(chunk_index=0, content=text, embedding=[1.0, 0.0])
+    ]
+    return row
+
+
 # --- Tests --------------------------------------------------------------------
 
 
@@ -244,19 +258,92 @@ async def test_to_turn_view_rebuilds_context_from_child_rows(session: AsyncSessi
     _, platform_exec, scenario = await _seed_scenario(session, [("hola", "respuesta")])
     turn = platform_exec.turns[0]
     # Insert out of order to prove the ordered relationship sorts by rank.
+    turn.retrieved_documents.append(_document(rank=1, name="b", document="d2.pdf", text="dos"))
     turn.retrieved_documents.append(
-        RetrievedContextDocument(rank=1, name="b", document="d2.pdf", content="dos", url=None)
-    )
-    turn.retrieved_documents.append(
-        RetrievedContextDocument(rank=0, name="a", document="d1.pdf", content="uno", url="http://x")
+        _document(rank=0, name="a", document="d1.pdf", text="uno", url="http://x")
     )
     await session.flush()
 
-    view = EvalRunner(session, RecordingJudge())._to_turn_view(turn, [])
+    texts = {"d1.pdf": "uno", "d2.pdf": "dos"}
+    chunks = {
+        row.id: [Chunk(index=0, text=texts[row.document])]
+        for row in turn.retrieved_documents
+    }
+    view = EvalRunner(session, RecordingJudge())._to_turn_view(turn, [], chunks)
 
+    # Documents keep the platform's rank order; their text is whatever the chunk query
+    # returned for each of them.
     assert [d.content for d in view.retrieved_context.documents] == ["uno", "dos"]
     assert view.retrieved_context.documents[0].url == "http://x"
     assert view.retrieved_context.node_texts() == ["d1.pdf\nuno", "d2.pdf\ndos"]
+
+
+class _StubEmbedder:
+    """Embeds any prompt as the same fixed direction, so ranking is predictable."""
+
+    def __init__(self, vector: list[float]) -> None:
+        self.vector = vector
+        self.calls = 0
+
+    def embed(self, texts):
+        self.calls += 1
+        return [self.vector]
+
+
+async def test_to_turn_view_uses_the_chunks_it_is_handed(session: AsyncSession) -> None:
+    """The narrowing itself runs in SQL; the runner only maps the result onto documents."""
+    _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])
+    turn = platform_exec.turns[0]
+    row = RetrievedContextDocument(rank=0, name="a", document="d.pdf")
+    turn.retrieved_documents.append(row)
+    await session.flush()
+
+    view = EvalRunner(session, RecordingJudge())._to_turn_view(
+        turn, [], {row.id: [Chunk(index=2, text="cerca")]}
+    )
+
+    assert view.retrieved_context.documents[0].content == "cerca"
+
+
+async def test_to_turn_view_without_chunks_leaves_documents_textless(
+    session: AsyncSession,
+) -> None:
+    _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])
+    turn = platform_exec.turns[0]
+    turn.retrieved_documents.append(
+        RetrievedContextDocument(rank=0, name="a", document="d.pdf")
+    )
+    await session.flush()
+
+    view = EvalRunner(session, RecordingJudge())._to_turn_view(turn, [], {})
+
+    assert view.retrieved_context.documents[0].content == ""
+
+
+async def test_query_embedding_is_skipped_without_documents(session: AsyncSession) -> None:
+    _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])
+    embedder = _StubEmbedder([1.0])
+    runner = EvalRunner(session, RecordingJudge(), embedder=embedder)
+
+    assert await runner._query_embedding(platform_exec.turns[0]) is None
+    assert embedder.calls == 0  # nothing to rank, so nothing to pay for
+
+
+async def test_a_failed_prompt_embedding_falls_back_to_the_whole_document(
+    session: AsyncSession,
+) -> None:
+    _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])
+    turn = platform_exec.turns[0]
+    turn.retrieved_documents.append(_document(rank=0, name="a", document="d.pdf", text="uno"))
+    await session.flush()
+
+    class _Failing:
+        def embed(self, texts):
+            raise EmbedError("sin cuota")
+
+    runner = EvalRunner(session, RecordingJudge(), embedder=_Failing())
+    # Losing the narrowing is survivable; losing the turn is not.
+    assert await runner._query_embedding(turn) is None
 
 
 async def test_to_turn_view_empty_context_when_no_child_rows(session: AsyncSession) -> None:
@@ -730,7 +817,7 @@ async def test_changed_input_forces_a_rescore(
         turn.response = "una respuesta distinta"
     elif changed == "retrieved_context":
         turn.retrieved_documents.append(
-            RetrievedContextDocument(rank=0, name="a", document="d.pdf", content="uno")
+            _document(rank=0, name="a", document="d.pdf", text="uno")
         )
     await session.flush()
     if changed == "judge_model":

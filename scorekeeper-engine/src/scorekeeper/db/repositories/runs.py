@@ -39,6 +39,9 @@ def run_tree_options(*, metric_scores: bool = True, retrieval: bool = True):
     if metric_scores:
         turn_opts.append(selectinload(Turn.metric_scores).selectinload(MetricScore.trace))
     if retrieval:
+        # Documents only, not their chunks: the chunk text is read by
+        # ``db.repositories.embeddings``, which ranks and limits it in SQL. Loading the
+        # relationship here would drag every 1536-float vector of the run into memory.
         turn_opts.append(selectinload(Turn.retrieved_documents))
     return selectinload(BenchmarkRun.scenario_results).options(
         selectinload(ScenarioResult.use_case),

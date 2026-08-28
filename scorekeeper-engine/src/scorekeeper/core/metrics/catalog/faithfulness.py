@@ -38,7 +38,6 @@ All prompts and justification output are Spanish.
 
 from __future__ import annotations
 
-import syntok.segmenter as segmenter
 from pydantic import BaseModel
 
 from scorekeeper.core.metrics.base import (
@@ -55,22 +54,7 @@ from scorekeeper.core.metrics.judge import Judge, JudgeStep
 from scorekeeper.core.metrics.prompts import PromptSlot, safe_format
 from scorekeeper.core.metrics.registry import register
 from scorekeeper.core.metrics.scale import Boolean, Unit
-
-
-def split_sentences(text: str) -> list[str]:
-    """Segment a text blob into sentences with syntok (deterministic, no LLM).
-
-    Each sentence's surface text is reconstructed from its tokens
-    (``token.spacing + token.value``), trimmed, and empty fragments are dropped.
-    Empty or whitespace-only input yields an empty list.
-    """
-    sentences: list[str] = []
-    for paragraph in segmenter.analyze(text):
-        for sentence in paragraph:
-            rebuilt = "".join(token.spacing + token.value for token in sentence).strip()
-            if rebuilt:
-                sentences.append(rebuilt)
-    return sentences
+from scorekeeper.core.text import split_sentences
 
 
 def _extraction_step(claims: list[str]) -> TraceStep:

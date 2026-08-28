@@ -35,6 +35,7 @@ from scorekeeper.config.settings import get_settings
 from scorekeeper.core.metrics import selection
 from scorekeeper.core.metrics.judge import Judge
 from scorekeeper.core.metrics.rollup import execution_average
+from scorekeeper.core.retrieval.embed import Embedder
 from scorekeeper.core.retrieval.pipeline import RetrievalOrchestrator
 from scorekeeper.core.retrieval.protocols import RetrievalPipeline
 from scorekeeper.core.runner import (
@@ -45,7 +46,7 @@ from scorekeeper.core.runner import (
     scenario_status,
     turn_delay_seconds,
 )
-from scorekeeper.core.services import retrieval
+from scorekeeper.core.services import embedding, retrieval
 from scorekeeper.core.services.scoring import pin_prompts, run_status
 from scorekeeper.core.services.status import STATUS_EN_PROCESO
 from scorekeeper.db.connection import run_lock, session_scope
@@ -160,8 +161,9 @@ async def advance_chain(
             orchestrator = pipeline or RetrievalOrchestrator(
                 session=db, encryption_key=get_settings().auth_encryption_key
             )
+            embedder = embedding.default_embedder()
             try:
-                await _work_turn(db, turn, scenario, orchestrator, judge)
+                await _work_turn(db, turn, scenario, orchestrator, judge, embedder)
             except Exception:
                 await db.rollback()
                 await _mark_fallido(db, str(run_key))
@@ -181,11 +183,13 @@ async def _work_turn(
     scenario: ScenarioResult,
     orchestrator: RetrievalPipeline,
     judge: Judge | None,
+    embedder: Embedder | None = None,
 ) -> None:
-    """Retrieve then score one turn, unless it is already done or out of attempts.
+    """Retrieve, embed, then score one turn, unless it is done or out of attempts.
 
-    Retrieval and scoring are one unit here, rather than two passes over the run, so that
-    a turn is finished — or not — as a whole. The fetch cache is released at the end of
+    The three phases are one unit here, rather than three passes over the run, so that a
+    turn is finished — or not — as a whole; each commits separately so a later failure
+    does not undo the earlier phase's work. The fetch cache is released at the end of
     the turn for the same reason: each job builds its own orchestrator, so nothing later
     could purge what this one downloaded.
     """
@@ -204,11 +208,17 @@ async def _work_turn(
         await retrieval.retrieve_turn(turn, orchestrator)
         await db.commit()
 
+    # Its own committed step between retrieval and scoring: chunks persist, so a retry
+    # of this turn re-downloads nothing and re-embeds nothing. Best-effort — a document
+    # that could not be embedded simply reaches the judge without text.
+    await embedding.embed_turn(db, turn, embedder)
+    await db.commit()
+
     metric_names = await selection.metrics_for(db, scenario.use_case_id)
     templates = await selection.bound_templates(db, scenario.run_id, metric_names)
     metrics = await selection.resolve(db, scenario.use_case_id, templates)
     # run_turn counts the attempt and commits it before the first judge call.
-    await EvalRunner(db, judge, templates).run_turn(
+    await EvalRunner(db, judge, templates, embedder=embedder).run_turn(
         turn, metrics, _history_before(turn.platform_execution, turn)
     )
     await _purge_turn_cache(orchestrator, turn)

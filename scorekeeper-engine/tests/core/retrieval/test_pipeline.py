@@ -138,7 +138,7 @@ async def test_happy_path_retrieved() -> None:
     assert report.source_format is SourceFormat.JSON_INDEXED
     assert [o.status for o in report.outcomes] == [RetrievalStatus.RETRIEVED]
     docs = report.to_context().documents
-    assert len(docs) == 1 and docs[0].content == "# markdown"
+    assert len(docs) == 1 and docs[0].document == "f.pdf"
     assert report.outcomes[0].auth is not None  # authorize result threaded through
 
 
@@ -190,7 +190,11 @@ async def test_extensionless_web_page_is_retrieved() -> None:
     )
     report = await orch.run("cell")
     assert report.outcomes[0].status is RetrievalStatus.RETRIEVED
-    assert report.to_context().documents[0].content == "# nota"
+    document = report.to_context().documents[0]
+    # The segmented sentences are what survives assemble — the whole-document
+    # markdown does not, and chunks only exist after the embedding phase.
+    assert document.content == ""
+    assert [(s.page, s.index, s.text) for s in document.sentences] == [(None, 0, "# nota")]
 
 
 async def test_client_build_failure_is_auth_missing() -> None:

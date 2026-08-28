@@ -33,6 +33,7 @@ from scorekeeper.core.retrieval.types import (
     ExtractedContent,
     RetrievalOutcome,
     RetrievalReport,
+    Sentence,
     SourceFormat,
     SourceRef,
 )
@@ -131,7 +132,12 @@ class _FakePipeline:
             host="h",
         )
         outcome = RetrievalOutcome.assembled(
-            source, locator, ExtractedContent(text=f"md::{cell}")
+            source,
+            locator,
+            ExtractedContent(
+                text=f"md::{cell}",
+                sentences=[Sentence(page=None, index=0, text=f"md::{cell}")],
+            ),
         )
         return RetrievalReport(source_format=SourceFormat.PLAINTEXT, outcomes=[outcome])
 
@@ -288,7 +294,9 @@ async def test_advance_chain_retrieves_before_scoring_its_turn(
     await advance_chain(first.turn_id, session=session, judge=judge, pipeline=pipeline)
 
     turn = run.scenario_results[0].platform_executions[0].turns[0]
-    assert [d.content for d in turn.retrieved_documents] == ["md::ref-claude/esc-1/1"]
+    assert [
+        [s["text"] for s in d.sentences] for d in turn.retrieved_documents
+    ] == [["md::ref-claude/esc-1/1"]]
     # The judge saw the context the same job had just fetched.
     assert judge.seen_turns[0].retrieved_context.documents[0].content == (
         "md::ref-claude/esc-1/1"

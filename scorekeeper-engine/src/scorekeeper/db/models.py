@@ -40,7 +40,7 @@ from sqlalchemy.orm import (
     relationship,
 )
 
-from scorekeeper.core.retrieved_context import RetrievedDocument
+from scorekeeper.core.retrieved_context import Chunk, RetrievedDocument
 
 # JSONB on PostgreSQL, plain JSON on the SQLite fallback.
 JsonColumn = JSON().with_variant(JSONB, "postgresql")
@@ -286,8 +286,11 @@ class RetrievedContextDocument(Base):
     rank: Mapped[int | float] = mapped_column(Float)  # retriever order (int or float).
     name: Mapped[str] = mapped_column(Text)  # Short label/title for the retrieved item.
     document: Mapped[str] = mapped_column(Text)  # Source document reference.
-    content: Mapped[str] = mapped_column(Text)  # The retrieved text.
     url: Mapped[str | None] = mapped_column(Text, default=None)  # Source URL, if any.
+    # The document's text, segmented into ``[{page, index, text}, ...]`` by the extract
+    # stage — the chunker's input, not judge input. NULL on rows retrieved before
+    # segmentation existed; those rows carry no text at all and are re-retrieved.
+    sentences: Mapped[list[dict[str, Any]] | None] = mapped_column(JsonColumn, default=None)
 
     turn: Mapped[Turn] = relationship(back_populates="retrieved_documents")
     embeddings: Mapped[list[RetrievedDocumentEmbedding]] = relationship(
@@ -305,28 +308,46 @@ class RetrievedContextDocument(Base):
             rank=rank,
             name=doc.name,
             document=doc.document,
-            content=doc.content,
             url=doc.url,
+            sentences=[s.model_dump() for s in doc.sentences],
+            # Set explicitly: once the row is flushed, a collection that was never
+            # touched lazy-loads on first access — a MissingGreenlet under asyncio.
+            # A freshly retrieved document provably has no chunks until the embedding
+            # phase writes them.
+            embeddings=[],
         )
 
-    def to_document(self) -> RetrievedDocument:
-        """Project this row back into a pydantic ``RetrievedDocument``."""
+    def to_document(self, chunks: list[Chunk] | None = None) -> RetrievedDocument:
+        """Project this row into the ``RetrievedDocument`` a judge reads.
+
+        ``chunks`` are the ones already selected for this turn — ranked and limited in SQL
+        by ``db.repositories.embeddings.chunks_for_turn``, never here: the row's own
+        ``embeddings`` relationship is not eager-loaded any more, precisely so the vectors
+        stay in the database. A document with no chunks carries no text at all.
+        ``sentences`` stays empty: it is the chunker's input, not judge input.
+        """
         return RetrievedDocument(
             name=self.name,
             document=self.document,
-            content=self.content,
             url=self.url,
+            chunks=list(chunks or []),
         )
 
 
 class RetrievedDocumentEmbedding(Base):
     """One chunk of a retrieved document, with its embedding.
 
-    A document is stored whole on ``RetrievedContextDocument.content``; this is the
-    chunked projection of that text, one row per chunk in ``chunk_index`` order, so a
-    consumer can retrieve or re-rank at chunk granularity instead of handing a judge the
-    entire document. Nothing writes these rows yet — the table is the storage layer, and
-    the producer seam is ``Judge.embed`` (``core.metrics.judge``).
+    The document's only stored text. ``RetrievedContextDocument.sentences`` is grouped
+    into overlapping windows of ``embedding_chunk_sentences`` (sharing
+    ``embedding_chunk_overlap``), one row per window in ``chunk_index`` order, each with
+    its embedding. At scoring time only the ``embedding_top_k`` chunks closest to the
+    turn's prompt are handed to a judge, so a judge never sees a whole document.
+
+    Written by ``core.services.embedding``; the vectors come from
+    ``core.retrieval.embed.OpenAIEmbedder``, which owns its own OpenAI client rather than
+    going through the judge. Alongside the text each row records **where it came from** —
+    page and sentence range — which the retrieval query does not read: that is stored for
+    citation and auditing, not for the judge.
 
     PostgreSQL-only in practice: ``embedding`` degrades to JSON on the SQLite fallback,
     which supports no similarity search.
@@ -364,7 +385,19 @@ class RetrievedDocumentEmbedding(Base):
     # The chunk's own text — what was embedded, kept so a hit can be read back without
     # re-splitting the parent document.
     content: Mapped[str] = mapped_column(Text)
-    embedding: Mapped[list[float]] = mapped_column(EmbeddingColumn)
+    # Nullable: chunking and embedding are separable. Without ``openai_api_key`` the
+    # chunks are still written — they are the document's only text — and simply carry no
+    # vector, so a judge still reads the document and only the cosine narrowing is lost.
+    embedding: Mapped[list[float] | None] = mapped_column(EmbeddingColumn, default=None)
+    # Where in the document the chunk came from. The page is the **first** sentence's:
+    # a window of several sentences can straddle a page break and only one page is kept,
+    # so such a chunk is filed under the page its head came from. NULL for DOCX/HTML,
+    # which have no pages, and on rows written before this metadata existed.
+    page: Mapped[int | None] = mapped_column(Integer, default=None)
+    # The ``Sentence.index`` range the chunk spans, inclusive both ends — what makes it
+    # traceable back to ``RetrievedContextDocument.sentences``.
+    sentence_start: Mapped[int | None] = mapped_column(Integer, default=None)
+    sentence_end: Mapped[int | None] = mapped_column(Integer, default=None)
 
     retrieved_document: Mapped[RetrievedContextDocument] = relationship(
         back_populates="embeddings"

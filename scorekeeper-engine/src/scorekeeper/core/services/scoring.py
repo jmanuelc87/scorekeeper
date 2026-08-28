@@ -22,7 +22,7 @@ from scorekeeper.core.runner import (
     EvalRunner,
     rollup_status,
 )
-from scorekeeper.core.services import ingestion, retrieval
+from scorekeeper.core.services import embedding, ingestion, retrieval
 from scorekeeper.core.services.ingestion import UploadedFile
 from scorekeeper.core.services.serializers import summarize_run
 from scorekeeper.core.services.status import STATUS_EN_PROCESO
@@ -148,6 +148,7 @@ async def run_evaluation(
     async with session_scope(session) as db:
         run_id = await ingestion.ingest_evaluation(platform, files, session=db)
         await retrieval.retrieve_run(run_id, session=db, pipeline=pipeline)
+        await embedding.embed_run(run_id, session=db)
         return await score_run(run_id, session=db, judge=judge)
 
 

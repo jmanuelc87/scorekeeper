@@ -71,6 +71,14 @@ class Settings(BaseSettings):
     # the judge provider is Anthropic, an OpenAI-backed embedder is attached iff
     # openai_api_key is set (see scorekeeper.core.metrics.judges.make_judge).
     openai_embedding_model: str = "text-embedding-3-small"
+    # Retrieval embedding phase (scorekeeper.core.services.embedding): a document's
+    # sentences are grouped into overlapping chunks, each chunk is embedded, and at
+    # scoring time only the chunks most similar to the turn's prompt are rendered into
+    # the judge prompt. The embedder is its own OpenAI client, independent of the judge.
+    embedding_chunk_sentences: int = 5  # sentences per chunk
+    embedding_chunk_overlap: int = 1  # sentences shared with the previous chunk
+    embedding_batch_size: int = 128  # texts per embeddings API call
+    embedding_top_k: int = 3  # chunks per document handed to the judge
     # Override the judge system prompt at runtime; None uses the built-in default.
     judge_system_prompt: str | None = None
     # Trace every LLM API call the judge makes (op, model, step, turn, sizes,

@@ -22,6 +22,7 @@ from scorekeeper.core.retrieval.types import (
     ExtractedContent,
     RetrievalOutcome,
     RetrievalReport,
+    Sentence,
     SourceFormat,
     SourceRef,
 )
@@ -51,7 +52,12 @@ class _FakePipeline:
             document_url="https://h/x.html", filename="x.html", doc_type=DocType.HTML, host="h"
         )
         outcome = RetrievalOutcome.assembled(
-            source, locator, ExtractedContent(text=f"md::{cell}")
+            source,
+            locator,
+            ExtractedContent(
+                text=f"md::{cell}",
+                sentences=[Sentence(page=None, index=0, text=f"md::{cell}")],
+            ),
         )
         return RetrievalReport(source_format=SourceFormat.PLAINTEXT, outcomes=[outcome])
 
@@ -108,7 +114,11 @@ async def test_retrieve_run_populates_documents_and_sets_status(session: AsyncSe
     await retrieve_run(run_id, session=session, pipeline=pipeline)
 
     turn = await _the_turn(session)
-    assert [d.content for d in turn.retrieved_documents] == ["md::manual (https://h/x.html)"]
+    # Retrieval stores the segmented text; chunks (and judge-readable text) come later,
+    # in the embedding phase.
+    assert [
+        [s["text"] for s in d.sentences] for d in turn.retrieved_documents
+    ] == [["md::manual (https://h/x.html)"]]
     # Retrieval leaves the run in the retrieval phase; scoring advances it afterwards.
     run = await session.get(BenchmarkRun, uuid.UUID(run_id))
     assert run.status == STATUS_EN_RECUPERACION
@@ -171,7 +181,7 @@ async def test_retrieve_run_skips_turns_already_retrieved(session: AsyncSession)
     await retrieve_run(run_id, session=session, pipeline=second)
 
     assert second.calls == []  # the pipeline was never asked to resolve anything
-    turn = (await session.execute(select(Turn))).scalars().one()
+    turn = await _the_turn(session)
     assert len(turn.retrieved_documents) == 1
     assert turn.attempts == 1  # and the skipped visit burned no attempt
 
