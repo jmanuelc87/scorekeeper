@@ -299,3 +299,24 @@ button:hover:not(:disabled) { opacity: .85; }
 .use-case-metrics { display: flex; flex-wrap: wrap; gap: 6px; }
 .use-case-note { margin: 0; font-size: .75rem; color: var(--gray); }
 .use-case-id { margin-top: auto; font-size: .68rem; color: var(--gray); font-family: ui-monospace, monospace; }
+
+/* === Auth providers === */
+.auth-provider-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }
+.auth-provider-card { background: white; border: 1px solid #dfe6ee; border-radius: var(--radius); padding: 16px 18px; box-shadow: 0 8px 24px #25344a08; display: flex; flex-direction: column; gap: 10px; }
+.auth-provider-header { display: flex; align-items: center; gap: 8px; }
+.auth-provider-kind { font-weight: 700; font-size: .95rem; text-transform: capitalize; }
+.auth-provider-host { margin: 0; font-size: .82rem; font-family: ui-monospace, monospace; color: var(--blue); word-break: break-all; }
+.auth-provider-fields { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.auth-provider-field { display: flex; gap: 8px; font-size: .75rem; }
+.auth-provider-field dt { color: var(--gray); font-weight: 600; min-width: 88px; }
+.auth-provider-field dd { margin: 0; word-break: break-all; }
+.auth-provider-settings { margin: 0; font-size: .68rem; background: #f8fafc; border: 1px solid #e8edf2; border-radius: 8px; padding: 8px 10px; overflow-x: auto; color: var(--gray); }
+.btn-delete { background: #fef2f2; color: var(--red); }
+.auth-provider-form { background: white; border: 1px solid #dfe6ee; border-radius: var(--radius); padding: 18px 20px; margin-bottom: 20px; box-shadow: 0 8px 24px #25344a08; display: flex; flex-direction: column; gap: 14px; }
+.auth-provider-form-fields { display: flex; flex-wrap: wrap; align-items: end; gap: 12px; }
+.auth-provider-form-fields .filter-group input { width: 220px; }
+.auth-provider-toggle { display: flex; align-items: center; gap: 8px; font-size: .82rem; padding-bottom: 8px; cursor: pointer; }
+.auth-provider-wide { width: 100%; }
+.auth-provider-textarea { min-height: 120px; }
+.auth-provider-hint { margin: 0; font-size: .72rem; color: var(--gray); }
+.auth-provider-form-actions { margin-left: auto; }
