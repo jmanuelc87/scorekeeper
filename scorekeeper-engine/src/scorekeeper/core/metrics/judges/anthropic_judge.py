@@ -20,6 +20,7 @@ from scorekeeper.core.metrics.judges.base import (
     clamp,
     judge_call,
     owned_model,
+    record_judge_call,
     record_usage,
     render_prompt,
     require_parsed,
@@ -40,13 +41,37 @@ DEFAULT_MODEL = "claude-opus-4-8"
 # Models this judge is allowed to call. An exact-match allow-list (the provider's
 # model space is small and Anthropic-owned); extend it as new Claude models ship.
 KNOWN_MODELS = frozenset(
-    {"claude-opus-4-8", "claude-sonnet-5", "claude-haiku-4-5-20251001"}
+    {
+        "claude-fable-5",
+        "claude-opus-5",
+        "claude-opus-4-8",
+        "claude-sonnet-5",
+        "claude-haiku-4-5-20251001",
+    }
 )
 # Models that support adaptive thinking (a 4.6+ feature). Others — e.g.
 # Haiku 4.5 — reject ``thinking={"type": "adaptive"}`` with a 400, so those calls
 # omit the ``thinking`` parameter entirely (no thinking). Keep in sync as new
 # adaptive-capable models are added to KNOWN_MODELS.
-ADAPTIVE_THINKING_MODELS = frozenset({"claude-opus-4-8", "claude-sonnet-5"})
+#
+# Every Claude 5 model belongs here, and for two of them it is not optional: on
+# Opus 5 thinking is on by default, and on Fable 5 it is always on — ``disabled``
+# and ``budget_tokens`` are both rejected with a 400 — so ``adaptive`` is the only
+# configuration either accepts.
+ADAPTIVE_THINKING_MODELS = frozenset(
+    {"claude-fable-5", "claude-opus-5", "claude-opus-4-8", "claude-sonnet-5"}
+)
+# Models that accept the server-side refusal fallback. A safety classifier may decline a
+# call (HTTP 200, ``stop_reason="refusal"``); with ``fallbacks`` the API re-runs the same
+# request on the fallback model inside the same call, so a declined turn is rescued
+# instead of surfacing as a ``JudgeError``. Gated like ADAPTIVE_THINKING_MODELS and for
+# the same reason: sending the parameter to a model that does not support it is a 400,
+# which would break *every* call rather than degrade one.
+REFUSAL_FALLBACK_MODELS = frozenset({"claude-fable-5", "claude-opus-5"})
+# The beta the array form of ``fallbacks`` requires. The scalar ``fallbacks="default"``
+# form pairs with ``server-side-fallback-2026-07-01`` instead and returns a 400 with this
+# header — and the installed SDK types accept only the array form anyway.
+REFUSAL_FALLBACK_BETA = "server-side-fallback-2026-06-01"
 
 
 class AnthropicJudge:
@@ -55,6 +80,10 @@ class AnthropicJudge:
     ``client`` may be injected (tests); otherwise a real ``anthropic.Anthropic``
     is built from ``api_key`` on first construction. Adaptive thinking is enabled
     so the model reasons before committing to a score.
+
+    ``fallback_model`` arms the server-side refusal fallback for the models that
+    support it (see :data:`REFUSAL_FALLBACK_MODELS`); ``None`` leaves the request
+    exactly as it was before the feature existed.
     """
 
     def __init__(
@@ -67,6 +96,7 @@ class AnthropicJudge:
         system_prompt: str | None = None,
         embedder: Any | None = None,
         step_models: StepModels | None = None,
+        fallback_model: str | None = None,
         timeout: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
         self.model = model
@@ -75,6 +105,13 @@ class AnthropicJudge:
         # Route each JudgeStep to a model. With no overrides every step resolves to
         # ``model``, so the judge behaves exactly as a single-model judge.
         self._step_models = step_models or StepModels(model)
+        # Validated here rather than per call: a typo in configuration should fail when
+        # the judge is built, not on the first refusal months later.
+        self.fallback_model = (
+            owned_model(fallback_model, owns=self._owns, provider=PROVIDER)
+            if fallback_model
+            else None
+        )
         # Anthropic offers no embeddings endpoint; embedding metrics delegate to
         # this backend (any object with an ``embed()`` method, e.g. an OpenAIJudge).
         self._embedder = embedder
@@ -129,6 +166,36 @@ class AnthropicJudge:
             return {"thinking": {"type": "adaptive"}}
         return {}
 
+    def _fallback_kwargs(self, model: str) -> dict[str, Any]:
+        """Per-model ``fallbacks``/``betas`` for the refusal rescue.
+
+        Empty unless a fallback model is configured *and* the calling model supports
+        the feature *and* the two differ — falling back to the model that just declined
+        would only buy a second refusal.
+        """
+        if (
+            self.fallback_model is None
+            or model not in REFUSAL_FALLBACK_MODELS
+            or self.fallback_model == model
+        ):
+            return {}
+        return {
+            "betas": [REFUSAL_FALLBACK_BETA],
+            "fallbacks": [{"model": self.fallback_model}],
+        }
+
+    def _parse(self, **kwargs: Any) -> Any:
+        """Call ``messages.parse``, on the beta namespace only when it has to be.
+
+        ``fallbacks`` lives on ``client.beta.messages``. Routing every call through the
+        beta namespace would change the request shape for models that never use the
+        parameter, so the plain namespace stays the default and nothing about the
+        existing path moves.
+        """
+        if "fallbacks" in kwargs:
+            return self._client.beta.messages.parse(**kwargs)
+        return self._client.messages.parse(**kwargs)
+
     def score(
         self,
         *,
@@ -142,22 +209,27 @@ class AnthropicJudge:
         spec = scale_spec(scale)
         model = self.resolve_model(step, model)
         content = f"{render_prompt(rubric, turn)}\n\n{spec.instruction_es}"
-        message = judge_call(
-            lambda: self._client.messages.parse(
+        with record_judge_call(
+            step=step, model=model, system_prompt=self.system_prompt, prompt=content
+        ):
+            message = judge_call(
+                lambda: self._parse(
+                    model=model,
+                    max_tokens=self.max_tokens,
+                    **self._thinking_kwargs(model),
+                    **self._fallback_kwargs(model),
+                    system=self.system_prompt,
+                    messages=[{"role": "user", "content": content}],
+                    output_format=_ScoreResponse,
+                ),
+                provider=PROVIDER,
                 model=model,
-                max_tokens=self.max_tokens,
-                **self._thinking_kwargs(model),
-                system=self.system_prompt,
-                messages=[{"role": "user", "content": content}],
-                output_format=_ScoreResponse,
-            ),
-            provider=PROVIDER,
-            model=model,
-            action="la puntuación",
-        )
-        # Recorded before the parse check: the tokens were spent even if the model
-        # refused or returned output that does not satisfy the schema.
-        self._record_usage(message)
+                action="la puntuación",
+            )
+            # Recorded inside the block so the tokens land on this call's record too.
+            self._record_usage(message)
+        # Usage is recorded before the parse check: the tokens were spent even if the
+        # model refused or returned output that does not satisfy the schema.
         parsed: _ScoreResponse = require_parsed(
             message.parsed_output,
             provider=PROVIDER,
@@ -180,22 +252,25 @@ class AnthropicJudge:
         model: str | None = None,
     ) -> T:
         model = self.resolve_model(step, model)
-        message = judge_call(
-            lambda: self._client.messages.parse(
+        content = render_prompt(instruction, turn)
+        with record_judge_call(
+            step=step, model=model, system_prompt=self.system_prompt, prompt=content
+        ):
+            message = judge_call(
+                lambda: self._parse(
+                    model=model,
+                    max_tokens=self.max_tokens,
+                    **self._thinking_kwargs(model),
+                    **self._fallback_kwargs(model),
+                    system=self.system_prompt,
+                    messages=[{"role": "user", "content": content}],
+                    output_format=schema,
+                ),
+                provider=PROVIDER,
                 model=model,
-                max_tokens=self.max_tokens,
-                **self._thinking_kwargs(model),
-                system=self.system_prompt,
-                messages=[
-                    {"role": "user", "content": render_prompt(instruction, turn)}
-                ],
-                output_format=schema,
-            ),
-            provider=PROVIDER,
-            model=model,
-            action="la extracción",
-        )
-        self._record_usage(message)
+                action="la extracción",
+            )
+            self._record_usage(message)
         return require_parsed(
             message.parsed_output,
             provider=PROVIDER,

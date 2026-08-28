@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scorekeeper.db.repositories.runs import run_tree_options
 from scorekeeper.db.models import (
     BenchmarkRun,
+    JudgeCall,
     MetricDefinition,
     MetricScore,
     PlatformExecution,
@@ -38,7 +39,7 @@ from scorekeeper.core.metrics.base import (
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import JudgeVerdict
-from scorekeeper.core.metrics.judges.base import record_usage
+from scorekeeper.core.metrics.judges.base import record_judge_call, record_usage
 from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.core.metrics.scale import Unit
 from scorekeeper.core.retrieval.embed import EmbedError
@@ -145,12 +146,48 @@ class _JudgeMetric(Metric):
         )
 
 
+class CallRecordingJudge(RecordingJudge):
+    """A ``RecordingJudge`` that opens a ``record_judge_call`` around each ``score``.
+
+    Simulates what a real concrete judge does around its model call, so runner tests
+    can assert the persisted per-call prompt rows without any SDK fakes.
+    """
+
+    def score(self, *, rubric, turn, scale, rubric_version=None, step=None) -> JudgeVerdict:
+        with record_judge_call(
+            step=step, model=self.model, system_prompt="Sistema.", prompt=rubric
+        ):
+            record_usage(input_tokens=3, output_tokens=1)
+            return super().score(
+                rubric=rubric, turn=turn, scale=scale, rubric_version=rubric_version, step=step
+            )
+
+
 class Utilidad(_JudgeMetric):
     name = "utilidad"
 
 
 class Correccion(_JudgeMetric):
     name = "correccion"
+
+
+class DosLlamadas(Metric):
+    """A metric that issues two judge calls, to exercise per-call ordering."""
+
+    name = "doble"
+    category = MetricCategory.RAG
+    scale = Unit()
+
+    def evaluate(self, turn: TurnView, judge) -> MetricResult:
+        first = judge.score(rubric="Primera pregunta", turn=turn, scale=self.scale)
+        judge.score(rubric="Segunda pregunta", turn=turn, scale=self.scale)
+        return MetricResult(
+            metric_name=self.name,
+            raw_score=first.score,
+            normalized_score=self.normalize(first.score),
+            trace=MetricTrace(steps=[]),
+            judge_model=first.model,
+        )
 
 
 class MetricaRota(Metric):
@@ -172,7 +209,7 @@ def registry():
     """Register the fake metrics into an isolated registry, then restore."""
     saved = MetricRegistry.all()
     MetricRegistry.clear()
-    for metric_cls in (Utilidad, Correccion, MetricaRota):
+    for metric_cls in (Utilidad, Correccion, DosLlamadas, MetricaRota):
         MetricRegistry.add(metric_cls)
     try:
         yield
@@ -756,6 +793,61 @@ async def test_rescoring_updates_single_token_usage_row(session: AsyncSession, r
     assert (await session.execute(select(func.count()).select_from(TurnTokenUsage))).scalar_one() == 1
     turn = platform_exec.turns[0]
     assert (turn.token_usage.input_tokens, turn.token_usage.output_tokens) == (7, 3)
+
+
+# --- Judge-call persistence ---------------------------------------------------
+
+
+async def test_persists_one_row_per_judge_call_in_order(session: AsyncSession, registry) -> None:
+    await _select_metrics(session, ["doble"])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+
+    await EvalRunner(session, CallRecordingJudge()).run_scenario(scenario)
+    await session.commit()
+
+    calls = (
+        await session.execute(select(JudgeCall).order_by(JudgeCall.sequence))
+    ).scalars().all()
+    # The metric made two calls; ``sequence`` numbers them in call order, from 0.
+    assert [c.sequence for c in calls] == [0, 1]
+    assert [c.prompt for c in calls] == ["Primera pregunta", "Segunda pregunta"]
+    (score,) = platform_exec.turns[0].metric_scores
+    assert {c.metric_score_id for c in calls} == {score.id}
+    assert all(c.system_prompt == "Sistema." for c in calls)
+    assert all(c.model == "judge-test" for c in calls)
+    # Each call carries the tokens its own response reported.
+    assert [(c.input_tokens, c.output_tokens) for c in calls] == [(3, 1), (3, 1)]
+
+
+async def test_rescoring_drops_the_previous_judge_calls(session: AsyncSession, registry) -> None:
+    await _select_metrics(session, ["utilidad"])
+    _, platform_exec, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+
+    await EvalRunner(session, CallRecordingJudge()).run_scenario(scenario)
+    await session.commit()
+
+    # A different judge model invalidates the scoring key, so the stale MetricScore is
+    # deleted and re-written — its calls go with it (CASCADE), leaving only the new one.
+    _interrupt(scenario)
+    await EvalRunner(session, CallRecordingJudge(model="otro-juez")).run_scenario(scenario)
+    await session.commit()
+
+    calls = (await session.execute(select(JudgeCall))).scalars().all()
+    assert [(c.sequence, c.model) for c in calls] == [(0, "otro-juez")]
+
+
+async def test_a_judge_that_records_nothing_writes_no_calls(
+    session: AsyncSession, registry
+) -> None:
+    # The plain RecordingJudge never opens a record_judge_call, so the score is written
+    # with an empty call list rather than failing.
+    await _select_metrics(session, ["utilidad"])
+    _, _, scenario = await _seed_scenario(session, [("hola", "qué tal")])
+
+    await EvalRunner(session, RecordingJudge()).run_scenario(scenario)
+    await session.commit()
+
+    assert (await session.execute(select(func.count()).select_from(JudgeCall))).scalar_one() == 0
 
 
 # --- Metric-level resume ------------------------------------------------------

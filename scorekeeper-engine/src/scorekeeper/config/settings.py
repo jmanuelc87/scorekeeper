@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     # including the embeddings backend attached to the Anthropic and Agent judges, which
     # is how a key-free agent run keeps its embeddings local.
     openai_base_url: str | None = None
-    anthropic_judge_model: str = "claude-opus-4-8"
+    anthropic_judge_model: str = "claude-sonnet-5"
     openai_judge_model: str = "gpt-5.6-sol"
     judge_max_tokens: int = 16384
     # Per-request timeout (seconds) for every judge LLM call, passed to the provider
@@ -55,7 +55,7 @@ class Settings(BaseSettings):
     # the Claude Code CLI bundled with claude-agent-sdk, so it authenticates with the
     # local Claude Code session and needs no API key. It calls the same Claude models
     # as the Anthropic judge (agent_judge_model must be one of its known models).
-    agent_judge_model: str = "claude-opus-4-8"
+    agent_judge_model: str = "claude-sonnet-5"
     # Long-lived Claude Code OAuth token (`claude setup-token`). Outside an interactive
     # session there is no local Claude Code login to authenticate with — a container
     # has no ~/.claude credentials — so the token is what makes judge_provider="agent"
@@ -85,6 +85,18 @@ class Settings(BaseSettings):
     embedding_chunk_overlap: int = 1  # sentences shared with the previous chunk
     embedding_batch_size: int = 128  # texts per embeddings API call
     embedding_top_k: int = 3  # chunks per document handed to the judge
+    # Server-side refusal fallback (scorekeeper.core.metrics.judges.anthropic_judge). A
+    # safety classifier may decline a judge call (HTTP 200, stop_reason="refusal"); with
+    # this set, the API re-runs that same call on this model inside the same request
+    # instead of leaving the turn unscored. It only applies to the Claude 5 models that
+    # support the feature, so it is inert while the judge runs on Opus 4.8. The model
+    # must be one the Anthropic judge owns. None disables the parameter entirely.
+    judge_fallback_model: str | None = "claude-opus-5"
+    # Model pins for the faithfulness_ragas entailment cascade: a cheap high-volume model
+    # decides every claim, and only verdicts it reports below escalation_confidence are
+    # re-judged by the decisive one. Both must be models the Anthropic judge owns.
+    faithfulness_bulk_model: str = "claude-sonnet-5"
+    faithfulness_audit_model: str = "claude-opus-5"
     # Override the judge system prompt at runtime; None uses the built-in default.
     judge_system_prompt: str | None = None
     # Trace every LLM API call the judge makes (op, model, step, turn, sizes,

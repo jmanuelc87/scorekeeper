@@ -40,15 +40,16 @@ def test_ragas_all_supported_is_one(make_judge) -> None:
             RagasEntailment(entailed=True, confidence=1.0, justification="Se deduce"),
         ],
     )
-    result = build(FaithfulnessRagas).evaluate(turn, judge)
+    metric = build(FaithfulnessRagas)
+    result = metric.evaluate(turn, judge)
 
     assert result.metric_name == "faithfulness_ragas"
     assert result.raw_score == 1.0
     assert result.normalized_score == 1.0
     # One bulk verdict per claim, all confident → only the bulk model ran.
     assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
-    assert judge.models == [FaithfulnessRagas.bulk_model, FaithfulnessRagas.bulk_model]
-    assert result.judge_model == FaithfulnessRagas.bulk_model
+    assert judge.models == [metric.bulk_model, metric.bulk_model]
+    assert result.judge_model == metric.bulk_model
 
 
 def test_ragas_mixed_is_fraction_supported(make_judge) -> None:
@@ -102,23 +103,22 @@ def test_ragas_low_confidence_escalates_to_audit(make_judge) -> None:
             RagasEntailment(entailed=True, confidence=1.0, justification="Confirmado"),
         ],
     )
-    result = build(FaithfulnessRagas).evaluate(turn, judge)
+    metric = build(FaithfulnessRagas)
+    result = metric.evaluate(turn, judge)
 
     # Audit verdict (entailed) wins → supported / n = 1 / 1.
     assert result.raw_score == 1.0
     # Two structured calls for the single claim: bulk (Haiku) then audit (Opus).
     assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
-    assert judge.models == [FaithfulnessRagas.bulk_model, FaithfulnessRagas.audit_model]
-    assert result.judge_model == (
-        f"{FaithfulnessRagas.bulk_model} → {FaithfulnessRagas.audit_model}"
-    )
+    assert judge.models == [metric.bulk_model, metric.audit_model]
+    assert result.judge_model == f"{metric.bulk_model} → {metric.audit_model}"
     # The escalation is flagged in typed metadata, and the surfaced rationale is
     # the audit model's — no glued-in "(escalado a …)" string.
     assert len(result.trace.steps) == 2  # extraction step + verification step
     entry = result.trace.steps[1].entries[0]
     assert entry.value is True
     assert entry.metadata["escalated"] is True
-    assert entry.metadata["model"] == FaithfulnessRagas.audit_model
+    assert entry.metadata["model"] == metric.audit_model
     assert entry.justification == "Confirmado"
 
 
@@ -266,3 +266,25 @@ def test_deepeval_pins_models_per_call(make_judge) -> None:
     # models are the explicit per-call pins, not judge.model_for's default.
     assert [kind for kind, _ in judge.calls] == ["structured", "score", "score"]
     assert judge.models == [truths_model, verdict_model, verdict_model]
+
+
+def test_ragas_reads_its_cascade_pins_from_settings(monkeypatch) -> None:
+    """The two tiers are configuration, not constants baked into the class."""
+    from scorekeeper.config.settings import Settings
+    from scorekeeper.core.metrics.catalog import faithfulness
+
+    monkeypatch.setattr(
+        faithfulness,
+        "get_settings",
+        lambda: Settings(
+            faithfulness_bulk_model="claude-sonnet-5",
+            faithfulness_audit_model="claude-fable-5",
+        ),
+    )
+    metric = build(FaithfulnessRagas)
+
+    assert metric.bulk_model == "claude-sonnet-5"
+    assert metric.audit_model == "claude-fable-5"
+    # Still overridable per instance afterwards, as the class comment promises.
+    metric.bulk_model = "claude-opus-5"
+    assert metric.bulk_model == "claude-opus-5"

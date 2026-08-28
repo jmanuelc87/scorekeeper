@@ -56,6 +56,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from scorekeeper.config.settings import get_settings
 from scorekeeper.db.models import (
     BenchmarkRun,
+    JudgeCall,
     MetricScore,
     MetricTrace,
     PlatformExecution,
@@ -69,7 +70,13 @@ from scorekeeper.core.metrics.base import Metric, MetricResult, TurnView
 from scorekeeper.core.metrics.fingerprint import scoring_key
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
 from scorekeeper.core.metrics.judges import make_judge
-from scorekeeper.core.metrics.judges.base import UsageAccumulator, collect_usage
+from scorekeeper.core.metrics.judges.base import (
+    CallRecorder,
+    JudgeCallRecord,
+    UsageAccumulator,
+    collect_calls,
+    collect_usage,
+)
 from scorekeeper.core.metrics.rollup import execution_average, turn_score
 from scorekeeper.core.metrics.selection import active_templates, metrics_for, resolve
 from scorekeeper.core.retrieval.embed import Embedder, EmbedError
@@ -413,7 +420,8 @@ class EvalRunner:
         # One accumulator for the whole turn — every metric thread adds each judge
         # call's tokens to it (see _evaluate_metrics), so the snapshot is the turn total.
         usage = UsageAccumulator()
-        for result in await self._evaluate_metrics(view, pending, turn.turn_number, usage):
+        evaluated = await self._evaluate_metrics(view, pending, turn.turn_number, usage)
+        for result, calls in evaluated:
             turn.metric_scores.append(
                 MetricScore(
                     metric_name=result.metric_name,
@@ -422,6 +430,12 @@ class EvalRunner:
                     judge_model=result.judge_model,
                     rubric_version=result.rubric_version,
                     scoring_key=keys[result.metric_name],
+                    # One row per LLM call the metric made, in call order: the only
+                    # place the exact prompt sent to the judge survives.
+                    judge_calls=[
+                        JudgeCall(sequence=i, **call.model_dump())
+                        for i, call in enumerate(calls)
+                    ],
                 )
             )
             await self.session.commit()  # persist each surviving metric's score
@@ -450,33 +464,38 @@ class EvalRunner:
         metrics: list[Metric],
         turn_number: int,
         usage: UsageAccumulator,
-    ) -> list[MetricResult]:
+    ) -> list[tuple[MetricResult, list[JudgeCallRecord]]]:
         """Evaluate every metric concurrently — one worker thread each — and return the
-        surviving results in metric-declaration order.
+        surviving results, each with its judge calls, in metric-declaration order.
 
         Only ``metric.evaluate`` runs off the event loop: it takes the ORM-free ``view``
         and the shared, thread-safe ``judge``, touches no session state, and drives a
         *blocking* LLM SDK — hence ``to_thread`` rather than a bare await. Each worker
-        activates the shared per-turn ``usage`` accumulator for the duration of its
-        evaluate() and resets it on exit, so nothing leaks to the next task on a reused
-        thread. ``gather`` yields results in *argument* order, which is what keeps the
-        ``MetricScore`` rows in a stable order regardless of which judge call finishes
-        first; ``return_exceptions`` is what keeps a failing metric from cancelling its
-        siblings (skip-metric-continue) — it is logged and dropped.
+        activates the shared per-turn ``usage`` accumulator plus a ``CallRecorder`` of
+        its *own* for the duration of its evaluate() and resets both on exit, so nothing
+        leaks to the next task on a reused thread. The recorder is per metric because its
+        snapshot is persisted per ``MetricScore``; since no metric fans its judge calls
+        out across threads, the recorded order is the real call order. ``gather`` yields
+        results in *argument* order, which is what keeps the ``MetricScore`` rows in a
+        stable order regardless of which judge call finishes first; ``return_exceptions``
+        is what keeps a failing metric from cancelling its siblings
+        (skip-metric-continue) — it is logged and dropped.
         """
         if not metrics:
             return []
 
-        def _evaluate(metric: Metric) -> MetricResult:
-            with collect_usage(usage):
-                return metric.evaluate(view, self.judge)
+        def _evaluate(metric: Metric) -> tuple[MetricResult, list[JudgeCallRecord]]:
+            recorder = CallRecorder()
+            with collect_usage(usage), collect_calls(recorder):
+                result = metric.evaluate(view, self.judge)
+            return result, recorder.snapshot()
 
         outcomes = await asyncio.gather(
             *(asyncio.to_thread(_evaluate, metric) for metric in metrics),
             return_exceptions=True,
         )
 
-        results: list[MetricResult] = []
+        results: list[tuple[MetricResult, list[JudgeCallRecord]]] = []
         for metric, outcome in zip(metrics, outcomes):
             if isinstance(outcome, BaseException):  # skip-metric-continue
                 logger.warning(

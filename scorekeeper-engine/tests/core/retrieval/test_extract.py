@@ -162,6 +162,42 @@ def test_images_are_stripped_and_text_stripped() -> None:
     assert "text" in result.text
 
 
+def test_links_are_stripped_with_their_anchor_text() -> None:
+    conv = _RecordingConverter(
+        markdown=(
+            "Ver [el informe](https://x.com/a.pdf#page=3) y [otro][ref].\n\n"
+            "[ref]: https://y.com/b\n\n"
+            "<a href='https://x'>Banxico</a> subió la tasa.\n\n"
+            "Fuente <https://x.com> y www.ejemplo.com/x."
+        )
+    )
+    result = MarkdownContentExtractor(converter=conv).extract(_doc(DocType.HTML, b"x"), _loc(DocType.HTML))
+    assert "http" not in result.text and "www." not in result.text
+    assert "](" not in result.text and "<a " not in result.text
+    assert "el informe" not in result.text and "otro" not in result.text  # anchor text gone
+    assert "Banxico" not in result.text
+    assert "subió la tasa." in result.text
+
+
+def test_link_markup_never_becomes_a_sentence() -> None:
+    conv = _RecordingConverter(markdown="Texto uno. [BMV](https://bmv.com.mx/a) https://otro.mx/b Texto dos.")
+    result = MarkdownContentExtractor(converter=conv).extract(
+        _doc(DocType.HTML, b"x"), _loc(DocType.HTML)
+    )
+    joined = " ".join(s.text for s in result.sentences)
+    assert "http" not in joined and "bmv.com.mx" not in joined
+    assert "BMV" not in joined
+    assert "Texto uno." in joined and "Texto dos." in joined
+
+
+def test_space_runs_between_words_are_collapsed() -> None:
+    # Two or more horizontal spaces between words collapse to one — tabs and the
+    # non-breaking spaces an HTML conversion emits included. Newlines are untouched.
+    conv = _RecordingConverter(markdown="Uno    dos\tres\u00a0\u00a0cuatro\ncinco  seis")
+    result = MarkdownContentExtractor(converter=conv).extract(_doc(DocType.HTML, b"x"), _loc(DocType.HTML))
+    assert result.text == "Uno dos\tres cuatro\ncinco seis"
+
+
 def test_extracted_content_type() -> None:
     conv = _RecordingConverter()
     result = MarkdownContentExtractor(converter=conv).extract(_doc(DocType.HTML, b"x"), _loc(DocType.HTML))
@@ -217,16 +253,19 @@ def test_image_markup_never_becomes_a_sentence() -> None:
 # -- real markitdown integration (skips if the optional extra is absent) --------------------
 
 
-def test_real_html_conversion_preserves_structure_drops_images() -> None:
+def test_real_html_conversion_preserves_structure_drops_images_and_links() -> None:
     pytest.importorskip("markitdown")
     html = (
         b"<h1>Titulo</h1>"
         b"<ul><li>uno</li><li>dos</li></ul>"
         b"<table><tr><th>A</th><th>B</th></tr><tr><td>1</td><td>2</td></tr></table>"
         b"<img src='x.png'>"
+        b"<p>Ver <a href='https://x.com/nota'>la nota</a> en https://x.com/otra.</p>"
     )
     result = MarkdownContentExtractor().extract(_doc(DocType.HTML, html), _loc(DocType.HTML))
     assert "# Titulo" in result.text  # heading
     assert ("* uno" in result.text) or ("- uno" in result.text)  # list
     assert "| A | B |" in result.text  # table
     assert "![" not in result.text and "<img" not in result.text  # no images
+    assert "http" not in result.text  # no links
+    assert "la nota" not in result.text  # anchor text dropped with the link

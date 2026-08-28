@@ -20,8 +20,10 @@ Per document type:
 * **HTML** — the fetched page bytes are converted.
 
 Conversion goes through **MarkItDown** (imported lazily; ships in the optional ``retrieval``
-extra), preserving titles, lists, and tables. **Images/graphics are dropped**: MarkItDown
-keeps images as markdown, so this stage strips image markup from the result.
+extra), preserving titles, lists, and tables. **Images/graphics and links are dropped**:
+MarkItDown keeps both as markdown, so this stage strips image markup from the result and
+strips links out of it entirely — anchor text included, along with a URL that is only a URL
+(autolink or bare).
 
 Every converted document is then segmented into :class:`~scorekeeper.core.retrieved_context.Sentence`
 with ``syntok`` (``core.text.split_sentences``, the same segmenter ``faithfulness`` uses on the
@@ -54,12 +56,28 @@ _SUPPORTED = frozenset({DocType.PDF, DocType.DOCX, DocType.HTML})
 # MarkItDown ``file_extension`` hint per document type.
 _EXTENSIONS = {DocType.PDF: ".pdf", DocType.DOCX: ".docx", DocType.HTML: ".html"}
 
-# Image markup to remove (inline / reference markdown images and raw <img> tags), plus a
-# collapser for the blank-line runs their removal can leave behind.
+# Image markup to remove (inline / reference markdown images and raw <img> tags).
 _IMAGE_INLINE = re.compile(r"!\[[^\]]*\]\([^)]*\)")
 _IMAGE_REFERENCE = re.compile(r"!\[[^\]]*\]\[[^\]]*\]")
 _IMAGE_TAG = re.compile(r"<img\b[^>]*>", re.IGNORECASE)
+
+# Link markup to remove: a link goes entirely — anchor text and target alike — and so does a
+# bare or autolinked URL.
+_LINK_INLINE = re.compile(r"\[[^\]]*\]\([^)]*\)")
+_LINK_REFERENCE = re.compile(r"\[[^\]]*\]\[[^\]]*\]")
+_LINK_DEFINITION = re.compile(r"^[ \t]*\[[^\]]*\]:[ \t]*\S+.*$", re.MULTILINE)
+_LINK_TAG = re.compile(r"<a\b[^>]*>.*?</a>|</?a\b[^>]*>", re.IGNORECASE | re.DOTALL)
+_AUTOLINK = re.compile(r"<(?:https?://|mailto:)[^>\s]*>", re.IGNORECASE)
+_BARE_URL = re.compile(
+    r"\(?(?:https?://|www\.)[^\s<>)\]]*[^\s<>)\].,;:!?\"']\)?", re.IGNORECASE
+)
+
+# Collapsers for the blank-line / space runs the removals above can leave behind. The
+# space run is any horizontal whitespace but a newline — tabs and the non-breaking /
+# unicode spaces an HTML conversion emits (``&nbsp;``) included — so two words never stay
+# separated by more than one space.
 _BLANK_RUN = re.compile(r"\n{3,}")
+_SPACE_RUN = re.compile(r"[^\S\n\r\f\v]{2,}")
 
 
 class ExtractError(Exception):
@@ -105,8 +123,8 @@ class MarkdownContentExtractor:
         else:
             raise ExtractError(f"Tipo de documento no soportado: {document.doc_type}")
 
-        # Strip images before segmenting so no sentence is built out of image markup.
-        blocks = [(page, _strip_images(markdown).strip()) for page, markdown in pages]
+        # Strip images and links before segmenting so no sentence is built out of markup.
+        blocks = [(page, _strip_markup(markdown).strip()) for page, markdown in pages]
         sentences: list[Sentence] = []
         for page, block in blocks:
             for sentence in split_sentences(block):
@@ -162,9 +180,20 @@ class MarkdownContentExtractor:
         return result.text_content
 
 
-def _strip_images(markdown: str) -> str:
-    """Remove image markup (markdown images and raw ``<img>`` tags) from ``markdown``."""
+def _strip_markup(markdown: str) -> str:
+    """Remove image and link markup from ``markdown``.
+
+    Images (markdown and raw ``<img>``) go entirely, and so does every link — markdown links,
+    reference links and their definitions, ``<a>`` elements — anchor text included, along with
+    a URL that is only a URL (autolink or bare).
+    """
     markdown = _IMAGE_INLINE.sub("", markdown)
     markdown = _IMAGE_REFERENCE.sub("", markdown)
     markdown = _IMAGE_TAG.sub("", markdown)
-    return _BLANK_RUN.sub("\n\n", markdown)
+    markdown = _LINK_INLINE.sub("", markdown)
+    markdown = _LINK_REFERENCE.sub("", markdown)
+    markdown = _LINK_DEFINITION.sub("", markdown)
+    markdown = _LINK_TAG.sub("", markdown)
+    markdown = _AUTOLINK.sub("", markdown)
+    markdown = _BARE_URL.sub("", markdown)
+    return _BLANK_RUN.sub("\n\n", _SPACE_RUN.sub(" ", markdown))

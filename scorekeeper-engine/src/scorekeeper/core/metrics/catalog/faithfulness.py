@@ -31,14 +31,19 @@ asked for.
 
 Neither metric touches ``retrieved_context`` directly. It is a single Spanish
 text blob on ``TurnView``; the judge layer renders it into every prompt (via the
-``{context}`` placeholder and an appended "Contexto recuperado" section), so
-these metrics stay agnostic to context shape and just hand the turn to the judge.
+``{context}`` placeholder and an appended "Contexto recuperado" section, in both
+cases delimited by ``<contexto></contexto>`` tags), so these metrics stay agnostic
+to context shape and just hand the turn to the judge.
 All prompts and justification output are Spanish.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from pydantic import BaseModel
+
+from scorekeeper.config.settings import get_settings
 
 from scorekeeper.core.metrics.base import (
     NOT_APPLICABLE,
@@ -116,15 +121,25 @@ class FaithfulnessRagas(MultiStepMetric):
         ),
     )
 
-    # Per-call model pins for the entailment cascade (per-claim, the n× hot loop),
-    # overridable per instance. A cheap high-volume model (bulk, Haiku) decides every
-    # claim; only verdicts it reports below ``escalation_confidence`` are re-judged by
-    # the decisive/audit model (Opus). These are explicit model ids, not JudgeStep
-    # routing, so the two tiers are fixed regardless of the judge's step config; both
-    # must stay in ``AnthropicJudge.KNOWN_MODELS`` or the judge will reject the call.
+    # Per-call model pins for the entailment cascade (per-claim, the n× hot loop). A
+    # cheap high-volume model (bulk, Haiku) decides every claim; only verdicts it reports
+    # below ``escalation_confidence`` are re-judged by the decisive/audit model (Opus).
+    # These are explicit model ids, not JudgeStep routing, so the two tiers are fixed
+    # regardless of the judge's step config; both must stay in
+    # ``AnthropicJudge.KNOWN_MODELS`` or the judge will reject the call.
+    #
+    # The class attributes are the fallback for a direct ``FaithfulnessRagas()``; the
+    # configured values come from settings in ``__init__``, and either stays overridable
+    # per instance afterwards.
     bulk_model: str = "claude-haiku-4-5-20251001"
     audit_model: str = "claude-opus-4-8"
     escalation_confidence: float = 0.7
+
+    def __init__(self, templates: Mapping[str, str] | None = None) -> None:
+        super().__init__(templates)
+        settings = get_settings()
+        self.bulk_model = settings.faithfulness_bulk_model
+        self.audit_model = settings.faithfulness_audit_model
 
     def _verify_claim(
         self, turn: TurnView, judge: Judge, claim: str, bulk_model: str, audit_model: str

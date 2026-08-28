@@ -84,6 +84,9 @@ button:hover:not(:disabled) { opacity: .85; }
 .btn-resume { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border-radius: 50%; background: var(--amber); color: white; font-size: 1rem; line-height: 1; }
 .btn-resume:hover:not(:disabled) { opacity: .85; }
 .btn-resume:disabled { opacity: .5; }
+.btn-rerun { display: inline-flex; align-items: center; justify-content: center; width: 30px; height: 30px; padding: 0; border-radius: 50%; background: var(--blue); color: white; font-size: 1rem; line-height: 1; }
+.btn-rerun:hover:not(:disabled) { opacity: .85; }
+.btn-rerun:disabled { opacity: .5; }
 .inline-error { margin: 0; padding: 4px 8px; font-size: .72rem; color: var(--red); background: #fef2f2; border-radius: 6px; }
 .run-id { font-size: .82rem; background: #f3f6f9; padding: 4px 8px; border-radius: 6px; color: var(--gray); }
 .run-card-meta { font-size: .78rem; color: var(--gray); }
@@ -221,6 +224,18 @@ button:hover:not(:disabled) { opacity: .85; }
 .trace-entry-value { font-weight: 800; color: var(--blue); font-size: .82rem; }
 .trace-entry-justification { margin: 0; font-size: .78rem; line-height: 1.5; color: #374151; white-space: pre-wrap; word-break: break-word; }
 .trace-entry-metadata { margin: 6px 0 0; font-size: .68rem; background: #f3f6f9; padding: 6px 8px; border-radius: 4px; overflow-x: auto; color: var(--gray); }
+
+/* === Judge calls === */
+.judge-calls { border-top: 1px dashed #dfe6ee; padding-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.judge-calls-title { font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--gray); }
+.judge-call { background: white; border: 1px solid #e8edf2; border-radius: 8px; }
+.judge-call-header { display: flex; align-items: center; gap: 8px; padding: 6px 12px; cursor: pointer; user-select: none; font-size: .78rem; }
+.judge-call-header:hover { background: #f3f6f9; }
+.judge-call-sequence { font-weight: 700; color: var(--blue); font-variant-numeric: tabular-nums; }
+.judge-call-meta { font-size: .7rem; color: var(--gray); background: #f3f6f9; padding: 2px 6px; border-radius: 4px; }
+.judge-call-body { border-top: 1px solid #e8edf2; padding: 8px 12px; display: flex; flex-direction: column; gap: 4px; }
+.judge-call-label { font-size: .65rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--gray); }
+.judge-call-text { margin: 0 0 6px; font-size: .75rem; line-height: 1.5; color: #374151; font-family: ui-monospace, monospace; white-space: pre-wrap; word-break: break-word; }
 
 /* === Token usage === */
 .token-usage-section { border-top: 1px dashed #dfe6ee; padding-top: 8px; }

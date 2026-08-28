@@ -119,6 +119,29 @@ export async function resumeRun(runId: string): Promise<{ run_id: string; status
 }
 
 /**
+ * Re-run a completed evaluation via POST /api/v1/evaluations/{run_id}/rerun.
+ * Drops the run's scores and judges every selected turn again under the currently
+ * active prompts. The run must be in the "completado" state.
+ */
+export async function rerunRun(runId: string): Promise<{ run_id: string; status: string }> {
+  const response = await fetch(`${API_URL}/api/v1/evaluations/${runId}/rerun`, {
+    method: "POST",
+  });
+
+  if (!response.ok) {
+    if (response.status === 404) {
+      throw new Error("Run not found");
+    }
+    if (response.status === 409) {
+      throw new Error("Only a completed run can be re-run");
+    }
+    throw new Error(`Request failed (${response.status})`);
+  }
+
+  return response.json() as Promise<{ run_id: string; status: string }>;
+}
+
+/**
  * Fetch the structured metric traces for a turn via GET /api/v1/turns/{turn_id}/traces.
  * Returns one entry per metric scored on the turn.
  */

@@ -3,7 +3,7 @@
 A retrieved document's text lives only on its chunks, and a judge is handed just the few
 closest to the turn's prompt. That ranking runs **in PostgreSQL**, through pgvector's
 ``<=>`` cosine-distance operator, rather than in Python: the chunks stay in the database
-and their 1536-float vectors never cross into the process.
+and their vectors never cross into the process.
 
 **Shape matters here.** The per-document subquery is written as a bare
 ``ORDER BY embedding <=> :q LIMIT :k`` because that is the only form the

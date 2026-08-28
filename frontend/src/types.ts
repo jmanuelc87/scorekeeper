@@ -140,12 +140,25 @@ export interface Trace {
   steps: TraceStep[];
 }
 
+/** A single LLM call made by the judge while scoring a metric. */
+export interface JudgeCall {
+  sequence: number;
+  step: string | null;
+  model: string;
+  system_prompt: string;
+  prompt: string;
+  latency_ms: number;
+  input_tokens: number;
+  output_tokens: number;
+}
+
 /** A metric trace as returned by GET /api/v1/turns/{turn_id}/traces. */
 export interface MetricTrace {
   metric_name: string;
   judge_model: string | null;
   rubric_version: string | null;
   trace: Trace;
+  judge_calls: JudgeCall[];
 }
 
 /** Token usage for a single turn as returned by GET /api/v1/turns/{turn_id}/token-usage. */

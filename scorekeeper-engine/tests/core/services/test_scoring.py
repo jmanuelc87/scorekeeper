@@ -28,6 +28,7 @@ from scorekeeper.core.metrics.selection import MissingPromptError, sync_prompts
 from scorekeeper.core.services.ingestion import UploadedFile, ingest_evaluation
 from scorekeeper.core.services.runs import (
     get_run_summary,
+    rerun_run,
     resume_run,
     set_turn_selection,
     start_run,
@@ -593,3 +594,99 @@ async def test_score_run_fails_fast_when_a_slot_has_no_active_version(
     assert (await session.get(BenchmarkRun, uuid.UUID(run_id))).status == "fallido"
     scores = (await session.execute(select(func.count()).select_from(MetricScore))).scalar_one()
     assert scores == 0
+
+
+# --- re-run -------------------------------------------------------------------
+# Re-running a finished run is not a resume: the chain skips a scored turn, so the
+# scores have to go before the same turns can be judged again.
+
+
+async def test_rerun_run_clears_the_scores_and_requeues(
+    session: AsyncSession, registry
+) -> None:
+    run_id = await _ingest_selected(session)
+    await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+
+    status = await rerun_run(run_id, session=session)
+
+    assert status == "en_cola"
+    assert (await session.get(BenchmarkRun, uuid.UUID(run_id))).status == "en_cola"
+    scores = (
+        await session.execute(select(func.count()).select_from(MetricScore))
+    ).scalar_one()
+    assert scores == 0
+    turns = (await session.execute(select(Turn))).scalars().all()
+    assert [t.turn_score for t in turns] == [None, None]
+    assert all(t.attempts == 0 for t in turns)
+    # Selection survives: the re-run scores the same turns, not a different set.
+    assert all(t.is_selected for t in turns)
+    platform_exec = (await session.execute(select(PlatformExecution))).scalars().one()
+    assert platform_exec.status == "pending"
+    assert platform_exec.average_score is None
+    assert platform_exec.finished_at is None
+    scenario = (await session.execute(select(ScenarioResult))).scalars().one()
+    assert scenario.status == "pending"
+
+
+async def test_rerun_run_releases_the_pinned_prompts(
+    session: AsyncSession, registry_with_prompt
+) -> None:
+    """The point of a re-run: the same conversations under the prompts active *now*."""
+    run_id = await _ingest_selected(session)
+    await _publish(session)
+    await score_run(run_id, session=session, judge=RecordingJudge(0.8))
+
+    await rerun_run(run_id, session=session)
+
+    bindings = (
+        await session.execute(select(func.count()).select_from(RunPromptBinding))
+    ).scalar_one()
+    assert bindings == 0
+
+    # A newer version goes live, and the re-run pins it instead of the old one.
+    for version in (await session.execute(select(PromptVersion))).scalars().all():
+        version.is_active = False
+    for prompt in (await session.execute(select(Prompt))).scalars().all():
+        session.add(
+            PromptVersion(
+                prompt_id=prompt.id,
+                version=2,
+                template="NUEVA {claim}",
+                status="published",
+                is_active=True,
+            )
+        )
+    await session.commit()
+
+    judge = RecordingJudge(0.6, model="otro-juez")
+    seen = _counting(judge)
+    await score_run(run_id, session=session, judge=judge)
+
+    binding = (await session.execute(select(RunPromptBinding))).scalars().one()
+    version = await session.get(PromptVersion, binding.prompt_version_id)
+    assert version.version == 2
+    assert seen and all("NUEVA" in rubric for rubric in seen)
+
+
+@pytest.mark.parametrize(
+    "status", ["ingerido", "en_cola", "en_proceso", "parcial", "fallido"]
+)
+async def test_rerun_run_rejects_unfinished_runs(
+    session: AsyncSession, registry, status: str
+) -> None:
+    """Only a finished run is re-run; anything else would throw away live or partial work."""
+    files = [UploadedFile("esc1.xlsx", _conversation_bytes(), "esc1", "default")]
+    run_id = await ingest_evaluation("claude", files, session=session)
+    run = await session.get(BenchmarkRun, uuid.UUID(run_id))
+    run.status = status
+    await session.commit()
+
+    with pytest.raises(ValueError):
+        await rerun_run(run_id, session=session)
+    await session.refresh(run)
+    assert run.status == status
+
+
+async def test_rerun_run_unknown_returns_none(session: AsyncSession) -> None:
+    assert await rerun_run("not-a-uuid", session=session) is None
+    assert await rerun_run("00000000-0000-0000-0000-000000000000", session=session) is None

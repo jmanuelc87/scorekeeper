@@ -19,6 +19,7 @@ from scorekeeper.core.metrics.judges.base import (
     clamp,
     judge_call,
     owned_model,
+    record_judge_call,
     record_usage,
     render_prompt,
     require_parsed,
@@ -152,12 +153,16 @@ class OpenAIJudge:
             )
             return completion, completion.choices[0].message
 
-        completion, message = judge_call(
-            _call, provider=self.provider, model=model, action="la puntuación"
-        )
-        # Recorded before the parse check: the tokens were spent even if the model
-        # refused or returned output that does not satisfy the schema.
-        self._record_chat_usage(completion)
+        with record_judge_call(
+            step=step, model=model, system_prompt=self.system_prompt, prompt=content
+        ):
+            completion, message = judge_call(
+                _call, provider=self.provider, model=model, action="la puntuación"
+            )
+            # Recorded before the parse check: the tokens were spent even if the model
+            # refused or returned output that does not satisfy the schema; inside the
+            # block so they also land on this call's record.
+            self._record_chat_usage(completion)
         parsed: _ScoreResponse = require_parsed(
             message.parsed,
             provider=self.provider,
@@ -181,22 +186,26 @@ class OpenAIJudge:
         model: str | None = None,
     ) -> T:
         model = self.resolve_model(step, model)
+        content = render_prompt(instruction, turn)
 
         def _call() -> tuple[Any, Any]:
             completion = self._client.chat.completions.parse(
                 model=model,
                 messages=[
                     {"role": "system", "content": self.system_prompt},
-                    {"role": "user", "content": render_prompt(instruction, turn)},
+                    {"role": "user", "content": content},
                 ],
                 response_format=schema,
             )
             return completion, completion.choices[0].message
 
-        completion, message = judge_call(
-            _call, provider=self.provider, model=model, action="la extracción"
-        )
-        self._record_chat_usage(completion)
+        with record_judge_call(
+            step=step, model=model, system_prompt=self.system_prompt, prompt=content
+        ):
+            completion, message = judge_call(
+                _call, provider=self.provider, model=model, action="la extracción"
+            )
+            self._record_chat_usage(completion)
         return require_parsed(
             message.parsed,
             provider=self.provider,

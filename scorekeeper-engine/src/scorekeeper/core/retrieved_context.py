@@ -43,7 +43,7 @@ class Chunk(BaseModel):
     """One stored, embedded window of a document, as handed to a judge.
 
     The embedding itself never leaves the database: the ranking runs in SQL
-    (``db.repositories.embeddings``), so 1536-float vectors never enter the ``TurnView``
+    (``db.repositories.embeddings``), so the vectors never enter the ``TurnView``
     that ``metrics.fingerprint`` hashes whole.
     """
 

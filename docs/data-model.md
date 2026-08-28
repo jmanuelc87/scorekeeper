@@ -412,7 +412,7 @@ never sees a whole document.
 | `retrieved_document_id` | UUID | FK → `retrieved_documents.id`, `ON DELETE CASCADE` (indexed). |
 | `chunk_index` | Integer | Order of the chunk within its document, 0-based. Unique per document (`uq_retrieved_document_embeddings_chunk`), so re-embedding replaces chunks instead of accumulating them. |
 | `content` | Text | The chunk's own text — what was embedded, kept so a hit reads back without re-splitting the parent. |
-| `embedding` | vector(1536) | The chunk's embedding; `NULL` when it was stored without one. JSON on the SQLite fallback. |
+| `embedding` | vector(768) | The chunk's embedding; `NULL` when it was stored without one. JSON on the SQLite fallback. |
 | `page` | Integer | 1-based page the chunk's **first** sentence came from. `NULL` for DOCX/HTML, and on rows written before this column existed. |
 | `sentence_start` | Integer | First `Sentence.index` the chunk spans, indexing `retrieved_documents.sentences`. |
 | `sentence_end` | Integer | Last `Sentence.index` the chunk spans, **inclusive**. |
@@ -444,10 +444,14 @@ enrichment that lets scoring narrow them to the turn's prompt. A deployment with
 `openai_api_key` stores chunks with a `NULL` embedding, and a judge still reads the whole
 document — only the narrowing is lost.
 
-The width is fixed at **1536** (`db.models.EMBEDDING_DIMENSIONS`), matching the default
-embedder `openai_embedding_model` = `text-embedding-3-small`. Fixed rather than free
-because pgvector can only index a column of known width; the cost is that an embedder
-of a different width does not fit and cannot populate the table.
+The width is fixed at **768** (`db.models.EMBEDDING_DIMENSIONS`) — nomic-embed-text, the
+model an OpenAI-compatible local server (LM Studio, reached through `openai_base_url`)
+serves. Fixed rather than free because pgvector can only index a column of known width,
+so this and `openai_embedding_model` have to agree: OpenAI's `text-embedding-3-small` is
+1536 wide and its vectors are rejected by `retrieval.embed.OpenAIEmbedder` before the
+INSERT. Changing the width takes a migration **and** a re-embed — pgvector cannot cast a
+stored vector to another width, so the migration empties the table (the text is rebuilt
+from `retrieved_documents.sentences`, the embeddings are paid for again).
 
 The table is **PostgreSQL-only in practice**. It needs the `vector` extension — the
 Compose `database` service runs `pgvector/pgvector:pg17` for that reason — and carries an

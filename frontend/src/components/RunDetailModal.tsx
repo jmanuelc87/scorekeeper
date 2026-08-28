@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useState } from "react";
-import type { MetricScore, MetricTrace, Run, ScenarioPlatformExecution, ScenarioTurn, TraceEntry, TraceStep, TurnTokenUsage } from "../types";
+import type { JudgeCall, MetricScore, MetricTrace, Run, ScenarioPlatformExecution, ScenarioTurn, TraceEntry, TraceStep, TurnTokenUsage } from "../types";
 import { fetchScenarioTurns, fetchTurnTraces, fetchTurnTokenUsage, updateTurnSelection } from "../api";
 import { StatusBadge } from "./StatusBadge";
 
@@ -483,6 +483,60 @@ function TracePanel({ trace, metricName }: { trace: MetricTrace | undefined; met
       </div>
       {trace.trace.steps.map((step, i) => (
         <TraceStepView key={i} step={step} />
+      ))}
+      <JudgeCallsPanel calls={trace.judge_calls} />
+    </div>
+  );
+}
+
+/** Renders the LLM calls the judge made for a metric, each one collapsible. */
+function JudgeCallsPanel({ calls }: { calls: JudgeCall[] | undefined }) {
+  const [expanded, setExpanded] = useState<number | null>(null);
+
+  if (!calls || calls.length === 0) {
+    return null;
+  }
+
+  const toggle = (sequence: number) => {
+    setExpanded(expanded === sequence ? null : sequence);
+  };
+
+  return (
+    <div className="judge-calls">
+      <span className="judge-calls-title">Llamadas al juez ({calls.length})</span>
+      {calls.map((call) => (
+        <div className="judge-call" key={call.sequence}>
+          <div
+            className="judge-call-header"
+            onClick={() => toggle(call.sequence)}
+            role="button"
+            tabIndex={0}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                toggle(call.sequence);
+              }
+            }}
+            aria-expanded={expanded === call.sequence}
+            aria-label={`Ver llamada ${call.sequence}`}
+          >
+            <span className="judge-call-sequence">#{call.sequence}</span>
+            {call.step && <span className="judge-call-meta">{call.step}</span>}
+            <span className="judge-call-meta">{call.model}</span>
+            <span className="judge-call-meta">{call.latency_ms} ms</span>
+            <span className="metric-expand-icon">
+              {expanded === call.sequence ? "▾" : "▸"}
+            </span>
+          </div>
+          {expanded === call.sequence && (
+            <div className="judge-call-body">
+              <span className="judge-call-label">System prompt</span>
+              <p className="judge-call-text">{call.system_prompt}</p>
+              <span className="judge-call-label">Prompt</span>
+              <p className="judge-call-text">{call.prompt}</p>
+            </div>
+          )}
+        </div>
       ))}
     </div>
   );

@@ -49,7 +49,7 @@ is performed inside the `ContentExtractor` (see [Extract](#extract)).
 | locate | `DocumentLocatorResolver` | `SourceRef` → `DocumentLocator` | Derive the document URL (minus fragment), filename, `DocType`, scheme, host, and page/section from a `#page=N` fragment. |
 | authorize | `AuthProvider` | `DocumentLocator` → `AuthDecision` (+ `client`) | Classify the auth requirement, resolve it against available credentials, and expose the generic `AuthClient`. |
 | fetch | `DocumentFetcher` | `DocumentLocator`, `AuthClient \| None` → `FetchedDocument` | Fetch the document bytes through the auth client (gated) or a public GET, cached on disk by `document_url`. |
-| filter + extract | `ContentExtractor` | `FetchedDocument`, `DocumentLocator` → `ExtractedContent` | Convert the document to markdown page by page (titles/lists/tables; images dropped) and segment it into page-attributed sentences. |
+| filter + extract | `ContentExtractor` | `FetchedDocument`, `DocumentLocator` → `ExtractedContent` | Convert the document to markdown page by page (titles/lists/tables; images and links dropped) and segment it into page-attributed sentences. |
 | assemble | `RetrievalReport.to_context` | outcomes → `RetrievedContext` | Collect the successfully-retrieved documents, in rank order; they persist as [`RetrievedDocument`](data-model.md#retrieveddocument) child rows of the turn. |
 | embed | `Embedder` | `Sentence` list → chunk rows | Group the sentences into overlapping chunks and embed each one; see [Embedding](#embedding). A phase of its own, after retrieval and before scoring. |
 
@@ -153,8 +153,14 @@ By document type:
 
 Conversion runs through **MarkItDown** (imported lazily; in the optional `retrieval` extra),
 preserving **titles, lists, and tables**. **Images/graphics are dropped** — MarkItDown keeps
-images as markdown, so the stage strips image markup (`![…](…)`, `<img>`) from the result. A
-type outside {PDF, DOCX, HTML} fails `supports()` (→ `UNSUPPORTED_TYPE`); a corrupt file or
+images as markdown, so the stage strips image markup (`![…](…)`, `<img>`) from the result.
+**Links are dropped too, for every document type**, anchor text included: `[texto](url)`,
+`[texto][ref]` and its `[ref]: url` definition, and the whole `<a href=…>…</a>` element go, as
+does a URL that is only a URL — an autolink `<https://…>` or a bare `https://…` / `www.…`. A
+link is retriever plumbing, not prose: it adds no claim a judge can check, and its tokens would
+otherwise ride into every chunk.
+
+A type outside {PDF, DOCX, HTML} fails `supports()` (→ `UNSUPPORTED_TYPE`); a corrupt file or
 conversion failure raises `ExtractError`. The markdown is not persisted: it is the source of
 the sentences below, and the emptiness gate the assemble stage reads.
 
@@ -172,8 +178,8 @@ Each converted block is then segmented into `Sentence` values — `{page, index,
 `faithfulness` uses on the assistant's answer; no LLM call). `page` is the 1-based PDF page the
 sentence came from, `None` for DOCX/HTML; `index` orders the sentence across the **whole**
 document (0-based, never restarting per page), so it lines up with
-`RetrievedDocumentEmbedding.chunk_index`. Segmentation runs on the image-stripped markdown, so
-image markup never becomes a sentence.
+`RetrievedDocumentEmbedding.chunk_index`. Segmentation runs on the image- and link-stripped markdown,
+so neither image markup nor a URL ever becomes a sentence.
 
 Sentences are the **chunker's input**, not judge input, and they are not what a judge
 reads. They persist on `retrieved_documents.sentences` (JSONB, nullable — rows retrieved
@@ -199,7 +205,7 @@ A phase of its own between retrieval and scoring
   `Judge.embed`: embedding retrieved documents is retrieval work, and it has to keep
   working whatever judge provider a run uses (Anthropic has no embedding endpoint, LM
   Studio's model is the wrong width). A vector whose width is not
-  `EMBEDDING_DIMENSIONS` (1536, the pgvector column's fixed width) is rejected as
+  `EMBEDDING_DIMENSIONS` (768, the pgvector column's fixed width) is rejected as
   `EmbedError` rather than left to fail inside an INSERT.
 
 **Chunking and embedding are separable, deliberately.** The chunks are the document's
@@ -249,7 +255,7 @@ WHERE d.turn_id = :turn_id
 ```
 
 The `embedding` column is never selected, and `Turn.retrieved_documents` is no longer
-loaded down to its chunks — so a run's 1536-float vectors stay in the database instead of
+loaded down to its chunks — so a run's vectors stay in the database instead of
 being pulled into the worker for every turn.
 
 **About the HNSW index.** `ORDER BY <=> … LIMIT` is written bare on purpose: it is the only

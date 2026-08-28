@@ -82,13 +82,13 @@ ui.form.addEventListener("submit", (event) => {
   }, SUBMIT_DEBOUNCE_MS);
 });
 
-// The detail panel's refresh re-polls the open chat's run.
+// The detail panel's refresh re-reads the open chat's run.
 ui.refresh.addEventListener("click", () => {
   if (!detailRunId) return;
   void send({ type: "refresh", runId: detailRunId }).then(render).catch(showError);
 });
 
-// The worker keeps polling with the popup closed; mirror those writes live.
+// A refresh from the evaluations tab writes the history; mirror those writes live.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes[RUNS_KEY]) render(changes[RUNS_KEY].newValue);
 });

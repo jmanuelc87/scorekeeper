@@ -209,12 +209,31 @@ def _serialize_metric_score(score: MetricScore) -> dict[str, Any]:
 def serialize_metric_trace(
     score: MetricScore, include_provenance: bool
 ) -> dict[str, Any]:
-    """One metric's trace for the per-turn traces endpoint (steps, optional provenance)."""
+    """One metric's trace for the per-turn traces endpoint.
+
+    Steps, the judge calls behind them, and optionally the provenance.
+    """
     entry: dict[str, Any] = {"metric_name": score.metric_name}
     if include_provenance:
         entry["judge_model"] = score.judge_model
         entry["rubric_version"] = score.rubric_version
     entry["trace"] = {"steps": score.trace.steps} if score.trace is not None else None
+    # One entry per LLM call behind the score, in ``sequence`` order (the relationship
+    # is ordered by it): the exact prompt sent to the judge, which the trace's steps
+    # only summarize. Empty for scores written before the calls were recorded.
+    entry["judge_calls"] = [
+        {
+            "sequence": call.sequence,
+            "step": call.step,
+            "model": call.model,
+            "system_prompt": call.system_prompt,
+            "prompt": call.prompt,
+            "latency_ms": call.latency_ms,
+            "input_tokens": call.input_tokens,
+            "output_tokens": call.output_tokens,
+        }
+        for call in score.judge_calls
+    ]
     return entry
 
 

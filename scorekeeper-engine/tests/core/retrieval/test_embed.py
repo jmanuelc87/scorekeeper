@@ -7,12 +7,19 @@ from typing import Any
 import pytest
 
 from scorekeeper.core.retrieval.embed import Embedder, EmbedError, OpenAIEmbedder
+from scorekeeper.db.models import EMBEDDING_DIMENSIONS
 
 
 class _FakeEmbeddings:
-    """Records every ``create`` call and returns vectors of ``dimensions`` floats."""
+    """Records every ``create`` call and returns vectors of ``dimensions`` floats.
 
-    def __init__(self, *, dimensions: int = 1536, exc: Exception | None = None) -> None:
+    Defaults to the column's own width so the fake follows ``EMBEDDING_DIMENSIONS``
+    instead of pinning a number these tests would have to chase on every change.
+    """
+
+    def __init__(
+        self, *, dimensions: int = EMBEDDING_DIMENSIONS, exc: Exception | None = None
+    ) -> None:
         self.dimensions = dimensions
         self.exc = exc
         self.batches: list[list[str]] = []
@@ -58,9 +65,10 @@ def test_no_texts_makes_no_call() -> None:
 
 
 def test_wrong_width_is_rejected_before_it_reaches_the_column() -> None:
-    # nomic-embed-text is 768; the pgvector column is a fixed 1536.
-    fake = _FakeEmbeddings(dimensions=768)
-    with pytest.raises(EmbedError, match="768"):
+    # Any width but the column's is refused, whatever the column's happens to be.
+    other = EMBEDDING_DIMENSIONS + 1
+    fake = _FakeEmbeddings(dimensions=other)
+    with pytest.raises(EmbedError, match=str(other)):
         _embedder(fake).embed(["a"])
 
 

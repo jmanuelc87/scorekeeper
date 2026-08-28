@@ -45,11 +45,14 @@ from scorekeeper.core.retrieved_context import Chunk, RetrievedDocument
 # JSONB on PostgreSQL, plain JSON on the SQLite fallback.
 JsonColumn = JSON().with_variant(JSONB, "postgresql")
 
-# Width of a stored embedding, fixed by the default embedder: ``openai_embedding_model``
-# is ``text-embedding-3-small`` (1536 dimensions). Fixed rather than free because pgvector
-# can only index a column of known width, so an embedder of a different width cannot
-# populate the table.
-EMBEDDING_DIMENSIONS = 1536
+# Width of a stored embedding. 768 is nomic-embed-text, the model an OpenAI-compatible
+# local server (LM Studio, reached through ``openai_base_url``) serves. Fixed rather than
+# free because pgvector can only index a column of known width — so this and
+# ``openai_embedding_model`` must agree: an embedder of another width (OpenAI's
+# ``text-embedding-3-small`` is 1536) cannot populate the table, and
+# ``retrieval.embed.OpenAIEmbedder`` rejects its vectors before the INSERT.
+# Changing it takes a migration *and* a re-embed; the stored vectors cannot be cast.
+EMBEDDING_DIMENSIONS = 768
 
 # A real ``vector`` on PostgreSQL; JSON on the SQLite fallback, which has no such type.
 # Same escape hatch as ``JsonColumn``, and it is what keeps ``Base.metadata.create_all``
@@ -432,6 +435,12 @@ class MetricScore(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+    # Every LLM call the judge made to produce this score, in the order they ran.
+    judge_calls: Mapped[list[JudgeCall]] = relationship(
+        back_populates="metric_score",
+        cascade="all, delete-orphan",
+        order_by="JudgeCall.sequence",
+    )
 
 
 class MetricTrace(Base):
@@ -453,6 +462,39 @@ class MetricTrace(Base):
     steps: Mapped[list[Any] | None] = mapped_column(JsonColumn, default=None)
 
     metric_score: Mapped[MetricScore] = relationship(back_populates="trace")
+
+
+class JudgeCall(Base):
+    """One LLM call a judge made while producing a ``MetricScore``.
+
+    A metric can issue many calls for a single score (one per claim, per document,
+    per generated question), so this is the only place the exact text sent to the
+    model survives: the judge renders it and would otherwise discard it. ``sequence``
+    orders the calls within their score, starting at 0.
+    """
+
+    __tablename__ = "judge_calls"
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=uuid.uuid4)
+    metric_score_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("metric_scores.id", ondelete="CASCADE"), index=True
+    )
+    sequence: Mapped[int] = mapped_column(Integer)
+    # The JudgeStep the call was labelled with ("extract"/"verify"/"score"), when known.
+    step: Mapped[str | None] = mapped_column(String(16), default=None)
+    # The model that really ran, after the judge resolved the step's override.
+    model: Mapped[str] = mapped_column(String(128))
+    system_prompt: Mapped[str] = mapped_column(Text)
+    prompt: Mapped[str] = mapped_column(Text)
+    latency_ms: Mapped[int] = mapped_column(Integer)
+    input_tokens: Mapped[int] = mapped_column(Integer, server_default="0", default=0)
+    output_tokens: Mapped[int] = mapped_column(Integer, server_default="0", default=0)
+
+    metric_score: Mapped[MetricScore] = relationship(back_populates="judge_calls")
+
+    __table_args__ = (
+        UniqueConstraint("metric_score_id", "sequence", name="uq_judge_call_sequence"),
+    )
 
 
 class TurnTokenUsage(Base):

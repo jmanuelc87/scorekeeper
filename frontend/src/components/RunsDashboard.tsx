@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useState } from "react";
 import type { Granularity, MetricScore, Run, RunsQueryParams, ScenarioPlatformExecution, ScenarioResult, Turn } from "../types";
-import { fetchRuns, startRun, resumeRun } from "../api";
+import { fetchRuns, startRun, resumeRun, rerunRun } from "../api";
 import { StatusBadge } from "./StatusBadge";
 import { ProgressBar } from "./ProgressBar";
 import { PlatformScoreList } from "./PlatformScoreList";
@@ -123,6 +123,8 @@ function RunCard({
   const [showDetail, setShowDetail] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [resumeError, setResumeError] = useState("");
+  const [rerunning, setRerunning] = useState(false);
+  const [rerunError, setRerunError] = useState("");
 
   // A run with several scenarios earns the width to show them side by side. The span
   // is clamped to the grid's own column count, so a narrow viewport still gets one.
@@ -158,6 +160,29 @@ function RunCard({
     }
   };
 
+  const handleRerun = async () => {
+    // Destructive and paid for: the existing scores are dropped and every selected
+    // turn goes back to the judge.
+    if (
+      !window.confirm(
+        "Re-run this evaluation? Its current scores are discarded and every " +
+          "selected turn is judged again under the active prompts."
+      )
+    ) {
+      return;
+    }
+    setRerunning(true);
+    setRerunError("");
+    try {
+      await rerunRun(run.run_id);
+      onStarted();
+    } catch (caught) {
+      setRerunError(caught instanceof Error ? caught.message : "Failed to re-run");
+    } finally {
+      setRerunning(false);
+    }
+  };
+
   return (
     <>
       <article className="run-card" style={{ gridColumn: `span ${columns}` }}>
@@ -188,6 +213,17 @@ function RunCard({
                 {resuming ? "…" : "↻"}
               </button>
             )}
+            {run.status === "completado" && (
+              <button
+                className="btn-rerun"
+                onClick={() => void handleRerun()}
+                disabled={rerunning}
+                aria-label="Re-run evaluation"
+                title="Re-run evaluation (discards current scores)"
+              >
+                {rerunning ? "…" : "⟳"}
+              </button>
+            )}
             <button
               className="btn-detail"
               onClick={() => setShowDetail(true)}
@@ -202,6 +238,7 @@ function RunCard({
 
         {startError && <p className="inline-error">{startError}</p>}
         {resumeError && <p className="inline-error">{resumeError}</p>}
+        {rerunError && <p className="inline-error">{rerunError}</p>}
 
         <div className="run-card-meta">
           <time dateTime={run.created_at}>

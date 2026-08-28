@@ -2,8 +2,8 @@
  * Evaluations page: the full-width table of every run submitted from this browser.
  *
  * Like the popup it owns no network work — it asks the service worker for the run
- * history and to re-poll a run, and re-renders whenever the worker writes new
- * state to storage, so the table stays live even while scoring continues.
+ * history and to re-read a run, and re-renders whenever the worker writes new
+ * state to storage, so a refresh from anywhere reaches the table.
  */
 
 import {
@@ -27,7 +27,7 @@ ui.options.addEventListener("click", (event) => {
   chrome.runtime.openOptionsPage();
 });
 
-// One "Actualizar" per row; re-poll just that run.
+// One "Actualizar" per row; re-read just that run.
 ui.body.addEventListener("click", (event) => {
   const button = event.target.closest(".row-refresh");
   if (!button) return;
@@ -37,7 +37,7 @@ ui.body.addEventListener("click", (event) => {
     .catch(() => {});
 });
 
-// The worker keeps polling with this page in the background; mirror those writes.
+// A capture or a refresh elsewhere writes the history; mirror those writes.
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area === "local" && changes[RUNS_KEY]) render(changes[RUNS_KEY].newValue);
 });

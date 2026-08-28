@@ -5,16 +5,19 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from scorekeeper.db.models import (
     BenchmarkRun,
+    JudgeCall,
     MetricScore,
+    MetricTrace,
     PlatformExecution,
     ScenarioResult,
     Turn,
+    TurnTokenUsage,
 )
 
 
@@ -41,7 +44,7 @@ def run_tree_options(*, metric_scores: bool = True, retrieval: bool = True):
     if retrieval:
         # Documents only, not their chunks: the chunk text is read by
         # ``db.repositories.embeddings``, which ranks and limits it in SQL. Loading the
-        # relationship here would drag every 1536-float vector of the run into memory.
+        # relationship here would drag every stored vector of the run into memory.
         turn_opts.append(selectinload(Turn.retrieved_documents))
     return selectinload(BenchmarkRun.scenario_results).options(
         selectinload(ScenarioResult.use_case),
@@ -158,3 +161,52 @@ async def list_runs(
     if end is not None:
         stmt = stmt.where(PlatformExecution.finished_at <= end)
     return list((await session.execute(stmt)).scalars().unique().all())
+
+
+async def clear_scores(session: AsyncSession, run_key: uuid.UUID) -> None:
+    """Wipe every score of ``run_key`` and reset its tree back to unscored.
+
+    What a re-run needs and a resume must never do: the chain skips a turn that already
+    has a ``turn_score``, so scoring a finished run again means dropping the scores
+    first. Turn selection, retrieved documents and their embeddings are left alone — the
+    re-run scores the same turns over the same context, only under freshly pinned
+    prompts.
+
+    Statement-level deletes rather than walking the ORM tree: ``MetricScore`` cascades
+    delete-orphan into rows this run's loaders don't carry (``judge_calls``), which the
+    unit of work would resolve with a lazy load at flush time — a ``MissingGreenlet``
+    under an ``AsyncSession``. The children are deleted explicitly for the same reason
+    the FKs declare ``ondelete``: SQLite does not enforce it without the pragma.
+
+    ``attempts`` is reset too, so a turn abandoned after ``MAX_TURN_ATTEMPTS`` gets a
+    fresh budget — a re-run is a new evaluation, not a continuation. Does not commit,
+    but *does* expire the session: statement-level writes bypass the identity map, so a
+    caller threading one session through clear → score (the sync path, and every test)
+    would otherwise keep reading the scores this just deleted and skip every turn.
+    """
+    turn_ids = (
+        select(Turn.id)
+        .join(PlatformExecution, PlatformExecution.id == Turn.platform_execution_id)
+        .join(ScenarioResult, ScenarioResult.id == PlatformExecution.scenario_result_id)
+        .where(ScenarioResult.run_id == run_key)
+    )
+    score_ids = select(MetricScore.id).where(MetricScore.turn_id.in_(turn_ids))
+    for stmt in (
+        delete(JudgeCall).where(JudgeCall.metric_score_id.in_(score_ids)),
+        delete(MetricTrace).where(MetricTrace.metric_score_id.in_(score_ids)),
+        delete(MetricScore).where(MetricScore.turn_id.in_(turn_ids)),
+        delete(TurnTokenUsage).where(TurnTokenUsage.turn_id.in_(turn_ids)),
+        update(Turn).where(Turn.id.in_(turn_ids)).values(turn_score=None, attempts=0),
+        update(PlatformExecution)
+        .where(
+            PlatformExecution.scenario_result_id.in_(
+                select(ScenarioResult.id).where(ScenarioResult.run_id == run_key)
+            )
+        )
+        .values(status="pending", started_at=None, finished_at=None, average_score=None),
+        update(ScenarioResult)
+        .where(ScenarioResult.run_id == run_key)
+        .values(status="pending"),
+    ):
+        await session.execute(stmt.execution_options(synchronize_session=False))
+    session.expire_all()

@@ -75,8 +75,8 @@ open — the popup states why instead, and **Enviar a Scorekeeper** stays disabl
 The popup keeps a local history of the runs submitted from this browser. Its
 **Última evaluación** panel shows the run for the open chat only — matched on the
 chat URL (ignoring `?query` and `#hash`) — and its **Evaluaciones** link opens a
-full-page tab listing every run with its live status and a per-row refresh button.
-The worker keeps polling every non-terminal run even with both closed, and the
+full-page tab listing every run with its status and a per-row refresh button.
+A run's status advances only when you press **Actualizar**; the
 toolbar badge tracks the newest one (`…` running, `✓` done, `!` partial/failed);
 once everything has finished successfully the `✓` clears itself after a few
 minutes, while a `!` stays until the next capture. Everything else — per-metric
@@ -112,7 +112,7 @@ flowchart TD
     worker -- executeScript --> capture
     capture -- "{messages, url}" --> worker
     worker -- "POST {apiUrl}/api/v1/captures → run_id" --> api
-    worker -- "GET {apiUrl}/api/v1/evaluations/{id}<br/>(per open run, alarm 30s)" --> api
+    worker -- "GET {apiUrl}/api/v1/evaluations/{id}<br/>(on demand, per refresh)" --> api
     worker -- writes run history --> store
     store -- storage.onChanged --> popup
     store -- storage.onChanged --> evals
@@ -122,7 +122,7 @@ The service worker owns every network call. The popup is destroyed as soon as it
 loses focus, so it could not finish an upload it started; delegating also means a
 worker request to a host in `host_permissions` skips CORS, so no extra
 `CORS_ORIGINS` entry is needed for a locally-run API. Both UI surfaces are pure
-readers: they ask the worker to submit or re-poll and re-render off
+readers: they ask the worker to submit or refresh and re-render off
 `storage.onChanged`, so neither owns state that dies when it closes.
 
 `capture.js` is injected on demand rather than declared in the manifest — the
@@ -181,15 +181,14 @@ rendering bug.
 
 The helpers that own this shape live in `src/config.js` (`getRuns`, `getRun`,
 `upsertRun`, `runCaptures`, `runScenarioIds`, `captureLabels`, `newestRun` — which
-picks the most recently updated entry, since a poll cycle re-prepends the list and
+picks the most recently updated entry, since every write re-prepends the list and
 leaves `runs[0]` meaning nothing); a pre-history single `lastRun` key is folded into the
 list once on first read, and `runCaptures` reads an entry written before `captures`
 existed back as a single-capture list, so upgrading loses nothing.
 
-The worker polls **every** non-terminal run on the 30s alarm and clears the alarm
-only once all of them are terminal (`completado`, `parcial`, `fallido`), so
-several captures scored at once all keep advancing. A `refresh` message re-polls
-one run on demand — behind the popup panel's button and each table row.
+There is no background polling: a `refresh` message re-reads exactly one run — behind
+the popup panel's button and each table row — and skips a run already terminal
+(`completado`, `parcial`, `fallido`), since its status cannot change again.
 
 The badge reflects the newest run. When all runs are terminal and the newest
 succeeded, a second alarm (`CLEAR_BADGE_ALARM`, `CLEAR_BADGE_MINUTES`) wipes the
@@ -303,7 +302,7 @@ feedback footer, because none of them are inside it.
 | Path | Role |
 |---|---|
 | `manifest.json` | MV3 manifest: permissions, popup, options, worker. |
-| `src/background.js` | Service worker — injection, `POST /api/v1/captures`, polls every open run, badge. |
+| `src/background.js` | Service worker — injection, `POST /api/v1/captures`, on-demand run refresh, badge. |
 | `src/config.js` | Shared defaults, run-history + `chrome.storage.local` helpers, chat-URL match, permission request. |
 | `src/content/capture.js` | Per-platform adapters; the only DOM-coupled file. |
 | `src/popup/` | Capture form and the open chat's evaluation panel. |
@@ -331,8 +330,9 @@ feedback footer, because none of them are inside it.
 
 An adapter may declare a `citations` block. What it matches becomes the message's
 `retrieved_context`: a JSON array of `{name, url}` records, one element per unique
-source (`name` omitted when the source has no title). The backend stores that JSON
-in the column and `split_context_docs` renders one retrieved document per element.
+source (`name` omitted when the source has no title, and truncated to 100 characters
+— ellipsis included — when the chip spells out a long one). The backend stores that
+JSON in the column and `split_context_docs` renders one retrieved document per element.
 
 ```json
 [

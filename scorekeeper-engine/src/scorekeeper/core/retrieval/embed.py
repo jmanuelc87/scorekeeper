@@ -7,10 +7,11 @@ judging work, and it must keep running whatever judge provider a run is configur
 lazy-import shape mirrors ``core.retrieval.parser``, the pipeline's other direct SDK
 consumer; the ``max_retries=0`` and explicit timeout mirror the judge's client.
 
-Vectors are stored in a fixed-width pgvector column (``db.models.EMBEDDING_DIMENSIONS``
-= 1536), so a model of another width cannot be persisted — this is checked here and
-raised as :class:`EmbedError` rather than left to fail deep in an INSERT. That is also
-what rules out ``lmstudio_embedding_model`` (nomic-embed-text, 768).
+Vectors are stored in a fixed-width pgvector column (``db.models.EMBEDDING_DIMENSIONS``),
+so a model of another width cannot be persisted — this is checked here and raised as
+:class:`EmbedError` rather than left to fail deep in an INSERT. Keep
+``openai_embedding_model`` and that constant in agreement: at 768 the column takes
+nomic-embed-text and rejects OpenAI's 1536-wide ``text-embedding-3-small``.
 """
 
 from __future__ import annotations
