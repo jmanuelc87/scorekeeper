@@ -123,8 +123,8 @@ def test_ragas_low_confidence_escalates_to_audit(make_judge) -> None:
 
 
 def test_ragas_reports_the_model_the_judge_actually_ran(make_judge) -> None:
-    # A judge that remaps every pinned id to one model (LM Studio serves a single
-    # local model): the pins must not leak into the calls, the trace, or judge_model.
+    # A judge that remaps every pinned id to a single model: the pins must not leak
+    # into the calls, the trace, or judge_model.
     turn = TurnView(
         prompt="¿Cómo reinicio el router?",
         response="El router se reinicia en 10s.",

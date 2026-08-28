@@ -8,6 +8,7 @@ passthrough, ``structured()`` return type, and factory selection/errors.
 
 from __future__ import annotations
 
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -18,8 +19,8 @@ from scorekeeper.core.metrics.base import TurnView
 from scorekeeper.core.metrics.judge import JudgeStep, JudgeVerdict
 from scorekeeper.core.metrics import judges as judges_pkg
 from scorekeeper.core.metrics.judges import (
+    AgentJudge,
     AnthropicJudge,
-    LMStudioJudge,
     OpenAIJudge,
     make_judge,
 )
@@ -159,6 +160,54 @@ class FakeEmbeddings:
         if self._usage is not None:
             attrs["usage"] = self._usage
         return type("Response", (), attrs)()
+
+
+class FakeAgentSdk:
+    """Stands in for the ``claude_agent_sdk`` module the agent judge drives.
+
+    The judge uses exactly two names from it — ``ClaudeAgentOptions`` (a plain option
+    bag) and ``query`` (an async iterator of messages ending in a result message) — so
+    these tests run without the SDK installed. ``structured_output`` is what the judge
+    duck-types the result message on; the leading text message stands in for the
+    assistant chatter the CLI streams before it.
+    """
+
+    def __init__(
+        self,
+        structured_output: object,
+        *,
+        usage: dict | None = None,
+        is_error: bool = False,
+        api_error_status: int | None = None,
+        errors: list[str] | None = None,
+        raises: Exception | list[Exception | None] | None = None,
+    ) -> None:
+        self._structured_output = structured_output
+        self._usage = usage
+        self._is_error = is_error
+        self._api_error_status = api_error_status
+        self._errors = errors
+        self._failures = _FailureScript(raises)
+        self.calls: list[dict] = []
+
+    def ClaudeAgentOptions(self, **kwargs):  # noqa: N802 — mirrors the SDK's class name
+        return SimpleNamespace(**kwargs)
+
+    def query(self, **kwargs):
+        self.calls.append(kwargs)
+        self._failures.check()
+        return self._messages()
+
+    async def _messages(self):
+        yield SimpleNamespace(content="pensando…")  # not the result message
+        yield SimpleNamespace(
+            structured_output=self._structured_output,
+            is_error=self._is_error,
+            api_error_status=self._api_error_status,
+            errors=self._errors,
+            subtype="error_during_execution" if self._is_error else "success",
+            usage=self._usage,
+        )
 
 
 class FakeChat:
@@ -487,6 +536,27 @@ def test_openai_embed_returns_vectors_in_order() -> None:
     assert call["input"] == ["a", "b"]
 
 
+def test_openai_judge_forwards_base_url_to_the_sdk_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The lazily-built client targets ``base_url`` (None → the SDK default)."""
+    built: list[dict] = []
+
+    def fake_openai(**kwargs) -> object:
+        built.append(kwargs)
+        return object()
+
+    monkeypatch.setitem(
+        sys.modules, "openai", SimpleNamespace(OpenAI=fake_openai)
+    )
+
+    OpenAIJudge(model="gpt-5.6-sol", api_key="sk-o")
+    assert built[-1]["base_url"] is None
+
+    OpenAIJudge(model="gpt-5.6-sol", api_key="sk-o", base_url="http://localhost:1234/v1")
+    assert built[-1]["base_url"] == "http://localhost:1234/v1"
+
+
 def test_openai_embed_empty_skips_call() -> None:
     client = FakeOpenAIClient(None, embeddings=[[1.0]])
     judge = OpenAIJudge(model="gpt-5.6-sol", client=client)
@@ -595,6 +665,170 @@ def test_openai_embed_model_override_validates(turn: TurnView) -> None:
         judge.embed(texts=["a"], model="gpt-5.6-sol")
 
 
+# --- Claude Agent judge -------------------------------------------------------
+
+
+def test_agent_score_returns_verdict_and_clamps(turn: TurnView) -> None:
+    # The CLI returns structured output as a plain dict; the judge validates it against
+    # the schema and clamps the score into the scale.
+    client = FakeAgentSdk({"score": 9.0, "justification": "Muy claro"})
+    judge = AgentJudge(model="claude-opus-4-8", client=client)
+
+    verdict = judge.score(rubric="Evalúa la claridad", turn=turn, scale=Likert())
+
+    assert verdict == JudgeVerdict(
+        score=5.0, justification="Muy claro", model="claude-opus-4-8"
+    )
+
+
+def test_agent_query_is_tool_free_single_turn_with_a_json_schema(turn: TurnView) -> None:
+    # The agent judge evaluates a rubric, it does not act: no tools, one turn, and the
+    # answer is pinned to the score schema. Adaptive thinking follows the model.
+    client = FakeAgentSdk({"score": 1.0, "justification": "ok"})
+    judge = AgentJudge(model="claude-opus-4-8", client=client, system_prompt="Juez.")
+
+    judge.score(rubric="Evalúa", turn=turn, scale=Unit())
+
+    options = client.calls[0]["options"]
+    assert options.tools == []
+    assert options.max_turns == 1
+    assert options.model == "claude-opus-4-8"
+    assert options.system_prompt == "Juez."
+    assert options.thinking == {"type": "adaptive"}
+    assert options.output_format == {
+        "type": "json_schema",
+        "schema": _ScoreResponse.model_json_schema(),
+    }
+    assert "Evalúa" in client.calls[0]["prompt"]
+
+
+def test_agent_forwards_the_oauth_token_to_the_cli(turn: TurnView) -> None:
+    # In Docker there is no Claude Code session to borrow, so the token is what
+    # authenticates the CLI subprocess the judge spawns.
+    client = FakeAgentSdk({"score": 1.0, "justification": "ok"})
+    judge = AgentJudge(model="claude-opus-4-8", client=client, oauth_token="sk-ant-oat-x")
+
+    judge.score(rubric="Evalúa", turn=turn, scale=Unit())
+
+    assert client.calls[0]["options"].env == {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat-x"}
+
+
+def test_agent_without_a_token_leaves_the_cli_environment_alone(turn: TurnView) -> None:
+    # No token configured → nothing is injected, so a local run keeps using whatever
+    # credentials the inherited environment already carries.
+    client = FakeAgentSdk({"score": 1.0, "justification": "ok"})
+    judge = AgentJudge(model="claude-opus-4-8", client=client)
+
+    judge.score(rubric="Evalúa", turn=turn, scale=Unit())
+
+    assert client.calls[0]["options"].env == {}
+
+
+def test_agent_omits_thinking_for_models_without_adaptive_support(turn: TurnView) -> None:
+    # Haiku rejects adaptive thinking, so the option is left off entirely.
+    client = FakeAgentSdk({"score": 1.0, "justification": "ok"})
+    judge = AgentJudge(model="claude-haiku-4-5-20251001", client=client)
+
+    judge.score(rubric="Evalúa", turn=turn, scale=Boolean())
+
+    assert not hasattr(client.calls[0]["options"], "thinking")
+
+
+def test_agent_structured_returns_schema(turn: TurnView) -> None:
+    client = FakeAgentSdk({"claims": ["a", "b"], "summary": "resumen"})
+    judge = AgentJudge(model="claude-opus-4-8", client=client)
+
+    result = judge.structured(instruction="Extrae", turn=turn, schema=Claims)
+
+    assert isinstance(result, Claims)
+    assert result.claims == ["a", "b"]
+    assert client.calls[0]["options"].output_format["schema"] == Claims.model_json_schema()
+
+
+def test_agent_records_usage_from_the_result_message(turn: TurnView) -> None:
+    # The SDK reports usage as a plain dict, with the prompt-cached input split out of
+    # input_tokens: the cache counters must be added back or the call reads as ~free.
+    client = FakeAgentSdk(
+        {"score": 3.0, "justification": "ok"},
+        usage={
+            "input_tokens": 2,
+            "cache_creation_input_tokens": 10,
+            "cache_read_input_tokens": 2,
+            "output_tokens": 6,
+        },
+    )
+    judge = AgentJudge(model="claude-opus-4-8", client=client)
+    acc = UsageAccumulator()
+    with collect_usage(acc):
+        judge.score(rubric="r", turn=turn, scale=Likert())
+
+    snap = acc.snapshot()
+    assert (snap.input_tokens, snap.output_tokens) == (14, 6)
+
+
+def test_agent_rejects_foreign_model(turn: TurnView) -> None:
+    judge = AgentJudge(model="claude-opus-4-8", client=FakeAgentSdk(None))
+    with pytest.raises(ValueError, match="no pertenece al proveedor"):
+        judge.score(rubric="r", turn=turn, scale=Likert(), model="gpt-4o")
+
+
+def test_agent_missing_structured_output_raises_descriptive_error(turn: TurnView) -> None:
+    # The query succeeded but produced nothing matching the schema.
+    judge = AgentJudge(model="claude-opus-4-8", client=FakeAgentSdk(None))
+
+    with pytest.raises(JudgeError) as exc_info:
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+    message = str(exc_info.value)
+    assert "Claude Agent" in message
+    assert "claude-opus-4-8" in message
+    assert "puntuación" in message
+
+
+def test_agent_throttled_result_is_retried_then_succeeds(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    # The CLI reports a throttled call as an error *result message*, not by raising, so
+    # the judge has to turn it back into a retryable failure for judge_call.
+    set_policy(max_attempts=3)
+    client = FakeAgentSdk(
+        None, is_error=True, api_error_status=429, errors=["rate limit"]
+    )
+    judge = AgentJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError, match="rate limit"):
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert len(client.calls) == 3  # retried until the budget ran out
+    assert backoff_waits == [1.0, 2.0]
+
+
+def test_agent_error_without_a_status_is_not_retried(
+    turn: TurnView, backoff_waits: list[float], set_policy
+) -> None:
+    # A CLI failure with no API status is permanent: reporting it once beats sleeping.
+    set_policy(max_attempts=3)
+    client = FakeAgentSdk(None, is_error=True, errors=["sesión no autenticada"])
+    judge = AgentJudge(model="claude-opus-4-8", client=client)
+
+    with pytest.raises(JudgeError, match="sesión no autenticada"):
+        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
+
+    assert len(client.calls) == 1
+    assert backoff_waits == []
+
+
+def test_agent_embed_delegates_to_embedder_and_raises_without_one() -> None:
+    embedder = OpenAIJudge(
+        model="gpt-5.6-sol", client=FakeOpenAIClient(None, embeddings=[[1.0, 0.0]])
+    )
+    judge = AgentJudge(model="claude-opus-4-8", client=FakeAgentSdk(None), embedder=embedder)
+    assert judge.embed(texts=["a"]) == [[1.0, 0.0]]
+
+    bare = AgentJudge(model="claude-opus-4-8", client=FakeAgentSdk(None))
+    with pytest.raises(NotImplementedError, match="embeddings"):
+        bare.embed(texts=["a"])
+
+
 # --- Descriptive errors -------------------------------------------------------
 
 
@@ -619,19 +853,6 @@ def test_openai_refusal_surfaces_refusal_text(turn: TurnView) -> None:
 
     with pytest.raises(JudgeError, match="No puedo ayudar con eso."):
         judge.score(rubric="verifica", turn=turn, scale=Boolean())
-
-
-def test_lmstudio_errors_name_its_own_provider(turn: TurnView) -> None:
-    # LMStudioJudge inherits OpenAIJudge's call methods; its descriptive errors must
-    # report "LM Studio", not the inherited "OpenAI", so the failing backend is clear.
-    client = FakeOpenAIClient(None)
-    judge = LMStudioJudge(model="local-model", client=client)
-
-    with pytest.raises(JudgeError) as exc_info:
-        judge.score(rubric="Evalúa", turn=turn, scale=Likert())
-    message = str(exc_info.value)
-    assert "LM Studio" in message
-    assert "OpenAI" not in message
 
 
 def test_anthropic_sdk_error_is_wrapped_with_call_context(turn: TurnView) -> None:
@@ -694,7 +915,7 @@ def test_make_judge_anthropic_wires_embedder_when_openai_key_present(
 
     class DummyOpenAI:
         def __init__(self, **kwargs) -> None:
-            pass  # stands in for the embedder backend
+            self.kwargs = kwargs  # stands in for the embedder backend
 
     monkeypatch.setattr(judges_pkg, "AnthropicJudge", DummyAnthropic)
     monkeypatch.setattr(judges_pkg, "OpenAIJudge", DummyOpenAI)
@@ -707,10 +928,66 @@ def test_make_judge_anthropic_wires_embedder_when_openai_key_present(
     built.clear()
     make_judge(
         Settings(
-            judge_provider="anthropic", anthropic_api_key="sk-a", openai_api_key="sk-o"
+            judge_provider="anthropic",
+            anthropic_api_key="sk-a",
+            openai_api_key="sk-o",
+            openai_base_url="http://localhost:1234/v1",
         )
     )
     assert isinstance(built["embedder"], DummyOpenAI)
+    assert built["embedder"].kwargs["base_url"] == "http://localhost:1234/v1"
+
+
+def test_make_judge_agent_needs_no_key_and_wires_an_embedder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    built: dict = {}
+
+    class DummyAgent:
+        def __init__(self, **kwargs) -> None:
+            built.update(**kwargs)
+
+    class DummyOpenAI:
+        def __init__(self, **kwargs) -> None:
+            self.kwargs = kwargs  # stands in for the embedder backend
+
+    monkeypatch.setattr(judges_pkg, "AgentJudge", DummyAgent)
+    monkeypatch.setattr(judges_pkg, "OpenAIJudge", DummyOpenAI)
+
+    # No API key of any kind: the agent judge authenticates through the Claude Code
+    # session, so the factory must not gate on one — and with no OpenAI key there is
+    # no embeddings backend to attach.
+    make_judge(Settings(judge_provider="agent", agent_judge_model="claude-opus-4-8"))
+    assert built["model"] == "claude-opus-4-8"
+    assert built["embedder"] is None
+    assert built["oauth_token"] is None
+
+    # CLAUDE_CODE_OAUTH_TOKEN reaches the judge, which is what authenticates it where
+    # there is no Claude Code session (Docker). A blank value means "unset".
+    built.clear()
+    make_judge(Settings(judge_provider="agent", claude_code_oauth_token="sk-ant-oat-x"))
+    assert built["oauth_token"] == "sk-ant-oat-x"
+
+    built.clear()
+    make_judge(Settings(judge_provider="agent", claude_code_oauth_token="  "))
+    assert built["oauth_token"] is None
+
+    built.clear()
+    make_judge(Settings(judge_provider="agent", openai_api_key="sk-o"))
+    assert isinstance(built["embedder"], DummyOpenAI)
+    assert built["embedder"].kwargs["base_url"] is None
+
+    # OPENAI_BASE_URL reaches the embedder, so a key-free agent run can embed against a
+    # local OpenAI-compatible server instead of api.openai.com.
+    built.clear()
+    make_judge(
+        Settings(
+            judge_provider="agent",
+            openai_api_key="local",
+            openai_base_url="http://localhost:1234/v1",
+        )
+    )
+    assert built["embedder"].kwargs["base_url"] == "http://localhost:1234/v1"
 
 
 def test_make_judge_missing_key_raises() -> None:
@@ -1001,8 +1278,7 @@ def test_a_single_attempt_disables_retrying(
 def test_openai_score_and_embed_share_the_retry_seam(
     turn: TurnView, backoff_waits: list[float], set_policy
 ) -> None:
-    # Both OpenAI entry points route through judge_call, so both retry (and LMStudioJudge
-    # inherits them unchanged).
+    # Both OpenAI entry points route through judge_call, so both retry.
     set_policy(max_attempts=2)
     client = FakeOpenAIClient(
         _ScoreResponse(score=2.0, justification="ok"),

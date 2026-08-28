@@ -1,4 +1,4 @@
-import type { Metric, MetricTrace, PromptSlot, PromptSlotDetail, PromptVersion, Run, RunsQueryParams, ScenarioTurn, TurnTokenUsage, UseCase } from "./types";
+import type { AuthProvider, AuthProviderInput, Metric, MetricTrace, PromptSlot, PromptSlotDetail, PromptVersion, Run, RunsQueryParams, ScenarioTurn, TurnTokenUsage, UseCase } from "./types";
 
 const API_URL = import.meta.env.VITE_API_URL ?? "http://localhost:8001";
 
@@ -190,6 +190,21 @@ export async function createUseCase(name: string, metrics: string[]): Promise<Us
 }
 
 /**
+ * List every use case with its metric names via GET /api/v1/use-cases.
+ * `default` comes back with an empty `metrics` list — it scores every
+ * registered metric rather than a composed subset.
+ */
+export async function fetchUseCases(): Promise<UseCase[]> {
+  const response = await fetch(`${API_URL}/api/v1/use-cases`);
+
+  if (!response.ok) {
+    throw new Error(`Request failed (${response.status})`);
+  }
+
+  return response.json() as Promise<UseCase[]>;
+}
+
+/**
  * Fetch every prompt slot the registered metrics render via GET /api/v1/prompts.
  * Each entry carries the version currently active, or null when none is published.
  */
@@ -310,4 +325,86 @@ export async function discardPromptVersion(
   }
 
   return response.json() as Promise<PromptVersion>;
+}
+
+/**
+ * List the configured credential providers via GET /api/v1/auth-providers.
+ * The stored certificate private key is never returned — only `has_private_key`.
+ */
+export async function fetchAuthProviders(): Promise<AuthProvider[]> {
+  const response = await fetch(`${API_URL}/api/v1/auth-providers`);
+
+  if (!response.ok) {
+    throw new Error(`Request failed (${response.status})`);
+  }
+
+  return response.json() as Promise<AuthProvider[]>;
+}
+
+/**
+ * Create a credential provider via POST /api/v1/auth-providers.
+ * A 422 names the unknown provider kind or the missing encryption key, so it is
+ * surfaced verbatim.
+ */
+export async function createAuthProvider(body: AuthProviderInput): Promise<AuthProvider> {
+  const response = await fetch(`${API_URL}/api/v1/auth-providers`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+
+  return response.json() as Promise<AuthProvider>;
+}
+
+/**
+ * Partially update a credential provider via PATCH /api/v1/auth-providers/{id}.
+ * Only the keys present in `body` are changed.
+ */
+export async function updateAuthProvider(
+  providerId: string,
+  body: AuthProviderInput
+): Promise<AuthProvider> {
+  const response = await fetch(`${API_URL}/api/v1/auth-providers/${providerId}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+
+  return response.json() as Promise<AuthProvider>;
+}
+
+/** Delete a credential provider via DELETE /api/v1/auth-providers/{id}. */
+export async function deleteAuthProvider(providerId: string): Promise<void> {
+  const response = await fetch(`${API_URL}/api/v1/auth-providers/${providerId}`, {
+    method: "DELETE",
+  });
+
+  if (!response.ok) {
+    throw new Error(await errorMessage(response));
+  }
+}
+
+/**
+ * The API's `detail` for a failed credential-store call, which names the offending
+ * field or the conflicting (provider, host) pair, falling back to the status code.
+ */
+async function errorMessage(response: Response): Promise<string> {
+  const body = (await response.json().catch(() => null)) as { detail?: unknown } | null;
+  const detail = body?.detail;
+  if (typeof detail === "string") {
+    return detail;
+  }
+  if (Array.isArray(detail)) {
+    // FastAPI's own 422 shape: a list of {loc, msg} validation errors.
+    return detail.map((item) => (item as { msg?: string }).msg ?? "Invalid value").join("; ");
+  }
+  return `Request failed (${response.status})`;
 }

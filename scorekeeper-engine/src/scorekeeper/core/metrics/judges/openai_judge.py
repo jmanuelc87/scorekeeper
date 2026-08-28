@@ -56,7 +56,7 @@ class OpenAIJudge:
     """
 
     # Provider name used in error messages. A class attribute so a subclass pointed
-    # at a different backend (e.g. ``LMStudioJudge``) reports its own name instead of
+    # at a different (OpenAI-compatible) backend reports its own name instead of
     # "OpenAI" in the descriptive errors raised by the inherited call methods.
     provider: str = PROVIDER
 
@@ -65,6 +65,7 @@ class OpenAIJudge:
         *,
         model: str = DEFAULT_MODEL,
         api_key: str | None = None,
+        base_url: str | None = None,
         client: Any | None = None,
         system_prompt: str | None = None,
         embedding_model: str = DEFAULT_EMBEDDING_MODEL,
@@ -83,7 +84,11 @@ class OpenAIJudge:
             # max_retries=0: retrying is owned by ``judge_call``, which backs off with
             # jitter and honors Retry-After. Leaving the SDK's own retries on would
             # multiply the two budgets and make the total wait impossible to reason about.
-            client = openai.OpenAI(api_key=api_key, max_retries=0, timeout=timeout)
+            # base_url=None keeps the SDK default (https://api.openai.com/v1); set it to
+            # target an OpenAI-compatible endpoint, e.g. a local embeddings server.
+            client = openai.OpenAI(
+                base_url=base_url, api_key=api_key, max_retries=0, timeout=timeout
+            )
         self._client: Any = client
 
     def _owns(self, model: str) -> bool:

@@ -48,6 +48,7 @@ dev = [
 # are imported lazily and only when a judge builds its own client.
 judges = [
   "anthropic>=0.116,<1",
+  "claude-agent-sdk>=0.2.144",
   "openai>=1.60,<3",
 ]
 # SharePoint client for the retrieval pipeline's certificate-based AuthProvider
