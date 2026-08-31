@@ -32,8 +32,13 @@ npm run package     # dist/scorekeeper-capture.zip — manifest, icons, src, not
 
 There is no bundler and there must not be one: `src/content/capture.js` has to reach
 Chrome as the classic-script IIFE it is (see below), and every other file is an ES
-module the browser loads directly. `npm run package` zips only what ships, so the
-tooling never ends up in the Web Store upload.
+module the browser loads directly. Its one dependency, Turndown, is therefore
+*vendored* rather than imported: the browser builds of `turndown` and
+`turndown-plugin-gfm` are checked in under `src/vendor/` and injected ahead of
+`capture.js`, and the npm packages exist only so those two files can be refreshed
+(`cp node_modules/turndown/dist/turndown.js src/vendor/`). Biome does not lint them.
+`npm run package` zips only what ships, so the tooling never ends up in the Web Store
+upload.
 
 Tests cover `src/config.js` — the module every surface imports — against an in-memory
 `chrome.storage.local` stub. The adapters in `capture.js` are not unit-testable: they
@@ -127,7 +132,10 @@ readers: they ask the worker to submit or refresh and re-render off
 
 `capture.js` is injected on demand rather than declared in the manifest — the
 extension only reads a page while you have its popup open (`activeTab`), and has
-no standing access to any site.
+no standing access to any site. The two `src/vendor/` bundles go in with it, in
+front of it: they define the `TurndownService` and `turndownPluginGfm` globals the
+reader serializes messages with. Both are plain `var` globals, so re-injecting them
+into a frame already read is harmless.
 
 The same frame gets injected repeatedly: once when the popup opens to preview the
 chat, again when you send (the page is re-read so what is scored is the
@@ -226,9 +234,14 @@ When a platform stops capturing:
 3. Add it at the **top** of that role's candidate list in the adapter.
 4. Reload the extension at `chrome://extensions` and re-open the popup.
 
-Message text is read with `innerText` so code blocks and lists keep their line
-breaks; lines that are nothing but interface chrome (`Copiar`, `Retry`, …) are
-dropped by the `UI_NOISE` patterns in the same file.
+Message text is serialized to Markdown with Turndown (plus its GFM plugin, which is
+what handles tables) rather than read with `innerText`: headings, lists, tables,
+fenced code blocks and links reach the judge as markup instead of as flattened
+lines. Turndown reads markup and not layout, so `markHidden` flags everything the
+page is not rendering first — that is what keeps `hideChrome` able to subtract a
+source chip sitting inline in a sentence, and what keeps sr-only labels and
+collapsed menus out of the turn. Lines that are nothing but interface chrome
+(`Copiar`, `Retry`, …) are dropped by the `UI_NOISE` patterns in the same file.
 
 ### Model detection
 

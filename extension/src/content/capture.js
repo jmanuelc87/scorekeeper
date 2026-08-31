@@ -6,6 +6,9 @@
  * user opens the popup on it, under `activeTab`). The value of the last statement
  * is what `executeScript` hands back, so this file ends in a call expression.
  *
+ * The same injection first loads `src/vendor/turndown.js` and its GFM plugin, whose
+ * globals this file serializes messages with — see `createTurndown`.
+ *
  * ## Why everything is inside an IIFE
  *
  * The same frame is injected more than once — once when the popup opens to preview
@@ -566,15 +569,17 @@
   }
 
   /**
-   * The visible text of one message bubble, with interface chrome removed.
+   * The message in one bubble as Markdown, with interface chrome removed.
    *
    * When the adapter declares a `content` selector the text is read from the first
    * match inside the bubble instead: some apps match a role on a wrapper whose text
    * lives one shadow root deeper, where `innerText` on the wrapper reads empty.
    *
-   * `innerText` (not `textContent`) because it respects layout: block elements,
-   * list items and code blocks keep their line breaks, which matters for a judge
-   * reading the response back.
+   * The bubble is serialized with Turndown (see `createTurndown`) rather than read
+   * with `innerText`: these apps render an answer as real markup — headings, lists,
+   * tables, fenced code, links — and `innerText` flattens all of it into lines, so a
+   * judge reading the response back cannot tell a heading from a sentence or a table
+   * from a run of words.
    *
    * The adapter's `chrome` elements are taken out two ways. They are hidden for the
    * duration of the read (see `hideChrome`), which is what removes furniture sitting
@@ -587,16 +592,22 @@
    *
    * `UI_NOISE` is the third filter, matching chrome by its wording rather than its
    * markup — for furniture we can only recognize by what it says.
+   *
+   * `markHidden` runs between the two: Turndown reads markup, not layout, so unlike
+   * `innerText` it would otherwise serialize everything the page keeps out of sight,
+   * the elements `hideChrome` just hid included.
    */
   function readText(bubble, adapter) {
     const node = contentNode(bubble, adapter);
     // Read what the chrome says before hiding it: once hidden it has no `innerText`.
     const chrome = chromeLines(node, adapter);
     const restore = hideChrome(node, adapter);
+    const unmark = markHidden(node);
     let raw;
     try {
-      raw = node.innerText ?? node.textContent ?? "";
+      raw = TURNDOWN.turndown(node);
     } finally {
+      unmark();
       restore();
     }
     return raw
@@ -609,6 +620,80 @@
       .join("\n")
       .replace(/\n{3,}/g, "\n\n")
       .trim();
+  }
+
+  /** Marks an element the page is not rendering, for the length of one read. */
+  const HIDDEN_ATTRIBUTE = "data-scorekeeper-hidden";
+
+  /**
+   * The Markdown serializer, one per injection.
+   *
+   * The bundles it comes from are injected by the service worker just before this
+   * file (see `CAPTURE_FILES` in `background.js`), which is what puts
+   * `TurndownService` and `turndownPluginGfm` on the isolated world. The GFM plugin
+   * is what teaches it tables and strikethrough, neither of which Turndown handles
+   * on its own — and these apps answer with tables constantly.
+   *
+   * Two rules of our own: elements `markHidden` flagged are dropped, and a link is
+   * kept only when its href is something the stored turn can be followed to.
+   */
+  function createTurndown() {
+    const service = new TurndownService({
+      headingStyle: "atx",
+      hr: "---",
+      bulletListMarker: "-",
+      codeBlockStyle: "fenced",
+      emDelimiter: "*",
+    });
+    service.use(turndownPluginGfm.gfm);
+    // Turndown would emit whatever the page put in `href` — a relative path, an
+    // in-page `#anchor`, a `javascript:` handler — none of which means anything once
+    // the turn is a row in the database. `webUrl` keeps the absolute http(s) ones and
+    // the rest degrade to their own text, which is still part of the sentence.
+    service.addRule("webLink", {
+      filter: (node) => node.nodeName === "A" && node.getAttribute("href"),
+      replacement: (content, node) => {
+        if (!content.trim()) return "";
+        const url = webUrl(node.getAttribute("href"));
+        return url ? `[${content}](${url})` : content;
+      },
+    });
+    // Added last on purpose: `addRule` puts a rule *in front* of the ones already
+    // there, so this is the one consulted first and a hidden link never reaches the
+    // rule above. Not `service.remove()`, which loses to the built-in rules — those
+    // are matched before the removal list, so a hidden `<p>` would still be a
+    // paragraph.
+    service.addRule("hidden", {
+      filter: (node) => node.hasAttribute(HIDDEN_ATTRIBUTE),
+      replacement: () => "",
+    });
+    return service;
+  }
+
+  const TURNDOWN = createTurndown();
+
+  /**
+   * Flag every element under `node` the page is not rendering, and return the undo.
+   *
+   * Turndown serializes a *clone* of the subtree, and a clone is outside the document
+   * where `getComputedStyle` has nothing to report — so the question has to be asked
+   * here, on the live nodes, and the answer carried across as an attribute the
+   * serializer's `remove` rule can see. This is what keeps `hideChrome` working and
+   * what stops the sr-only labels, collapsed menus and offscreen scaffolding these
+   * apps are full of from being read as part of the answer.
+   */
+  function markHidden(node) {
+    const marked = [];
+    for (const element of node.querySelectorAll("*")) {
+      const style = getComputedStyle(element);
+      if (element.hidden || style.display === "none" || style.visibility === "hidden") {
+        element.setAttribute(HIDDEN_ATTRIBUTE, "");
+        marked.push(element);
+      }
+    }
+    return () => {
+      for (const element of marked) element.removeAttribute(HIDDEN_ATTRIBUTE);
+    };
   }
 
   /**
@@ -631,13 +716,14 @@
    * Take this adapter's chrome out of the page for the length of one text read, and
    * return the undo.
    *
-   * `innerText` reports what is *rendered*, which is the only lever that reaches
-   * furniture sitting inline in a sentence: a source chip closing a paragraph shares
-   * its line with the prose it cites, so dropping the line would drop the prose.
-   * Taking the element out of layout subtracts exactly its own text instead.
+   * Hiding is the only lever that reaches furniture sitting inline in a sentence: a
+   * source chip closing a paragraph shares its line with the prose it cites, so
+   * dropping the line would drop the prose. Taking the element out of layout — where
+   * `markHidden` then flags it and the serializer drops it — subtracts exactly its
+   * own text instead.
    *
    * The page is left as it was found — capture only ever reads. Nothing is painted
-   * in between (reading `innerText` forces layout, not a repaint) and the undo runs
+   * in between (reading computed styles forces layout, not a repaint) and the undo runs
    * in a `finally`, so a throw mid-read cannot leave a bubble collapsed on screen.
    * `important` because these apps style with utility classes and one may carry
    * `!important`; whatever inline value was there before is put back verbatim,
