@@ -132,6 +132,8 @@ contradice.
 - confidence: tu confianza en ese veredicto, un número entre 0.0 y 1.0 (1.0 = certeza total; \
 usa valores bajos si el contexto es ambiguo o insuficiente).
 - justification: una justificación breve en español.
+Contexto recuperado:
+{context}
 Afirmación: {claim}'''
 
 VERIFY_DEEPEVAL = '''\

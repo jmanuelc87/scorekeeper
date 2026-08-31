@@ -20,8 +20,9 @@ and a deployment whose app booted between the two revisions will already have th
 rows from ``sync_metrics``.
 
 The rubrics are deliberately domain-neutral: the scenario's own context reaches the judge with
-the turn (``judges.base`` appends prompt, response, history and retrieved context to every
-call), so pinning the sector into the rubric text would only duplicate it.
+the turn (``judges.base`` appends prompt, response and history to every call, and each rubric
+interpolates the retrieved context through its own ``{context}`` placeholder), so pinning the
+sector into the rubric text would only duplicate it.
 
 ``downgrade`` removes the prompts and their versions but leaves the ``metrics`` rows: nothing in
 the application deletes a metric, and by then ``use_case_metrics`` and historical
@@ -83,8 +84,9 @@ _prompt_versions = sa.table(
 
 
 # --- Seed data ----------------------------------------------------------------
-# One rubric per metric, spelled out literally. Every template is instruction + scale;
-# it references no placeholder because the judge appends the whole turn after it.
+# One rubric per metric, spelled out literally. Every template is instruction + scale +
+# the retrieved context: the judge appends the turn itself after it, but the context is
+# only injected where a template asks for it with ``{context}``.
 
 RELEVANCIA = '''\
 Evalúa la RELEVANCIA de la respuesta del asistente: el grado en que aborda directamente la \
@@ -96,6 +98,10 @@ Escala 0.0-1.0:
 - 0.50-0.69: La respuesta contiene elementos relevantes mezclados con información menos pertinente
 - 0.30-0.49: La respuesta tiene cierta relevancia pero deja sin responder aspectos clave
 - 0.00-0.29: La respuesta es poco relevante o no aborda la consulta
+
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
 
 Devuelve la puntuación y una justificación breve en español.
 '''
@@ -112,6 +118,10 @@ desactualizada
 - 0.30-0.49: Múltiples errores factuales; información principalmente imprecisa
 - 0.00-0.29: Información fundamentalmente incorrecta o no verificable
 
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
+
 Devuelve la puntuación y una justificación breve en español.
 '''
 
@@ -125,6 +135,10 @@ Escala 0.0-1.0:
 - 0.50-0.69: Cubre aproximadamente la mitad de los aspectos relevantes
 - 0.30-0.49: Cubre solo algunos aspectos; hay grandes vacíos de información
 - 0.00-0.29: Respuesta incompleta que cubre muy poco del tema
+
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
 
 Devuelve la puntuación y una justificación breve en español.
 '''
@@ -140,6 +154,10 @@ Escala 0.0-1.0:
 - 0.30-0.49: Frecuentemente confusa; estructura pobre; lenguaje impreciso
 - 0.00-0.29: Muy confusa, desorganizada, casi imposible de entender
 
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
+
 Devuelve la puntuación y una justificación breve en español.
 '''
 
@@ -153,6 +171,10 @@ Escala 0.0-1.0:
 - 0.50-0.69: Razonamiento aceptable pero con algunas inconsistencias lógicas
 - 0.30-0.49: Razonamiento débil con varias inconsistencias o saltos lógicos
 - 0.00-0.29: Razonamiento falso o lógicamente incoherente
+
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
 
 Devuelve la puntuación y una justificación breve en español.
 '''
@@ -168,6 +190,10 @@ Escala 0.0-1.0:
 - 0.30-0.49: Comprensión limitada del contexto; referencias inadecuadas
 - 0.00-0.29: Ignora o malentiende el contexto completamente
 
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
+
 Devuelve la puntuación y una justificación breve en español.
 '''
 
@@ -181,6 +207,10 @@ Escala 0.0-1.0:
 - 0.50-0.69: Contiene información útil pero con aplicación limitada
 - 0.30-0.49: Poca aplicabilidad práctica; información mayormente teórica
 - 0.00-0.29: No aplicable; no proporciona dirección práctica
+
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
 
 Devuelve la puntuación y una justificación breve en español.
 '''
@@ -197,6 +227,10 @@ apropiado
 - 0.30-0.49: Estructura pobre; información desorganizada o difícil de seguir
 - 0.00-0.29: Estructura muy deficiente; prácticamente sin organización
 
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
+
 Devuelve la puntuación y una justificación breve en español.
 '''
 
@@ -211,6 +245,10 @@ Escala 0.0-1.0:
 - 0.30-0.49: Análisis superficial; mayormente respuestas de nivel básico
 - 0.00-0.29: Análisis mínimo o inexistente; respuesta superficial
 
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
+
 Devuelve la puntuación y una justificación breve en español.
 '''
 
@@ -224,6 +262,10 @@ Escala 0.0-1.0:
 - 0.50-0.69: Coherencia aceptable con algunas inconsistencias menores
 - 0.30-0.49: Varias inconsistencias; el hilo se pierde en algunos puntos
 - 0.00-0.29: Incoherente; numerosas contradicciones entre turnos
+
+Contexto recuperado (puede estar vacío; tómalo en cuenta solo si aporta información \
+relevante para la evaluación):
+{context}
 
 Devuelve la puntuación y una justificación breve en español.
 '''

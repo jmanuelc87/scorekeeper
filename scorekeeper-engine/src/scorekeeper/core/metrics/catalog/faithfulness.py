@@ -30,10 +30,12 @@ first (a judge may remap them), so the calls, the trace, and the reported
 asked for.
 
 Neither metric touches ``retrieved_context`` directly. It is a single Spanish
-text blob on ``TurnView``; the judge layer renders it into every prompt (via the
-``{context}`` placeholder and an appended "Contexto recuperado" section, in both
-cases delimited by ``<contexto></contexto>`` tags), so these metrics stay agnostic
-to context shape and just hand the turn to the judge.
+text blob on ``TurnView``; the judge layer renders it into the prompts that ask
+for it with a ``{context}`` placeholder (``generate_truths`` and the RAGAS
+``verify``), delimited by ``<contexto></contexto>`` tags, so these metrics stay
+agnostic to context shape and just hand the turn to the judge. The DeepEval
+``verify`` deliberately omits the placeholder: it judges the claim against the
+``{truths}`` already extracted from the context.
 All prompts and justification output are Spanish.
 """
 

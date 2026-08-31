@@ -276,9 +276,8 @@ def test_render_prompt_includes_retrieved_context() -> None:
             ]
         ),
     )
-    rendered = render_prompt("Evalúa la fidelidad.", turn)
+    rendered = render_prompt("Evalúa la fidelidad. {context}", turn)
 
-    assert "--- Contexto recuperado ---" in rendered
     # The context is delimited with <contexto> tags so the judge can tell it apart.
     assert "<contexto>\n" in rendered
     assert "\n</contexto>" in rendered
@@ -329,17 +328,32 @@ def test_render_prompt_renders_web_citations_as_readable_docs() -> None:
     )
     rendered = render_prompt("Contexto: {context}", turn)
 
-    assert "--- Contexto recuperado ---" in rendered
     assert "Política" in rendered
     assert "https://a/pol" in rendered
     assert "https://b/x" in rendered
     assert '{"name"' not in rendered  # raw JSON never reaches the judge.
 
 
-def test_render_prompt_omits_context_section_when_absent(turn: TurnView) -> None:
-    # The default fixture has no retrieved_context, so no section is emitted.
+def test_render_prompt_omits_context_when_the_template_does_not_ask_for_it() -> None:
+    # The context reaches the judge only through {context}: a template without it —
+    # hallucination.nli, answer_relevance.generate_question — never sees the blob.
+    turn = TurnView(
+        prompt="¿Cuál es la política de devoluciones?",
+        response="30 días.",
+        retrieved_context=RetrievedContext(
+            documents=[
+                RetrievedDocument(
+                    name="",
+                    document="",
+                    chunks=[Chunk(index=0, text="Devoluciones en 30 días.")],
+                )
+            ]
+        ),
+    )
     rendered = render_prompt("Evalúa (1-5): {prompt}", turn)
-    assert "--- Contexto recuperado ---" not in rendered
+
+    assert "Devoluciones en 30 días." not in rendered
+    assert "<contexto>" not in rendered
 
 
 def test_render_prompt_leaves_context_placeholder_empty_without_context(
