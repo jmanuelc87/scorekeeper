@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useState } from "react";
 import type { JudgeCall, MetricScore, MetricTrace, Run, ScenarioPlatformExecution, ScenarioTurn, TraceEntry, TraceStep, TurnTokenUsage } from "../types";
 import { fetchScenarioTurns, fetchTurnTraces, fetchTurnTokenUsage, updateTurnSelection } from "../api";
 import { StatusBadge } from "./StatusBadge";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
 
 interface RunDetailModalProps {
   run: Run;
@@ -279,11 +281,15 @@ function ScenarioDetail({
           <div className="detail-turn-content">
             <div className="detail-message detail-prompt">
               <span className="detail-role">User</span>
-              <p className="detail-text">{turn.prompt}</p>
+              <div className="detail-text detail-markdown">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.prompt}</ReactMarkdown>
+              </div>
             </div>
             <div className="detail-message detail-response">
               <span className="detail-role">Assistant</span>
-              <p className="detail-text">{turn.response}</p>
+              <div className="detail-text detail-markdown">
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>{turn.response}</ReactMarkdown>
+              </div>
             </div>
             {turn.expected_output && (
               <div className="detail-message detail-expected">

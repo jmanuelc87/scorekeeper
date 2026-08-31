@@ -7,7 +7,14 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "includes": ["src/**/*.js", "tests/**/*.js", "manifest.json", "package.json", "biome.json"]
+    "includes": [
+      "src/**/*.js",
+      "!src/vendor",
+      "tests/**/*.js",
+      "manifest.json",
+      "package.json",
+      "biome.json"
+    ]
   },
   "formatter": {
     "enabled": true,
@@ -25,7 +32,7 @@
     "formatter": {
       "quoteStyle": "double"
     },
-    "globals": ["chrome"]
+    "globals": ["chrome", "TurndownService", "turndownPluginGfm"]
   },
   "assist": {
     "enabled": true,

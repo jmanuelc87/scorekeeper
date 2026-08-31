@@ -195,6 +195,19 @@ button:hover:not(:disabled) { opacity: .85; }
 .detail-context { background: #f3e5f5; }
 .detail-role { display: block; font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--gray); margin-bottom: 4px; }
 .detail-text { margin: 0; font-size: .85rem; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+.detail-markdown { white-space: normal; }
+.detail-markdown > :first-child { margin-top: 0; }
+.detail-markdown > :last-child { margin-bottom: 0; }
+.detail-markdown p, .detail-markdown ul, .detail-markdown ol, .detail-markdown blockquote, .detail-markdown pre { margin: 0 0 8px; }
+.detail-markdown ul, .detail-markdown ol { padding-left: 20px; }
+.detail-markdown h1, .detail-markdown h2, .detail-markdown h3, .detail-markdown h4 { margin: 12px 0 6px; font-size: .9rem; }
+.detail-markdown code { background: rgba(0,0,0,.06); border-radius: 4px; padding: 1px 4px; font-size: .8rem; }
+.detail-markdown pre { background: rgba(0,0,0,.06); border-radius: 6px; padding: 8px 10px; overflow-x: auto; }
+.detail-markdown pre code { background: none; padding: 0; }
+.detail-markdown blockquote { border-left: 3px solid #cfd8e3; padding-left: 10px; color: var(--gray); }
+.detail-markdown table { border-collapse: collapse; font-size: .8rem; }
+.detail-markdown th, .detail-markdown td { border: 1px solid #cfd8e3; padding: 4px 8px; }
+.detail-markdown img { max-width: 100%; }
 .detail-metrics { border-top: 1px dashed #dfe6ee; padding-top: 8px; }
 .detail-metrics-label { font-size: .68rem; font-weight: 700; text-transform: uppercase; letter-spacing: .06em; color: var(--gray); display: block; margin-bottom: 6px; }
 

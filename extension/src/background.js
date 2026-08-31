@@ -21,8 +21,19 @@ import {
   upsertRun,
 } from "./config.js";
 
-/** Injected on demand; deliberately not a declared content script. */
-const CAPTURE_FILE = "src/content/capture.js";
+/**
+ * Injected on demand; deliberately not declared content scripts.
+ *
+ * Order matters: `capture.js` serializes a message with Turndown, which the two
+ * vendored bundles put on the isolated world as `TurndownService` and
+ * `turndownPluginGfm`. Both assign plain `var` globals, so re-injecting them into a
+ * frame the popup already read is harmless.
+ */
+const CAPTURE_FILES = [
+  "src/vendor/turndown.js",
+  "src/vendor/turndown-plugin-gfm.js",
+  "src/content/capture.js",
+];
 
 // Once everything has finished successfully, the green ✓ is wiped after this many
 // minutes so it does not linger forever; a delay (not an instant clear) keeps the
@@ -75,7 +86,7 @@ async function captureTab(tabId) {
   try {
     [injection] = await chrome.scripting.executeScript({
       target: { tabId },
-      files: [CAPTURE_FILE],
+      files: CAPTURE_FILES,
     });
   } catch (error) {
     // Chrome refuses to inject into its own pages and the Web Store.
