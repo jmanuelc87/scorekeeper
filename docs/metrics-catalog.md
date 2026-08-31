@@ -241,9 +241,8 @@ Raw score is already in `[0, 1]` (`Unit()`), **higher is better**.
 
 - **Answer:** `TurnView.response` — the source of the extracted statements.
 - **Retrieved context:** consumed indirectly. The metric never touches
-  `retrieved_context`; the judge layer renders it into every prompt (via the
-  `{context}` placeholder and an appended "Contexto recuperado" section), so the
-  metric stays agnostic to context shape.
+  `retrieved_context`; the judge layer renders it into the `{context}` placeholder
+  the `verify` template declares, so the metric stays agnostic to context shape.
 
 ### Scoring steps
 
@@ -263,9 +262,10 @@ Raw score is already in `[0, 1]` (`Unit()`), **higher is better**.
 
 - `EXTRACT_CLAIMS` turns each sentence of the answer into verifiable, independent
   statements (may reference `{prompt}`/`{response}`).
-- `faithfulness_ragas.verify` asks whether a single `{claim}` can be inferred from the context.
-  It must **not** contain `{prompt}`/`{response}`/`{context}` — the judge appends
-  the full turn (including retrieved context) automatically.
+- `faithfulness_ragas.verify` asks whether a single `{claim}` can be inferred from the
+  `{context}` it interpolates. The judge appends the turn itself (prompt, response,
+  history) automatically; the retrieved context is *not* appended — it reaches the judge
+  only through that `{context}` placeholder.
 
 ### Use cases
 
@@ -326,8 +326,9 @@ rendering.
 - `EXTRACT_CLAIMS` — shared with the RAGAS variant.
 - `faithfulness_deepeval.generate_truths` extracts atomic, verifiable facts from the retrieved context
   (references `{context}`).
-- `faithfulness_deepeval.verify` asks whether the `{truths}` contradict the `{claim}`; it too
-  must not contain the turn placeholders.
+- `faithfulness_deepeval.verify` asks whether the `{truths}` contradict the `{claim}`. It
+  deliberately omits `{context}`: the truths already extracted from it are what the claim is
+  judged against.
 
 ### Use cases
 
@@ -451,8 +452,9 @@ Unlike the `rag`/`seguridad` metrics above, these are `SingleRubricMetric`s: the
 pure declaration (`name`, `category = MetricCategory.CALIDAD`, `scale = Unit()`,
 `weight = 1.0`, one `rubric` prompt slot) and `SingleRubricMetric.evaluate` does the rest.
 They measure the answer as a piece of communication, so — unlike the RAG metrics — none of
-them require retrieved context, an expected output, or any other field beyond the turn
-itself.
+them require an expected output or any other field beyond the turn itself; each rubric does
+interpolate the turn's retrieved context through a `{context}` placeholder, so a grounded
+answer is judged against the sources it was given.
 
 ```
 raw_score      = the judge's 0.0-1.0 verdict, clamped into the scale
@@ -474,9 +476,9 @@ returns back into it, so a model answering `85` or `-3` cannot corrupt a rollup.
 - **No short-circuit.** There is no `NOT_APPLICABLE` path — every turn has a prompt and a
   response, which is all these rubrics need, so all ten always produce a score.
 - **The rubric is the whole prompt.** Each declares exactly one slot, `<metric>.rubric`,
-  with no required variables: the templates interpolate nothing, because `judges.base`
-  appends the full turn — turn number, prior history, retrieved context, prompt and
-  response — beneath every instruction it sends. That is also why
+  with no required variables: the only placeholder the templates interpolate is the judge's
+  own `{context}`, because `judges.base` appends the turn — turn number, prior history,
+  prompt and response — beneath every instruction it sends. That is also why
   `coherencia_multiturno` works without orchestrating anything: the history it judges
   arrives with the turn.
 - **Domain-neutral wording.** The rubrics name no sector. The scenario's own context
@@ -502,7 +504,8 @@ not the migration.
 - **Answer:** `TurnView.response`.
 - **History:** `TurnView.history` — appended by the judge to every call, and what
   `coherencia_multiturno` scores.
-- **Retrieved context:** appended when present, but no rubric requires it.
+- **Retrieved context:** interpolated by each rubric's `{context}` placeholder, and empty
+  when the turn has none.
 
 ### Use cases
 

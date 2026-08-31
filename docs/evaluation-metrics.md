@@ -386,10 +386,21 @@ Two audiences share one template, which is what `required_variables` pins down:
   `prompts.safe_format` — not `str.format`, so a placeholder it does not supply
   survives instead of raising `KeyError` inside the worker,
 - the **judge** then fills `{prompt}`, `{response}` and `{context}` from the turn
-  (`judges/base.py::_fill_placeholders`) and appends the full turn regardless.
+  (`judges/base.py::_fill_placeholders`) and appends the turn itself — number, history,
+  prompt, response — regardless.
 
 So a template may use its required variables plus those three, and nothing else —
 `prompts.validate_template` enforces exactly that.
+
+`{context}` is the exception to "appended regardless": the retrieved context is
+*only* interpolated where a template asks for it. `render_prompt` no longer appends a
+"Contexto recuperado" section, so a prompt that judges an isolated fragment —
+`hallucination.nli`, whose premise is one `{documento}`; `contextual_precision.verdict`,
+which is handed one `{node}`; `answer_relevance.generate_question`, which must see the
+answer alone — is not shown the whole blob behind its back. The slots that do carry
+`{context}` are `faithfulness_ragas.verify`, `faithfulness_deepeval.generate_truths` and
+the ten `calidad` rubrics; `tests/core/metrics/test_migration_prompts.py` holds that
+list.
 
 ## Adding a metric
 

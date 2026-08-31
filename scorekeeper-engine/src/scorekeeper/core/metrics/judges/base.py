@@ -2,7 +2,7 @@
 
 Everything an LLM judge needs *around* the model call — the Spanish system
 prompt, turning a ``Scale`` into a Spanish range instruction, rendering a rubric
-template plus the turn context, and clamping the model's score back into the
+template plus the turn, and clamping the model's score back into the
 scale's range — lives here so it is unit-testable without any LLM SDK and so the
 Anthropic and OpenAI judges stay thin wrappers over their respective clients.
 """
@@ -530,9 +530,15 @@ def render_prompt(instructions: str, turn: TurnView) -> str:
     """Render a rubric/instruction plus a structured Spanish view of the turn.
 
     ``instructions`` is filled with the turn's ``{prompt}``/``{response}``/
-    ``{context}`` (when it references them), then the full turn — number, history,
-    retrieved context, prompt, response — is appended so the model always has
-    complete context even if the rubric does not interpolate every field.
+    ``{context}`` (when it references them), then the turn itself — number, history,
+    prompt, response — is appended so the model always has the exchange even if the
+    rubric does not interpolate every field.
+
+    The retrieved context is **not** appended: it reaches the judge only through a
+    template's own ``{context}`` placeholder, so a prompt that does not ask for it
+    (``hallucination.nli``, which judges one document as its premise, or
+    ``answer_relevance.generate_question``, which must see the answer alone) is not
+    handed the whole blob behind its back.
     """
     parts = [_fill_placeholders(instructions, turn), "", "--- Turno a evaluar ---"]
     parts.append(f"Número de turno: {turn.turn_number}")
@@ -541,9 +547,6 @@ def render_prompt(instructions: str, turn: TurnView) -> str:
         for i, (prompt, response) in enumerate(turn.history, start=1):
             parts.append(f"  [{i}] Usuario: {prompt}")
             parts.append(f"      Asistente: {response}")
-    if not turn.retrieved_context.is_empty:
-        parts.append("--- Contexto recuperado ---")
-        parts.append(_tagged_context(turn))
     parts.append(f"Usuario: {turn.prompt}")
     parts.append(f"Asistente: {turn.response}")
     return "\n".join(parts)

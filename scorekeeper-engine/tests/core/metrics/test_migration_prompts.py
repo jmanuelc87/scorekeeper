@@ -19,10 +19,28 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from scorekeeper.core.metrics import catalog  # noqa: F401  (populate the registry)
-from scorekeeper.core.metrics.prompts import PromptTemplateError, validate_template
+from scorekeeper.core.metrics.prompts import (
+    PromptTemplateError,
+    placeholders,
+    validate_template,
+)
 from scorekeeper.core.metrics.registry import MetricRegistry
 from scorekeeper.db.models import MetricDefinition, Prompt, PromptVersion
 from seeded_prompts import MODULES, SEEDED_PROMPTS, seed_prompts
+
+
+_QUALITY_METRICS = (
+    "relevancia",
+    "precision",
+    "completitud",
+    "claridad",
+    "razonamiento_logico",
+    "contextualizacion",
+    "accionabilidad",
+    "estructura",
+    "profundidad_analitica",
+    "coherencia_multiturno",
+)
 
 
 def _declared_slots():
@@ -162,3 +180,28 @@ async def test_rubric_seed_is_idempotent(session: AsyncSession) -> None:
 
     prompts = (await session.execute(select(func.count()).select_from(Prompt))).scalar_one()
     assert prompts == len(_RUBRICS.SEEDED_PROMPTS)
+
+
+# --- which slots are handed the retrieved context ------------------------------
+# ``judges.base.render_prompt`` no longer appends the retrieved context to every call:
+# it reaches the judge only through a template's own ``{context}``. So which prompts see
+# it is now a property of the seed text, and this is the check on that.
+
+_SLOTS_WITH_CONTEXT = {
+    ("faithfulness_ragas", "verify"),
+    ("faithfulness_deepeval", "generate_truths"),
+    *((name, "rubric") for name in _QUALITY_METRICS),
+}
+
+
+@pytest.mark.parametrize("seed", SEEDED_PROMPTS, ids=lambda s: f"{s['metric']}.{s['slug']}")
+def test_only_the_slots_that_need_context_interpolate_it(seed) -> None:
+    key = (seed["metric"], seed["slug"])
+    uses_context = "context" in placeholders(seed["template"])
+
+    if key in _SLOTS_WITH_CONTEXT:
+        assert uses_context, f"{key} necesita el contexto recuperado y ya no lo recibe."
+    else:
+        # An isolated judgement: the node, the document or the answer alone is the
+        # premise, so handing it the whole context would change what it measures.
+        assert not uses_context, f"{key} no debe recibir el contexto recuperado completo."
