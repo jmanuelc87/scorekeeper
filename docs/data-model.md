@@ -382,7 +382,7 @@ assembled from these rows; a turn with no rows has no retrieved context.
 | `name` | Text | Short label/title for the retrieved item. |
 | `document` | Text | Source document reference (filename, title, id). |
 | `url` | Text | Source URL for retrieved web documents; `NULL` otherwise. |
-| `sentences` | JSONB | The document's text as the extract stage segmented it, `[{page, index, text}, ...]`. The chunker's input. `NULL` on rows retrieved before segmentation existed — those carry no text at all. |
+| `sentences` | JSONB | The document's text as the extract stage segmented it, `[{page, index, text, atomic}, ...]`. The chunker's input. `NULL` on rows retrieved before segmentation existed — those carry no text at all. |
 
 **A document holds no whole-document text.** Its text lives on its chunks
 (`RetrievedDocumentEmbedding`), and groundedness metrics evaluate its *node text* — the

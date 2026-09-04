@@ -49,7 +49,7 @@ is performed inside the `ContentExtractor` (see [Extract](#extract)).
 | locate | `DocumentLocatorResolver` | `SourceRef` → `DocumentLocator` | Derive the document URL (minus fragment), filename, `DocType`, scheme, host, and page/section from a `#page=N` fragment. |
 | authorize | `AuthProvider` | `DocumentLocator` → `AuthDecision` (+ `client`) | Classify the auth requirement, resolve it against available credentials, and expose the generic `AuthClient`. |
 | fetch | `DocumentFetcher` | `DocumentLocator`, `AuthClient \| None` → `FetchedDocument` | Fetch the document bytes through the auth client (gated) or a public GET, cached on disk by `document_url`. |
-| filter + extract | `ContentExtractor` | `FetchedDocument`, `DocumentLocator` → `ExtractedContent` | Convert the document to markdown page by page (titles/lists/tables; images and links dropped) and segment it into page-attributed sentences. |
+| filter + extract | `ContentExtractor` | `FetchedDocument`, `DocumentLocator` → `ExtractedContent` | Convert the document to markdown, selecting the requested page (titles/lists/tables; images and links dropped), and segment it into page-attributed sentences. Two backends: MarkItDown or the `unstructured-api` service. |
 | assemble | `RetrievalReport.to_context` | outcomes → `RetrievedContext` | Collect the successfully-retrieved documents, in rank order; they persist as [`RetrievedDocument`](data-model.md#retrieveddocument) child rows of the turn. |
 | embed | `Embedder` | `Sentence` list → chunk rows | Group the sentences into overlapping chunks and embed each one; see [Embedding](#embedding). A phase of its own, after retrieval and before scoring. |
 
@@ -137,9 +137,23 @@ ranked source references feeding `assemble`.
 
 ## Extract
 
-`MarkdownContentExtractor` (`scorekeeper.core.retrieval.extract`) implements the `ContentExtractor`
-stage: `supports(doc_type)` + `extract(document, locator) → ExtractedContent`, whose `text` is
-**markdown**. It also *is* the filter — page selection happens here, not in a separate stage.
+Two extractors implement the `ContentExtractor` stage — `supports(doc_type)` +
+`extract(document, locator) → ExtractedContent`, whose `text` is **markdown**. The stage also *is*
+the filter: page selection happens here, not in a separate stage. `settings.retrieval_extractor`
+picks one (`default_content_extractor()`), so switching backends is a configuration change rather
+than a revert:
+
+| `retrieval_extractor` | Implementation | Converts with |
+| --- | --- | --- |
+| `markdown` (default) | `MarkdownContentExtractor` | MarkItDown, in-process |
+| `unstructured` | `UnstructuredContentExtractor` | the `unstructured-api` service, over HTTP |
+
+An unrecognised value — or `unstructured` with no `unstructured_api_url` — logs a warning and
+falls back to `markdown`, so a half-configured deployment degrades instead of failing every
+retrieval.
+
+### MarkItDown (`markdown`)
+
 By document type:
 
 - **PDF** → **page by page**. `pypdf` slices each page into a one-page document before
@@ -171,6 +185,49 @@ the page count (it is CPU work, already pushed off the event loop with `asyncio.
 the concatenated markdown is not byte-identical to a single-pass conversion — a table or
 paragraph straddling a page break is split at the boundary.
 
+### unstructured-api (`unstructured`)
+
+`UnstructuredContentExtractor` (`scorekeeper.core.retrieval.extract_unstructured`) POSTs the
+document bytes to the **`unstructured-api` service** (`compose.yaml`) and gets back typed
+*elements* — `Title`, `NarrativeText`, `ListItem`, `Table`, `Header`, … — each carrying
+`metadata.page_number` and, for a table, `metadata.text_as_html`.
+
+**It calls a service, not a library.** The heavy half of that work — the layout model, OCR,
+poppler, tesseract — lives in that image, so the engine gains no dependency beyond the `httpx2` it
+already has, and the `scorekeeper-engine` image does not grow. The call is blocking, which the
+orchestrator already accommodates with `asyncio.to_thread`.
+
+Three things it buys over MarkItDown:
+
+- **Tables survive.** A `Table` element's `text_as_html` is rendered here into a pipe table (with
+  a stdlib `HTMLParser`, so the rendering is deterministic) and emitted as a **single `atomic`
+  sentence**, which the chunker never splits — see [Embedding](#embedding). Under `fast` the
+  service often infers no table structure and `text_as_html` is absent; the element's own
+  flattened text is then used, so the table win is largely a `hi_res` win.
+- **Pages come from the document.** A PDF referenced without `#page=N` is converted in **one**
+  request instead of one per page, and a table straddling a page break is no longer cut at the
+  boundary. With `#page=N` the page is still sliced out with `pypdf` first — posting a 300-page
+  document to keep one page is indefensible, and the slice is what lets `PageNotFoundError` be
+  raised before the service is called. A one-page slice reports itself as page 1, so the requested
+  page number is written back over every element.
+- **Scanned pages become readable.** A page whose text layer comes back empty is re-posted with
+  `strategy="hi_res"`, which runs OCR (`unstructured_ocr_languages`, `spa` by default). Only empty
+  pages are re-posted, so a mostly-digital document with a scanned insert pays one extra request
+  per insert. It is **best-effort in every direction**: past `unstructured_max_ocr_pages` empty
+  pages the escalation is skipped wholesale, and a failed OCR request leaves that page empty
+  rather than failing the document.
+
+Structural furniture — `Header`, `Footer`, `PageNumber`, `Image`, `FigureCaption` — is dropped **by
+category** rather than by regex, so running heads and page numbers stop riding into every chunk.
+Links and bare URLs are still stripped with the shared `strip_markup`, which stays load-bearing:
+the service returns prose, and prose contains bare URLs. One deliberate divergence: MarkItDown
+removes an `<a href=…>` element whole, anchor text included, while here the anchor text arrives as
+ordinary narrative and survives — so the two extractors do not produce identical text for an HTML
+document.
+
+Every service failure — connection, timeout, HTTP status, unparseable body — surfaces as
+`ExtractError`, which the orchestrator records as `FETCH_FAILED` against that one reference.
+
 ### Sentences
 
 Each converted block is then segmented into `Sentence` values — `{page, index, text}` — with
@@ -195,7 +252,12 @@ A phase of its own between retrieval and scoring
 
 - `chunk_sentences` (`scorekeeper.core.retrieval.chunk`) advances by
   `embedding_chunk_sentences - embedding_chunk_overlap` sentences per chunk, so
-  consecutive chunks share `embedding_chunk_overlap` sentences. The overlap is what keeps
+  consecutive chunks share `embedding_chunk_overlap` sentences. A sentence the extract
+  stage marked **`atomic`** — a rendered table — is a hard boundary: it becomes a window of
+  its own and never shares one with a neighbour, because half a grid grounds nothing and the
+  overlap that rescues a straddling claim does not apply to a table. A rendered table longer
+  than `extract_table_max_chars` is split by rows instead, each piece repeating the header,
+  since one chunk is also one embedding input and an oversized one fails the whole batch. The overlap is what keeps
   a claim straddling a chunk boundary readable in at least one chunk. An overlap not
   smaller than the window would never advance, and is rejected. Each window carries **where
   it came from**, not just its text — otherwise grouping would throw away the page the
