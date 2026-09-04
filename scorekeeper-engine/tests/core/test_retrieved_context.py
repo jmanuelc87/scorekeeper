@@ -82,7 +82,7 @@ def test_model_validate_round_trip() -> None:
                 "name": "n",
                 "document": "d",
                 "url": "https://ejemplo.com",
-                "sentences": [{"page": 1, "index": 0, "text": "c"}],
+                "sentences": [{"page": 1, "index": 0, "text": "c", "atomic": False}],
                 "chunks": [{"index": 0, "text": "c"}],
             }
         ]

@@ -41,8 +41,8 @@ def test_sentences_round_trip_as_json() -> None:
     )
     row = RetrievedContextDocument.from_document(doc, rank=0)
     assert row.sentences == [
-        {"page": 1, "index": 0, "text": "Una."},
-        {"page": 2, "index": 1, "text": "Dos."},
+        {"page": 1, "index": 0, "text": "Una.", "atomic": False},
+        {"page": 2, "index": 1, "text": "Dos.", "atomic": False},
     ]
 
 

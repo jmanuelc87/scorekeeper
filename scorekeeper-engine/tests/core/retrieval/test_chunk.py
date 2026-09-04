@@ -113,3 +113,67 @@ def test_the_range_uses_the_sentence_index_not_the_list_position() -> None:
     sentences = [Sentence(page=1, index=i + 10, text=f"s{i}") for i in range(4)]
     windows = chunk_sentences(sentences, size=2, overlap=0)
     assert [(w.sentence_start, w.sentence_end) for w in windows] == [(10, 11), (12, 13)]
+
+
+# -- atomic sentences (a rendered table is one unit) -----------------------------------------
+
+
+def _mixed(atomic_at: set[int], n: int) -> list[Sentence]:
+    """``n`` sentences on page 1, atomic at the given 0-based positions."""
+    return [
+        Sentence(page=1, index=i, text=f"s{i}", atomic=i in atomic_at) for i in range(n)
+    ]
+
+
+def test_an_atomic_sentence_becomes_a_window_of_its_own() -> None:
+    windows = chunk_sentences(_mixed({2}, 3), size=5, overlap=1)
+    assert [w.text for w in windows] == ["s0 s1", "s2"]
+
+
+def test_no_window_ever_spans_an_atomic_sentence() -> None:
+    windows = chunk_sentences(_mixed({3}, 7), size=3, overlap=1)
+    # The run before the table, the table alone, then the run after it.
+    assert [w.text for w in windows] == ["s0 s1 s2", "s3", "s4 s5 s6"]
+
+
+def test_an_atomic_window_reports_a_single_sentence_range() -> None:
+    windows = chunk_sentences(_mixed({1}, 3), size=5, overlap=0)
+    table = windows[1]
+    assert (table.sentence_start, table.sentence_end) == (1, 1)
+
+
+def test_an_atomic_sentence_first_or_last_leaves_no_empty_window() -> None:
+    assert [w.text for w in chunk_sentences(_mixed({0}, 3), size=2, overlap=0)] == [
+        "s0",
+        "s1 s2",
+    ]
+    assert [w.text for w in chunk_sentences(_mixed({2}, 3), size=2, overlap=0)] == [
+        "s0 s1",
+        "s2",
+    ]
+
+
+def test_consecutive_atomic_sentences_each_get_their_own_window() -> None:
+    windows = chunk_sentences(_mixed({1, 2}, 4), size=5, overlap=0)
+    assert [w.text for w in windows] == ["s0", "s1", "s2", "s3"]
+
+
+def test_only_atomic_sentences_yields_one_window_each() -> None:
+    assert len(chunk_sentences(_mixed({0, 1, 2}, 3), size=5, overlap=1)) == 3
+
+
+def test_an_atomic_window_keeps_its_own_page() -> None:
+    sentences = [
+        Sentence(page=1, index=0, text="s0"),
+        Sentence(page=4, index=1, text="tabla", atomic=True),
+    ]
+    assert [w.page for w in chunk_sentences(sentences, size=5, overlap=0)] == [1, 4]
+
+
+def test_without_atomic_sentences_the_output_is_the_plain_sliding_window() -> None:
+    """The regression guard: the flag must change nothing for existing documents."""
+    plain = _sentences(7)
+    flagged = _mixed(set(), 7)
+    assert chunk_sentences(flagged, size=3, overlap=1) == chunk_sentences(
+        plain, size=3, overlap=1
+    )

@@ -32,11 +32,16 @@ class Sentence(BaseModel):
     :class:`Chunk` list. ``page`` is the 1-based PDF page the sentence came from
     (``None`` for DOCX/HTML, which carry no page boundaries), and ``index`` orders
     the sentence within its whole document (0-based, never restarting per page).
+
+    ``atomic`` marks a sentence the chunker must not merge with its neighbours — a
+    rendered table, which reads as one unit or not at all. Rows written before the
+    flag existed simply lack the key and read back as ``False``.
     """
 
     page: int | None = None
     index: int
     text: str
+    atomic: bool = False
 
 
 class Chunk(BaseModel):

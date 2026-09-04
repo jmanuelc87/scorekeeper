@@ -8,6 +8,9 @@ at least one chunk. Pure, no I/O.
 A window carries where it came from, not just its text: the extract stage attributes every
 sentence to a page, and grouping them would throw that away. See :class:`SentenceWindow`.
 
+A sentence the extract stage marked ``atomic`` — a rendered table — is a hard boundary and
+becomes a window of its own, because half a grid grounds nothing.
+
 The other half of the pair — picking the stored chunks closest to a query embedding —
 happens in SQL, in ``db.repositories.embeddings``, so the vectors never leave the
 database.
@@ -51,6 +54,12 @@ def chunk_sentences(
     Advances by ``size - overlap`` sentences per chunk, so consecutive chunks share
     ``overlap`` sentences. The last window may be short. No sentences yields ``[]``.
 
+    An :attr:`~scorekeeper.core.retrieved_context.Sentence.atomic` sentence is a hard
+    boundary: it becomes a window of its own and never shares one with a neighbour. A
+    rendered table is the case — half a table grounds nothing, and the overlap that
+    rescues a straddling claim does not apply to a grid. With no atomic sentence the
+    output is exactly the plain sliding window over the whole sequence.
+
     Raises ``ValueError`` when ``size < 1`` or ``overlap`` is negative or not smaller
     than ``size`` — an overlap that consumes the whole window would never advance.
     """
@@ -60,20 +69,39 @@ def chunk_sentences(
         raise ValueError(
             f"El solape debe estar entre 0 y {size - 1} (recibido {overlap})"
         )
+    windows: list[SentenceWindow] = []
+    run: "list[Sentence]" = []  # the non-atomic sentences awaiting a sliding window
+    for sentence in sentences:
+        if not sentence.atomic:
+            run.append(sentence)
+            continue
+        windows.extend(_sliding_windows(run, size=size, overlap=overlap))
+        run = []
+        windows.append(_window([sentence]))
+    windows.extend(_sliding_windows(run, size=size, overlap=overlap))
+    return windows
+
+
+def _sliding_windows(
+    sentences: "Sequence[Sentence]", *, size: int, overlap: int
+) -> list[SentenceWindow]:
+    """Overlapping windows over a run of sentences, none of them atomic."""
     step = size - overlap
     windows: list[SentenceWindow] = []
     for start in range(0, len(sentences), step):
         # A short tail already covered by the previous window adds nothing.
         if start and start + overlap >= len(sentences):
             break
-        window = sentences[start : start + size]
-        windows.append(
-            SentenceWindow(
-                text=" ".join(s.text for s in window),
-                # The first sentence's page, deliberately: see ``SentenceWindow``.
-                page=window[0].page,
-                sentence_start=window[0].index,
-                sentence_end=window[-1].index,
-            )
-        )
+        windows.append(_window(sentences[start : start + size]))
     return windows
+
+
+def _window(sentences: "Sequence[Sentence]") -> SentenceWindow:
+    """One window over ``sentences``, carrying where its head came from."""
+    return SentenceWindow(
+        text=" ".join(s.text for s in sentences),
+        # The first sentence's page, deliberately: see ``SentenceWindow``.
+        page=sentences[0].page,
+        sentence_start=sentences[0].index,
+        sentence_end=sentences[-1].index,
+    )
