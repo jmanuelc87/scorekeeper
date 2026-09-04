@@ -23,8 +23,8 @@ from scorekeeper.config.settings import get_settings
 from scorekeeper.core.retrieval.credentials import CredentialError, SecretError, StoredAuthProvider
 from scorekeeper.core.retrieval.extract import (
     ExtractError,
-    MarkdownContentExtractor,
     PageNotFoundError,
+    default_content_extractor,
 )
 from scorekeeper.core.retrieval.fetch import CachingDocumentFetcher, FetchError
 from scorekeeper.core.retrieval.parser import LlmSourceRefParser
@@ -77,7 +77,7 @@ class RetrievalOrchestrator:
         self._resolver = resolver or UrlDocumentLocatorResolver()
         self._auth = auth_provider or StoredAuthProvider(session=session, encryption_key=key)
         self._fetcher = fetcher or CachingDocumentFetcher(session=session)
-        self._extractor = extractor or MarkdownContentExtractor()
+        self._extractor = extractor or default_content_extractor()
 
     # -- RetrievalPipeline protocol -----------------------------------------------------
 
@@ -160,7 +160,7 @@ class RetrievalOrchestrator:
             )
 
         try:
-            # markitdown/pypdf conversion is blocking CPU work.
+            # Conversion is blocking work: CPU (markitdown) or a request (unstructured).
             extracted = await asyncio.to_thread(self._extractor.extract, document, locator)
         except PageNotFoundError as exc:
             return RetrievalOutcome(

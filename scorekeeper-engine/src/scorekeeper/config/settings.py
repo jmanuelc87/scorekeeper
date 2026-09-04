@@ -111,6 +111,32 @@ class Settings(BaseSettings):
     # accumulate documents across runs (see evaluation.retrieve_run).
     retrieval_cache_dir: str = "./retrieval-cache"
 
+    # Extract stage backend (scorekeeper.core.retrieval.extract.default_content_extractor).
+    # "markdown" converts with MarkItDown in-process; "unstructured" posts the document to
+    # the unstructured-api service (compose.yaml), which returns typed elements carrying a
+    # page number and, for a table, its HTML. The unstructured path needs
+    # ``unstructured_api_url``; without it the markdown extractor is used instead, so a
+    # misconfigured deployment degrades rather than failing every retrieval.
+    retrieval_extractor: str = "markdown"  # "markdown" | "unstructured"
+    unstructured_api_url: str | None = None  # e.g. http://unstructured-api:8000
+    unstructured_api_key: str | None = None  # hosted SaaS only; self-hosting needs none
+    # Base partition strategy: "fast" reads the PDF text layer, "hi_res" runs the layout
+    # model and OCR (far slower, and the only strategy that recovers table structure well).
+    unstructured_strategy: str = "fast"
+    # Re-post a PDF page whose text layer came back empty with strategy="hi_res". This is
+    # what makes a scanned document readable instead of EMPTY_CONTENT. Best-effort: an OCR
+    # failure leaves the page empty rather than failing the document.
+    unstructured_ocr_fallback: bool = True
+    unstructured_ocr_languages: str = "spa"  # comma-separated tesseract languages
+    unstructured_timeout_seconds: float = 300.0  # one hi_res page is slow
+    # Above this many text-less pages the OCR fallback is skipped wholesale: a fully scanned
+    # 300-page PDF would otherwise occupy a worker for an hour to no one's benefit.
+    unstructured_max_ocr_pages: int = 20
+    # A rendered table is one chunk, never split mid-grid — but one chunk is also one
+    # embedding input, and an oversized one fails the whole batch. Past this many characters
+    # a table is split by rows, each piece repeating the header. 0 disables the split.
+    extract_table_max_chars: int = 4000
+
     # Master secret for the retrieval pipeline's credential store. Certificate private
     # keys configured per provider (the ``auth_providers`` table) are stored encrypted:
     # a per-row salt derives a key from this secret (PBKDF2) to encrypt/decrypt the PEM

@@ -27,7 +27,9 @@ from scorekeeper.core.retrieval.extract import (
     ExtractError,
     MarkdownContentExtractor,
     PageNotFoundError,
+    default_content_extractor,
 )
+from scorekeeper.core.retrieval.extract_unstructured import UnstructuredContentExtractor
 from scorekeeper.core.retrieval.fetch import CachingDocumentFetcher, FetchError
 from scorekeeper.core.retrieval.parser import LlmSourceRefParser
 from scorekeeper.core.retrieval.pipeline import RetrievalOrchestrator
@@ -89,6 +91,8 @@ __all__ = [
     "CachingDocumentFetcher",
     "FetchError",
     "MarkdownContentExtractor",
+    "UnstructuredContentExtractor",
+    "default_content_extractor",
     "ExtractError",
     "PageNotFoundError",
     "RetrievalOrchestrator",
