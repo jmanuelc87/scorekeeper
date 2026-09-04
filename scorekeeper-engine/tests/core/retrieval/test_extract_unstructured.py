@@ -249,6 +249,23 @@ def test_cell_whitespace_and_markup_are_collapsed() -> None:
     assert content.text.splitlines()[0] == "| Año fiscal | 2024 |"
 
 
+@pytest.mark.parametrize(
+    ("html", "expected"),
+    [
+        ("<table><tr><td>a<br>b</td></tr></table>", "| a b |"),
+        ("<table><tr><td>a<br/>b</td></tr></table>", "| a b |"),
+        ("<table><tr><td><p>uno</p><p>dos</p></td></tr></table>", "| uno dos |"),
+        # Inline formatting is not a word break: a superscript must stay attached.
+        ("<table><tr><td>1<sup>er</sup></td></tr></table>", "| 1er |"),
+        ("<table><tr><td>Ventas&nbsp;&amp;&nbsp;costos</td></tr></table>", "| Ventas & costos |"),
+    ],
+)
+def test_a_break_inside_a_cell_separates_words_instead_of_joining_them(html, expected) -> None:
+    """``a<br>b`` must not render as ``ab`` — the text nodes sit either side of the tag."""
+    content, _ = _extract([Element(category="Table", text="respaldo", page=1, html=html)])
+    assert content.text.splitlines()[0] == expected
+
+
 def test_html_with_no_table_falls_back_to_the_element_text() -> None:
     content, _ = _extract(
         [Element(category="Table", text="respaldo", page=1, html="<p>nada</p>")]

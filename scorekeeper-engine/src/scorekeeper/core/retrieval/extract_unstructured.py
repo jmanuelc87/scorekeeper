@@ -98,6 +98,11 @@ _HEADINGS = frozenset({"Title", "SectionHeader", "Headline", "Subtitle"})
 _TABLE = "Table"
 _LIST_ITEM = "ListItem"
 
+# Tags that separate words inside a table cell. Without them the text nodes either side of
+# a ``<br>`` would be concatenated ("a<br>b" -> "ab"); inline formatting (``<b>``, ``<sup>``)
+# is deliberately absent, so "1<sup>er</sup>" still reads "1er".
+_CELL_BREAKS = frozenset({"br", "p", "div", "li", "tr"})
+
 # The strategy the OCR fallback escalates to.
 _HI_RES = "hi_res"
 
@@ -463,12 +468,20 @@ class _TableHtmlParser(HTMLParser):
                 self._row = []
             self._close_cell()
             self._cell = []
+        elif tag in _CELL_BREAKS and self._cell is not None:
+            self._cell.append(" ")
+
+    def handle_startendtag(self, tag: str, attrs: Any) -> None:
+        """``<br/>`` arrives here rather than at ``handle_starttag``."""
+        self.handle_starttag(tag, attrs)
 
     def handle_endtag(self, tag: str) -> None:
         if tag in ("td", "th"):
             self._close_cell()
         elif tag == "tr":
             self._close_row()
+        elif tag in _CELL_BREAKS and self._cell is not None:
+            self._cell.append(" ")
 
     def handle_data(self, data: str) -> None:
         if self._cell is not None:
