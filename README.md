@@ -20,6 +20,90 @@ Scorekeeper es un sistema que evalúa automáticamente la calidad de las convers
 
 Scorekeeper permite a una organización responder, con evidencia y no solo con impresiones, qué asistente de IA funciona mejor. Reemplaza la revisión manual —lenta, costosa y subjetiva— por un proceso automático, consistente y auditable, donde cada calificación puede rastrearse hasta su justificación. Esto permite decidir qué plataforma adoptar o mantener, detectar rápidamente respuestas de baja calidad o mal fundamentadas, y controlar el costo del proceso de evaluación. Al capturar conversaciones directamente desde el navegador y procesar grandes volúmenes sin intervención humana, reduce el esfuerzo operativo y acelera la mejora continua de los asistentes de IA usados por la organización.
 
+## Arquitectura
+
+```mermaid
+flowchart TB
+      %% ---------- People ----------
+      analyst(["👤 Analista de calidad<br/><i>carga .xlsx, elige métricas, lee resultados</i>"])
+      operator(["👤 Usuario del asistente<br/><i>captura conversaciones desde el navegador</i>"])
+
+      %% ---------- System boundary ----------
+      subgraph SK["🎯 Scorekeeper — sistema de evaluación de asistentes de IA"]
+          direction TB
+
+          subgraph EDGE["Clientes"]
+              ext["🧩 Extensión de navegador<br/><small>MV3 · content scripts + popup<br/>captura turnos como Markdown (Turndown)</small>"]
+              web["🖥️  Frontend<br/><small>React + Vite (Nginx :8080)</small>"]
+          end
+
+          subgraph ENGINE["scorekeeper-engine (Python)"]
+              api["⚙️  HTTP API<br/><small>FastAPI :8001 · /evaluations /captures<br/>/runs /metrics /prompts /auth-providers</small>"]
+              worker["🔁 Celery worker ×3<br/><small>cadena de 1 job por turno<br/>reanudable ante fallos</small>"]
+
+              subgraph CORE["Núcleo de dominio"]
+                  ingest["📥 Ingesta<br/><small>.xlsx / capturas → turnos</small>"]
+                  retr["🔎 Pipeline de recuperación<br/><small>parse → locate → authorize →<br/>fetch → extract → chunk → embed</small>"]
+                  score["🧮 Scoring<br/><small>LLM-as-a-judge por métrica</small>"]
+                  roll["📊 Rollup<br/><small>turno → escenario → plataforma</small>"]
+                  cred["🔐 Credenciales<br/><small>cifradas con master secret</small>"]
+              end
+          end
+
+          subgraph DATA["Persistencia"]
+              pg[("🗄️  PostgreSQL + pgvector<br/><small>esquema Alembic · embeddings<br/>+ broker Celery (kombu)</small>")]
+          end
+
+          subgraph OBS["Observabilidad"]
+              alloy["📡 Grafana Alloy<br/><small>logs vía docker.sock</small>"]
+              loki[("🪵  Loki :3100")]
+              graf["📈 Grafana :3000"]
+          end
+      end
+
+      %% ---------- External systems ----------
+      assistants["🤖 Copilot · Gemini · Claude<br/><small>conversaciones evaluadas</small>"]
+      judgeLLM["🧠 Proveedor de juez<br/><small>Anthropic · OpenAI · Claude Agent SDK</small>"]
+      embedLLM["🔢 Endpoint de embeddings<br/><small>OpenAI-compatible / LM Studio · Ollama</small>"]
+      sources["🌐 Fuentes citadas<br/><small>web pública · SharePoint (Azure AD cert) · OAuth2</small>"]
+
+      %% ---------- Relations ----------
+      analyst -->|"sube .xlsx, configura y consulta"| web
+      operator -->|"un clic durante la conversación"| ext
+      operator -.->|"usa"| assistants
+      ext -->|"captura turnos"| assistants
+
+      web -->|"HTTPS / JSON"| api
+      ext -->|"POST /captures"| api
+
+      api -->|"encola run"| pg
+      pg -->|"broker"| worker
+      api --> ingest
+      worker --> retr --> score --> roll
+      ingest --> pg
+      retr <-->|"documentos"| sources
+      retr -->|"secretos"| cred
+      cred --> pg
+      retr -->|"vectores"| embedLLM
+      score -->|"prompt + rúbrica"| judgeLLM
+      roll --> pg
+      api -->|"lee resultados"| pg
+
+      api -.->|"stdout JSON"| alloy
+      worker -.->|"stdout JSON"| alloy
+      alloy --> loki --> graf
+      analyst -.->|"revisa logs"| graf
+
+      classDef person fill:#0b4f6c,stroke:#062f40,color:#fff
+      classDef system fill:#1168bd,stroke:#0b4884,color:#fff
+      classDef ext fill:#6b6b6b,stroke:#4a4a4a,color:#fff
+      classDef store fill:#2d6a4f,stroke:#1b4332,color:#fff
+      class analyst,operator person
+      class api,worker,web,ext,ingest,retr,score,roll,cred system
+      class assistants,judgeLLM,embedLLM,sources ext
+      class pg,loki,alloy,graf store
+```
+
 ## Run everything with Docker
 
 ```bash
