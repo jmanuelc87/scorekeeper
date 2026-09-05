@@ -72,19 +72,19 @@ services:
       unstructured-api:
         condition: service_healthy
 
-  # Document → typed elements for the retrieval pipeline's extract stage
-  # (scorekeeper.core.retrieval.extract_unstructured). It carries the layout model, OCR,
-  # poppler and tesseract so the engine image does not have to: the worker only posts
-  # bytes and reads JSON back. Only the worker calls it, so no port is published.
   unstructured-api:
     image: quay.io/unstructured-io/unstructured-api:latest
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/healthcheck"]
+      # The image ships wget, not curl: a curl-based test fails with "executable file
+      # not found" and the service never turns healthy, blocking the worker.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8000/healthcheck"]
       interval: 30s
       timeout: 5s
       retries: 5
       start_period: 60s
+    ports:
+      - "8000:8000"
 
   frontend:
     build:
