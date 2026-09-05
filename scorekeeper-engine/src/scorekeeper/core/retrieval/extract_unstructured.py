@@ -17,6 +17,9 @@ What it buys over the markdown extractor:
 
 * **Tables survive.** A ``Table`` element carries ``metadata.text_as_html``, rendered here into a
   pipe table and emitted as a single ``atomic`` sentence so the chunker never splits a grid.
+  Each table is then **described** by Claude Haiku 4.5 (see
+  :mod:`~scorekeeper.core.retrieval.describe`) and the description stored as the line above the
+  grid, so the chunk a judge reads carries the table's subject and not only its cells.
 * **Pages come from the document.** Each element reports ``metadata.page_number``, so a PDF
   referenced without ``#page=N`` is converted in **one** request instead of one per page, and a
   table straddling a page break is no longer cut at the boundary.
@@ -46,6 +49,7 @@ from typing import TYPE_CHECKING, Any
 from pydantic import BaseModel
 
 from scorekeeper.config.settings import get_settings
+from scorekeeper.core.retrieval.describe import TableDescriber
 from scorekeeper.core.retrieval.extract import (
     ExtractError,
     check_page,
@@ -133,10 +137,20 @@ class UnstructuredContentExtractor:
     ``partitioner`` is the seam to the service: a ``(body, *, filename, strategy) -> [Element]``
     callable, injectable for tests. When ``None`` a default HTTP client is built lazily on first
     use, so importing this module needs neither the service nor its URL.
+
+    ``describer`` is the seam to the table describer, a ``table -> description | None``
+    callable, built lazily on the first table for the same reason — so importing this module
+    needs neither the Agent SDK nor Claude credentials.
     """
 
-    def __init__(self, *, partitioner: "Partitioner | None" = None) -> None:
+    def __init__(
+        self,
+        *,
+        partitioner: "Partitioner | None" = None,
+        describer: TableDescriber | None = None,
+    ) -> None:
         self._partitioner = partitioner
+        self._describer = describer
 
     # -- ContentExtractor protocol ------------------------------------------------------
 
@@ -170,22 +184,66 @@ class UnstructuredContentExtractor:
 
         blocks = _blocks(elements)
         sentences: list[Sentence] = []
+        rendered: list[str] = []
+        described = 0
         for page, markdown, is_table in blocks:
-            texts = (
-                _split_table(markdown, settings.extract_table_max_chars)
-                if is_table
-                else split_sentences(markdown)
-            )
+            if is_table:
+                # Described once per table, then repeated on every piece: each piece is a
+                # standalone table a judge may read alone, and the description is what tells
+                # it what the grid is about. Prepending after the split, not before, because
+                # ``_split_table`` reads the first two lines as header and separator.
+                description = self._describe(markdown)
+                described += description is not None
+                # Every piece carries the description, so the rows it may hold shrink by
+                # exactly that much: ``extract_table_max_chars`` bounds one embedding
+                # input, and the description is part of it.
+                budget = settings.extract_table_max_chars
+                if budget > 0 and description:
+                    budget = max(1, budget - len(_with_description("", description)))
+                texts = [
+                    _with_description(piece, description)
+                    for piece in _split_table(
+                        markdown, budget, settings.extract_table_overlap_rows
+                    )
+                ]
+                rendered.append(_with_description(markdown, description))
+            else:
+                texts = split_sentences(markdown)
+                rendered.append(markdown)
             for text in texts:
                 sentences.append(
                     Sentence(
                         page=page, index=len(sentences), text=text, atomic=is_table
                     )
                 )
-        text = "\n\n".join(markdown for _, markdown, _ in blocks)
+        text = "\n\n".join(rendered)
+        logger.debug(
+            "extract: %s página=%s -> %d elemento(s), %d bloque(s) (%d tabla(s), "
+            "%d descrita(s)), %d oración(es), %d carácter(es)",
+            document.doc_type.value,
+            locator.page,
+            len(elements),
+            len(blocks),
+            sum(1 for _, _, is_table in blocks if is_table),
+            described,
+            len(sentences),
+            len(text),
+        )
         return ExtractedContent(text=text, page=locator.page, sentences=sentences)
 
     # -- helpers ------------------------------------------------------------------------
+
+    def _describe(self, table: str) -> str | None:
+        """``table``'s description, building the default describer on first use.
+
+        Best-effort like the describer itself: a table that cannot be described keeps the
+        text it already had.
+        """
+        if self._describer is None:
+            from scorekeeper.core.retrieval.describe import AgentTableDescriber
+
+            self._describer = AgentTableDescriber()
+        return self._describer(table)
 
     def _pdf_elements(
         self, body: bytes, locator: DocumentLocator, settings: Any
@@ -211,10 +269,14 @@ class UnstructuredContentExtractor:
             for element in elements:
                 element.page = locator.page
             pages = [locator.page]
+            logger.debug(
+                "extract: página %d de %d recortada antes de partitionar", locator.page, total
+            )
         else:
             elements = self._partition(body, DocType.PDF, settings.unstructured_strategy)
             _carry_pages(elements)
             pages = list(range(1, total + 1))
+            logger.debug("extract: PDF de %d página(s) partitionado entero", total)
 
         if (
             settings.unstructured_ocr_fallback
@@ -243,6 +305,9 @@ class UnstructuredContentExtractor:
             if element.page is not None and element.text.strip()
         }
         empty = [page for page in pages if page not in with_text]
+        logger.debug(
+            "extract: %d de %d página(s) sin texto tras la estrategia base", len(empty), len(pages)
+        )
         if not empty:
             return elements
         if len(empty) > settings.unstructured_max_ocr_pages:
@@ -267,6 +332,9 @@ class UnstructuredContentExtractor:
             for element in ocr:
                 element.page = page
             recovered[page] = ocr
+        logger.debug(
+            "extract: OCR recuperó %d de %d página(s) vacía(s)", len(recovered), len(empty)
+        )
         if not recovered:
             return elements
 
@@ -287,9 +355,21 @@ class UnstructuredContentExtractor:
         """Call the seam, building the default HTTP partitioner on first use."""
         if self._partitioner is None:
             self._partitioner = _ApiPartitioner()
-        return self._partitioner(
+        logger.debug(
+            "extract: partitionando %d byte(s) como %s con strategy=%s",
+            len(body),
+            _FILENAMES[doc_type],
+            strategy,
+        )
+        elements = self._partitioner(
             body, filename=_FILENAMES[doc_type], strategy=strategy
         )
+        logger.debug(
+            "extract: %d elemento(s) devuelto(s); categorías: %s",
+            len(elements),
+            ", ".join(sorted({element.category for element in elements})) or "ninguna",
+        )
+        return elements
 
 
 class _ApiPartitioner:
@@ -444,6 +524,18 @@ def _row(cells: "Sequence[str]") -> str:
     return "| " + " | ".join(cells) + " |"
 
 
+def _with_description(table: str, description: str | None) -> str:
+    """``table`` with its description as the line above it, italicised.
+
+    Emphasis rather than a plain line so the description reads as a caption and not as a
+    stray table row; a blank line separates it from the grid, which is what keeps the
+    markdown a valid pipe table. With no description the table is returned untouched.
+    """
+    if not description:
+        return table
+    return f"*{description}*\n\n{table}"
+
+
 class _TableHtmlParser(HTMLParser):
     """Collect ``<tr>``/``<td>`` text out of ``text_as_html``.
 
@@ -521,12 +613,17 @@ def _parse_table_html(html: str) -> list[list[str]]:
     return parser.rows
 
 
-def _split_table(markdown: str, max_chars: int) -> list[str]:
-    """Split an oversized table by rows, repeating the header in each piece.
+def _split_table(markdown: str, max_chars: int, overlap_rows: int = 0) -> list[str]:
+    """Split an oversized table by rows, repeating the header — and ``overlap_rows`` — in each piece.
 
     A table is one chunk, and a chunk is one embedding input: an oversized one fails the whole
     batch and leaves the document with no vectors at all. Each piece stays a valid standalone
     table, so a judge reading only one of them still sees the column names.
+
+    The pieces **overlap**, the way ``chunk_sentences`` overlaps sentence windows: each one
+    reopens with the last ``overlap_rows`` rows of the previous piece, so a row that only means
+    something read against the one above it is readable in at least one piece. Carried rows are
+    dropped when they would leave no room for a new row, so a split always advances.
     """
     if max_chars <= 0 or len(markdown) <= max_chars:
         return [markdown]
@@ -535,15 +632,30 @@ def _split_table(markdown: str, max_chars: int) -> list[str]:
         return [markdown]
     header, separator, body = lines[0], lines[1], lines[2:]
     overhead = len(header) + len(separator) + 2
+    overlap = max(0, overlap_rows)
     pieces: list[str] = []
     current: list[str] = []
     size = overhead
     for row in body:
         if current and size + len(row) + 1 > max_chars:
             pieces.append("\n".join([header, separator, *current]))
-            current, size = [], overhead
+            current = current[len(current) - overlap :] if overlap else []
+            while current and overhead + _rows_size(current) >= max_chars:
+                current.pop(0)
+            size = overhead + _rows_size(current)
         current.append(row)
         size += len(row) + 1
     if current:
         pieces.append("\n".join([header, separator, *current]))
+    logger.debug(
+        "extract: tabla de %d carácter(es) partida en %d pieza(s) (máximo %d)",
+        len(markdown),
+        len(pieces),
+        max_chars,
+    )
     return pieces or [markdown]
+
+
+def _rows_size(rows: "Sequence[str]") -> int:
+    """The characters ``rows`` add to a piece, newline separators included."""
+    return sum(len(row) + 1 for row in rows)

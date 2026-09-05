@@ -48,6 +48,23 @@ class _RecordingPartitioner:
         return [call[0] for call in self.calls]
 
 
+class _RecordingDescriber:
+    """Fake table describer: records every table it is handed.
+
+    ``description`` is what it answers with; ``None`` stands in for a describer that could
+    not produce one, which is how every test that predates descriptions keeps its exact
+    expected markdown.
+    """
+
+    def __init__(self, description: str | None = None) -> None:
+        self.description = description
+        self.tables: list[str] = []
+
+    def __call__(self, table: str) -> str | None:
+        self.tables.append(table)
+        return self.description
+
+
 def _settings(**overrides):
     """The extractor's settings, defaulted to "fast, no OCR, no table splitting"."""
     values = {
@@ -55,6 +72,7 @@ def _settings(**overrides):
         "unstructured_ocr_fallback": False,
         "unstructured_max_ocr_pages": 20,
         "extract_table_max_chars": 0,
+        "extract_table_overlap_rows": 0,
     }
     values.update(overrides)
     return SimpleNamespace(**values)
@@ -84,12 +102,20 @@ def _pdf(pages: int) -> bytes:
     return buf.getvalue()
 
 
-def _extract(elements, *, doc_type=DocType.PDF, body=None, page=None, **settings):
-    """Run the extractor over ``elements``, returning (content, partitioner)."""
+def _extract(
+    elements, *, doc_type=DocType.PDF, body=None, page=None, describer=None, **settings
+):
+    """Run the extractor over ``elements``, returning (content, partitioner).
+
+    ``describer`` defaults to one that describes nothing, so no test reaches the real
+    Agent SDK and every expectation written before descriptions existed still holds.
+    """
     if settings:
         module.get_settings = lambda: _settings(**settings)  # noqa: E731
     partitioner = _RecordingPartitioner(elements)
-    extractor = UnstructuredContentExtractor(partitioner=partitioner)
+    extractor = UnstructuredContentExtractor(
+        partitioner=partitioner, describer=describer or _RecordingDescriber()
+    )
     body = _pdf(1) if body is None and doc_type is DocType.PDF else (body or b"x")
     content = extractor.extract(_doc(doc_type, body), _loc(doc_type, page=page))
     return content, partitioner
@@ -285,12 +311,112 @@ def test_an_oversized_table_is_split_repeating_the_header() -> None:
     assert all(s.text.startswith("| Id | Valor |\n| --- | --- |") for s in content.sentences)
 
 
+def test_the_pieces_of_a_split_table_overlap_by_rows() -> None:
+    rows = "".join(f"<tr><td>{i}</td><td>valor {i}</td></tr>" for i in range(40))
+    html = f"<table><tr><th>Id</th><th>Valor</th></tr>{rows}</table>"
+    content, _ = _extract(
+        [Element(category="Table", text="", page=1, html=html)],
+        extract_table_max_chars=200,
+        extract_table_overlap_rows=2,
+    )
+    pieces = [s.text.splitlines()[2:] for s in content.sentences]
+    assert len(pieces) > 1
+    for previous, following in zip(pieces, pieces[1:]):
+        assert following[:2] == previous[-2:]
+
+
 def test_a_table_under_the_limit_stays_one_sentence() -> None:
     content, _ = _extract(
         [Element(category="Table", text="", page=1, html=_TABLE_HTML)],
         extract_table_max_chars=4000,
     )
     assert len(content.sentences) == 1
+
+
+# -- table descriptions ---------------------------------------------------------------------
+
+
+def test_a_tables_description_opens_its_sentence() -> None:
+    describer = _RecordingDescriber("Ingresos por año.")
+    content, _ = _extract(
+        [Element(category="Table", text="", page=1, html=_TABLE_HTML)],
+        describer=describer,
+    )
+    assert content.sentences[0].text == (
+        "*Ingresos por año.*\n\n"
+        "| Año | Ingreso |\n| --- | --- |\n| 2023 | 1.5 |\n| 2024 | 2.0 |"
+    )
+    assert content.sentences[0].atomic is True
+    assert content.text == content.sentences[0].text
+
+
+def test_the_describer_receives_the_rendered_table() -> None:
+    describer = _RecordingDescriber("Una tabla.")
+    _extract(
+        [Element(category="Table", text="", page=1, html=_TABLE_HTML)],
+        describer=describer,
+    )
+    assert describer.tables == [
+        "| Año | Ingreso |\n| --- | --- |\n| 2023 | 1.5 |\n| 2024 | 2.0 |"
+    ]
+
+
+def test_only_tables_are_described() -> None:
+    describer = _RecordingDescriber("Una tabla.")
+    _extract(
+        [
+            Element(category="NarrativeText", text="Una.", page=1),
+            Element(category="Title", text="Título", page=1),
+            Element(category="ListItem", text="uno", page=1),
+            Element(category="Table", text="", page=1, html=_TABLE_HTML),
+        ],
+        describer=describer,
+    )
+    assert len(describer.tables) == 1
+
+
+def test_an_undescribed_table_keeps_the_text_it_had() -> None:
+    """A describer that answers ``None`` leaves the markdown byte-identical."""
+    content, _ = _extract(
+        [Element(category="Table", text="", page=1, html=_TABLE_HTML)],
+        describer=_RecordingDescriber(None),
+    )
+    assert content.sentences[0].text == (
+        "| Año | Ingreso |\n| --- | --- |\n| 2023 | 1.5 |\n| 2024 | 2.0 |"
+    )
+
+
+def test_a_split_table_is_described_once_and_every_piece_carries_it() -> None:
+    rows = "".join(f"<tr><td>{i}</td><td>valor {i}</td></tr>" for i in range(40))
+    html = f"<table><tr><th>Id</th><th>Valor</th></tr>{rows}</table>"
+    describer = _RecordingDescriber("Valores por id.")
+    content, _ = _extract(
+        [Element(category="Table", text="", page=1, html=html)],
+        describer=describer,
+        extract_table_max_chars=300,
+    )
+    assert len(content.sentences) > 1
+    assert len(describer.tables) == 1  # one call per table, not per piece
+    assert all(
+        s.text.startswith("*Valores por id.*\n\n| Id | Valor |\n| --- | --- |")
+        for s in content.sentences
+    )
+
+
+def test_the_description_counts_against_the_chunk_budget() -> None:
+    """A piece plus its description must still fit ``extract_table_max_chars``.
+
+    The limit bounds one embedding input, and the description is part of that input.
+    """
+    rows = "".join(f"<tr><td>{i}</td><td>valor {i}</td></tr>" for i in range(40))
+    html = f"<table><tr><th>Id</th><th>Valor</th></tr>{rows}</table>"
+    content, _ = _extract(
+        [Element(category="Table", text="", page=1, html=html)],
+        describer=_RecordingDescriber("Valores por id." * 5),
+        extract_table_max_chars=300,
+    )
+    assert content.sentences
+    assert all(len(s.text) <= 300 for s in content.sentences)
 
 
 # -- pages and sentence indexing ------------------------------------------------------------

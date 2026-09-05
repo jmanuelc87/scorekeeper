@@ -136,6 +136,11 @@ class Settings(BaseSettings):
     # embedding input, and an oversized one fails the whole batch. Past this many characters
     # a table is split by rows, each piece repeating the header. 0 disables the split.
     extract_table_max_chars: int = 4000
+    # Rows each piece of a split table repeats from the end of the previous one, mirroring
+    # embedding_chunk_overlap: a row read against the one above it stays readable in at
+    # least one piece. 0 splits with no overlap. Carried rows are dropped when they would
+    # leave no room for a new one, so the split always advances.
+    extract_table_overlap_rows: int = 1
 
     # Master secret for the retrieval pipeline's credential store. Certificate private
     # keys configured per provider (the ``auth_providers`` table) are stored encrypted:
