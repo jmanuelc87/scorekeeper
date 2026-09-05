@@ -126,9 +126,10 @@ class EvalRunner:
     Construct with an ``AsyncSession`` and, optionally, a ``Judge`` (defaults to the
     configured judge from ``make_judge()``). Tests inject a stub judge.
 
-    ``embedder`` narrows what context a judge sees: the turn's prompt is embedded once
-    and each document keeps only its ``embedding_top_k`` closest chunks. ``None`` — no
-    embedder configured, or none passed — hands over every stored chunk instead.
+    ``embedder`` narrows what context a judge sees: the turn's response is embedded once
+    and each document keeps only its ``embedding_top_k`` closest chunks, each widened to
+    the ``embedding_context_neighbors`` chunks either side of it. ``None`` — no embedder
+    configured, or none passed — hands over every stored chunk instead.
     """
 
     def __init__(
@@ -324,13 +325,16 @@ class EvalRunner:
         turn of that conversation; that is correct, since their judges saw it.
         """
         query_embedding = await self._query_embedding(turn)
+        # Both knobs are meaningful only with something to rank against: without it every
+        # chunk is returned whatever they say, so settings are not consulted at all.
+        narrowing = get_settings() if query_embedding is not None else None
         chunks = await embeddings_repo.chunks_for_turn(
             self.session,
             turn_id=turn.id,
             query_embedding=query_embedding,
-            # Only meaningful with something to rank against; without it every chunk is
-            # returned whatever ``k`` says, so settings are not consulted at all.
-            k=get_settings().embedding_top_k if query_embedding is not None else 0,
+            k=narrowing.embedding_top_k if narrowing else 0,
+            # Each kept chunk is then widened to the window [n-p … n … n+p].
+            neighbors=narrowing.embedding_context_neighbors if narrowing else 0,
         )
         view = self._to_turn_view(turn, history or [], chunks)
         # ``run_scenario`` passes the ids it already flattened; a per-turn caller
@@ -541,7 +545,12 @@ class EvalRunner:
 
     # ---- Helpers ------------------------------------------------------------
     async def _query_embedding(self, turn: Turn) -> list[float] | None:
-        """Embed the turn's prompt, once, to rank its documents' chunks against it.
+        """Embed the turn's response, once, to rank its documents' chunks against it.
+
+        The **answer**, not the question: the chunks are what a judge checks the answer
+        against, so what a claim actually cites matters more than what the question
+        happened to word. A passage the answer draws on but the question does not
+        resemble is no longer narrowed away before the judge sees it.
 
         ``None`` whenever ranking is impossible or pointless — no embedder, no retrieved
         documents — and also when embedding fails: losing the *narrowing* is survivable
@@ -551,10 +560,10 @@ class EvalRunner:
             return None
         try:
             # The SDK call is blocking; keep it off the event loop.
-            vectors = await asyncio.to_thread(self.embedder.embed, [turn.prompt])
+            vectors = await asyncio.to_thread(self.embedder.embed, [turn.response])
         except EmbedError:
             logger.warning(
-                "No se pudo embeber el prompt del turno %s; se usa todo el contexto",
+                "No se pudo embeber la respuesta del turno %s; se usa todo el contexto",
                 turn.turn_number,
                 exc_info=True,
             )

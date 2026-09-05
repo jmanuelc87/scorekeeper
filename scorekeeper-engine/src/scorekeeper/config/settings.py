@@ -79,12 +79,17 @@ class Settings(BaseSettings):
     openai_embedding_model: str = "text-embedding-3-small"
     # Retrieval embedding phase (scorekeeper.core.services.embedding): a document's
     # sentences are grouped into overlapping chunks, each chunk is embedded, and at
-    # scoring time only the chunks most similar to the turn's prompt are rendered into
+    # scoring time only the chunks most similar to the turn's response are rendered into
     # the judge prompt. The embedder is its own OpenAI client, independent of the judge.
     embedding_chunk_sentences: int = 5  # sentences per chunk
     embedding_chunk_overlap: int = 1  # sentences shared with the previous chunk
     embedding_batch_size: int = 128  # texts per embeddings API call
-    embedding_top_k: int = 3  # chunks per document handed to the judge
+    embedding_top_k: int = 20  # chunks per document ranking keeps
+    # Neighbouring chunks fetched around each kept chunk (p): a hit at index n is widened
+    # to [n-p … n … n+p], so a claim starting in the chunk before the one similarity found
+    # is still readable. 0 hands the judge the ranked chunks alone. A document can return
+    # up to embedding_top_k * (2p + 1) chunks, so raising this multiplies judge input.
+    embedding_context_neighbors: int = 0
     # Server-side refusal fallback (scorekeeper.core.metrics.judges.anthropic_judge). A
     # safety classifier may decline a judge call (HTTP 200, stop_reason="refusal"); with
     # this set, the API re-runs that same call on this model inside the same request

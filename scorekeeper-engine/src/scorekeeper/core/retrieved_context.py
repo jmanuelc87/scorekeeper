@@ -10,7 +10,7 @@ relies on that order, which is the *platform's* retriever order and never ours.
 
 A document carries no whole-document text. Its text arrives as ``chunks``: the
 overlapping sentence windows the embedding phase stored, already narrowed to the ones
-most similar to the turn's prompt (``db.repositories.embeddings``). The
+most similar to the turn's response (``db.repositories.embeddings``). The
 ``sentences`` field is the other direction — what the extract stage produced on the way
 *in*, and the chunker's input; it is left empty when a document is read back for scoring.
 
