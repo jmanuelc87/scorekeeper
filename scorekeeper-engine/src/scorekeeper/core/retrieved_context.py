@@ -10,7 +10,7 @@ relies on that order, which is the *platform's* retriever order and never ours.
 
 A document carries no whole-document text. Its text arrives as ``chunks``: the
 overlapping sentence windows the embedding phase stored, already narrowed to the ones
-most similar to the turn's prompt (``db.repositories.embeddings``). The
+most similar to the turn's response (``db.repositories.embeddings``). The
 ``sentences`` field is the other direction — what the extract stage produced on the way
 *in*, and the chunker's input; it is left empty when a document is read back for scoring.
 
@@ -32,11 +32,16 @@ class Sentence(BaseModel):
     :class:`Chunk` list. ``page`` is the 1-based PDF page the sentence came from
     (``None`` for DOCX/HTML, which carry no page boundaries), and ``index`` orders
     the sentence within its whole document (0-based, never restarting per page).
+
+    ``atomic`` marks a sentence the chunker must not merge with its neighbours — a
+    rendered table, which reads as one unit or not at all. Rows written before the
+    flag existed simply lack the key and read back as ``False``.
     """
 
     page: int | None = None
     index: int
     text: str
+    atomic: bool = False
 
 
 class Chunk(BaseModel):

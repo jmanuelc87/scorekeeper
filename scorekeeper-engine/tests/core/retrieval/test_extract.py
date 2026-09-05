@@ -269,3 +269,43 @@ def test_real_html_conversion_preserves_structure_drops_images_and_links() -> No
     assert "![" not in result.text and "<img" not in result.text  # no images
     assert "http" not in result.text  # no links
     assert "la nota" not in result.text  # anchor text dropped with the link
+
+
+# -- backend selection (settings.retrieval_extractor) ----------------------------------------
+
+
+def _select(monkeypatch, **overrides):
+    from types import SimpleNamespace
+
+    from scorekeeper.core.retrieval import extract as module
+
+    values = {"retrieval_extractor": "markdown", "unstructured_api_url": None}
+    values.update(overrides)
+    settings = SimpleNamespace(**values)
+    monkeypatch.setattr(module, "get_settings", lambda: settings)
+    return module.default_content_extractor()
+
+
+def test_the_default_backend_is_the_markdown_extractor(monkeypatch) -> None:
+    assert isinstance(_select(monkeypatch), MarkdownContentExtractor)
+
+
+def test_the_unstructured_backend_is_selected_with_an_api_url(monkeypatch) -> None:
+    from scorekeeper.core.retrieval import UnstructuredContentExtractor
+
+    extractor = _select(
+        monkeypatch,
+        retrieval_extractor="unstructured",
+        unstructured_api_url="http://unstructured-api:8000",
+    )
+    assert isinstance(extractor, UnstructuredContentExtractor)
+
+
+def test_unstructured_without_an_api_url_falls_back_to_markdown(monkeypatch) -> None:
+    """A half-configured deployment degrades; it does not fail every retrieval."""
+    extractor = _select(monkeypatch, retrieval_extractor="unstructured")
+    assert isinstance(extractor, MarkdownContentExtractor)
+
+
+def test_an_unknown_backend_falls_back_to_markdown(monkeypatch) -> None:
+    assert isinstance(_select(monkeypatch, retrieval_extractor="ocr"), MarkdownContentExtractor)

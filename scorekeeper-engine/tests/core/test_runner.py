@@ -324,6 +324,7 @@ class _StubEmbedder:
 
     def embed(self, texts):
         self.calls += 1
+        self.texts = list(texts)
         return [self.vector]
 
 
@@ -366,7 +367,23 @@ async def test_query_embedding_is_skipped_without_documents(session: AsyncSessio
     assert embedder.calls == 0  # nothing to rank, so nothing to pay for
 
 
-async def test_a_failed_prompt_embedding_falls_back_to_the_whole_document(
+async def test_the_query_embedding_is_the_response_not_the_prompt(
+    session: AsyncSession,
+) -> None:
+    """The chunks are what a judge checks the answer against, so the answer is the query."""
+    _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])
+    turn = platform_exec.turns[0]
+    turn.retrieved_documents.append(_document(rank=0, name="a", document="d.pdf", text="uno"))
+    await session.flush()
+    embedder = _StubEmbedder([1.0])
+
+    assert await EvalRunner(
+        session, RecordingJudge(), embedder=embedder
+    )._query_embedding(turn) == [1.0]
+    assert embedder.texts == ["respuesta"]
+
+
+async def test_a_failed_query_embedding_falls_back_to_the_whole_document(
     session: AsyncSession,
 ) -> None:
     _, platform_exec, _ = await _seed_scenario(session, [("hola", "respuesta")])

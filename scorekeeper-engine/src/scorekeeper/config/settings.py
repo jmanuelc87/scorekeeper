@@ -79,12 +79,17 @@ class Settings(BaseSettings):
     openai_embedding_model: str = "text-embedding-3-small"
     # Retrieval embedding phase (scorekeeper.core.services.embedding): a document's
     # sentences are grouped into overlapping chunks, each chunk is embedded, and at
-    # scoring time only the chunks most similar to the turn's prompt are rendered into
+    # scoring time only the chunks most similar to the turn's response are rendered into
     # the judge prompt. The embedder is its own OpenAI client, independent of the judge.
     embedding_chunk_sentences: int = 5  # sentences per chunk
     embedding_chunk_overlap: int = 1  # sentences shared with the previous chunk
     embedding_batch_size: int = 128  # texts per embeddings API call
-    embedding_top_k: int = 3  # chunks per document handed to the judge
+    embedding_top_k: int = 20  # chunks per document ranking keeps
+    # Neighbouring chunks fetched around each kept chunk (p): a hit at index n is widened
+    # to [n-p … n … n+p], so a claim starting in the chunk before the one similarity found
+    # is still readable. 0 hands the judge the ranked chunks alone. A document can return
+    # up to embedding_top_k * (2p + 1) chunks, so raising this multiplies judge input.
+    embedding_context_neighbors: int = 0
     # Server-side refusal fallback (scorekeeper.core.metrics.judges.anthropic_judge). A
     # safety classifier may decline a judge call (HTTP 200, stop_reason="refusal"); with
     # this set, the API re-runs that same call on this model inside the same request
@@ -110,6 +115,37 @@ class Settings(BaseSettings):
     # entries are purged when that execution's retrieval finishes, so the directory does not
     # accumulate documents across runs (see evaluation.retrieve_run).
     retrieval_cache_dir: str = "./retrieval-cache"
+
+    # Extract stage backend (scorekeeper.core.retrieval.extract.default_content_extractor).
+    # "markdown" converts with MarkItDown in-process; "unstructured" posts the document to
+    # the unstructured-api service (compose.yaml), which returns typed elements carrying a
+    # page number and, for a table, its HTML. The unstructured path needs
+    # ``unstructured_api_url``; without it the markdown extractor is used instead, so a
+    # misconfigured deployment degrades rather than failing every retrieval.
+    retrieval_extractor: str = "markdown"  # "markdown" | "unstructured"
+    unstructured_api_url: str | None = None  # e.g. http://unstructured-api:8000
+    unstructured_api_key: str | None = None  # hosted SaaS only; self-hosting needs none
+    # Base partition strategy: "fast" reads the PDF text layer, "hi_res" runs the layout
+    # model and OCR (far slower, and the only strategy that recovers table structure well).
+    unstructured_strategy: str = "fast"
+    # Re-post a PDF page whose text layer came back empty with strategy="hi_res". This is
+    # what makes a scanned document readable instead of EMPTY_CONTENT. Best-effort: an OCR
+    # failure leaves the page empty rather than failing the document.
+    unstructured_ocr_fallback: bool = True
+    unstructured_ocr_languages: str = "spa"  # comma-separated tesseract languages
+    unstructured_timeout_seconds: float = 300.0  # one hi_res page is slow
+    # Above this many text-less pages the OCR fallback is skipped wholesale: a fully scanned
+    # 300-page PDF would otherwise occupy a worker for an hour to no one's benefit.
+    unstructured_max_ocr_pages: int = 20
+    # A rendered table is one chunk, never split mid-grid — but one chunk is also one
+    # embedding input, and an oversized one fails the whole batch. Past this many characters
+    # a table is split by rows, each piece repeating the header. 0 disables the split.
+    extract_table_max_chars: int = 4000
+    # Rows each piece of a split table repeats from the end of the previous one, mirroring
+    # embedding_chunk_overlap: a row read against the one above it stays readable in at
+    # least one piece. 0 splits with no overlap. Carried rows are dropped when they would
+    # leave no room for a new one, so the split always advances.
+    extract_table_overlap_rows: int = 1
 
     # Master secret for the retrieval pipeline's credential store. Certificate private
     # keys configured per provider (the ``auth_providers`` table) are stored encrypted:

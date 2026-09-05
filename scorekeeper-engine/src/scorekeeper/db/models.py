@@ -290,7 +290,7 @@ class RetrievedContextDocument(Base):
     name: Mapped[str] = mapped_column(Text)  # Short label/title for the retrieved item.
     document: Mapped[str] = mapped_column(Text)  # Source document reference.
     url: Mapped[str | None] = mapped_column(Text, default=None)  # Source URL, if any.
-    # The document's text, segmented into ``[{page, index, text}, ...]`` by the extract
+    # The document's text, segmented into ``[{page, index, text, atomic}, ...]`` by the extract
     # stage — the chunker's input, not judge input. NULL on rows retrieved before
     # segmentation existed; those rows carry no text at all and are re-retrieved.
     sentences: Mapped[list[dict[str, Any]] | None] = mapped_column(JsonColumn, default=None)
@@ -344,7 +344,7 @@ class RetrievedDocumentEmbedding(Base):
     into overlapping windows of ``embedding_chunk_sentences`` (sharing
     ``embedding_chunk_overlap``), one row per window in ``chunk_index`` order, each with
     its embedding. At scoring time only the ``embedding_top_k`` chunks closest to the
-    turn's prompt are handed to a judge, so a judge never sees a whole document.
+    turn's response are handed to a judge, so a judge never sees a whole document.
 
     Written by ``core.services.embedding``; the vectors come from
     ``core.retrieval.embed.OpenAIEmbedder``, which owns its own OpenAI client rather than

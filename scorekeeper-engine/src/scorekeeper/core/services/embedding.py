@@ -4,7 +4,7 @@ Sits between retrieval and scoring. Retrieval leaves a document's text on
 ``RetrievedContextDocument.sentences``; this phase groups those sentences into
 overlapping windows (``core.retrieval.chunk.chunk_sentences``), embeds each window, and
 stores one ``RetrievedDocumentEmbedding`` row per chunk. Scoring then reads only the
-chunks closest to the turn's prompt, so a judge never sees a whole document.
+chunks closest to the turn's response, so a judge never sees a whole document.
 
 **Best-effort, like retrieval**: an embedding failure is logged and leaves the chunks
 stored *without* vectors rather than failing the turn — a judge then reads the whole
@@ -77,7 +77,7 @@ async def embed_document(
 
     Chunking and embedding are deliberately separable. The chunks are the document's
     *only* stored text, so they are written whatever happens; the vectors are the
-    enrichment that lets scoring narrow them to the turn's prompt. A run without
+    enrichment that lets scoring narrow them to the turn's response. A run without
     ``openai_api_key`` — or one whose embedding call failed — therefore still hands a
     judge the whole document rather than nothing at all.
 

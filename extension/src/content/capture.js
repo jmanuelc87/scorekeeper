@@ -144,6 +144,13 @@
         ".screen-reader-model-response-label", // "Gemini dijo"
         "model-response-disclaimers", // "Gemini es una IA y puede cometer errores."
         ".luminous-actions-container", // "Copiar instrucción" / edit bar
+        // The "Mostrar razonamiento" panel and the research steps it lists. Both
+        // render *inside* `model-response`, above the answer, so without this they
+        // are read as the opening paragraphs of the response — and the judge would
+        // score the model's deliberation as if it were the reply.
+        "model-thoughts",
+        ".thoughts-content",
+        "extended-response-panel",
       ],
     },
     {
@@ -181,7 +188,17 @@
       // chips are slotted *into* it from light DOM, which `innerText` does not
       // collect. Declared for the day a reskin makes `content` miss and a whole
       // bubble gets read instead.
-      chrome: [".sr-only", ".citation-slot"],
+      chrome: [
+        ".sr-only",
+        ".citation-slot",
+        // The agent-thoughts section: its header and the step list under it. Inert
+        // while `content` resolves — both sit outside the markdown document — and
+        // declared for the day a reskin makes `content` miss and the whole bubble is
+        // read instead, reasoning included.
+        "ucs-agent-thoughts",
+        ".agent-thoughts",
+        ".thought-process",
+      ],
       // The `md-text-button` model picker. Its label is *light* DOM slotted into the
       // button's shadow root, so `deepQueryAll` reaches it by walking children —
       // no `content` indirection needed here.
@@ -224,6 +241,14 @@
         ".fai-CopilotMessage__name", // agent-name badge above the answer
         ".fai-CopilotMessage__actions", // copy / feedback / sources bar below it
         '[data-testid="foot-note-div"]',
+        // The chain-of-thought panel ("Pensando…" and the numbered steps below it),
+        // which streams inside the reply div before the answer itself. Matched on a
+        // *substring* of the testid because Copilot suffixes it per turn, and on the
+        // Fluent class as a second handle — every other class on the block is hashed.
+        '[data-testid*="chain-of-thought"]',
+        '[data-testid*="thinking"]',
+        '[class*="ChainOfThought"]',
+        '[class*="ThinkingPanel"]',
       ],
       // The model switcher by the composer, whose text is the model ("Opus"). Not to
       // be confused with `.fai-CopilotMessage__name` above an answer: that badge is
@@ -281,7 +306,16 @@
       // than inside it, so neither reaches `innerText` from there today; declared for
       // the day a reskin moves them in, where it costs nothing — an element that
       // contributes no text removes no lines.
-      chrome: [".sr-only"],
+      chrome: [
+        ".sr-only",
+        // The reasoning summary ("Thought for 5s" and the chain it expands into).
+        // It renders beside the message node on today's build, so it does not reach
+        // `innerText` from there — but a reasoning model moves it *inside* often
+        // enough that hiding it costs nothing and stops the deliberation being
+        // stored as the answer.
+        '[data-testid*="thought"]',
+        '[data-testid*="reasoning"]',
+      ],
     },
   ];
 
@@ -316,6 +350,14 @@
     // whereas `.+` would eat any sentence that happens to open the same way.
     /^thought for \d+\s*\w+$/i,
     /^pensó durante \d+\s*\w+$/i,
+    /^razonado durante \d+\s*\w+$/i,
+    // The toggles the other apps put on their reasoning panels, for the day their
+    // markup moves out from under the selectors above. Same whole-line rule: these
+    // only ever drop a line that is nothing but the control's own label.
+    /^(mostrar|ocultar) (razonamiento|pensamientos?)$/i,
+    /^(show|hide) (thinking|reasoning|thoughts)$/i,
+    /^(pensando|razonando)(\.{3}|…)?$/i,
+    /^(thinking|reasoning)(\.{3}|…)?$/i,
   ];
 
   function captureConversation() {
@@ -495,11 +537,22 @@
    * link the retrieval pipeline has nothing to fetch from. Resolving against the page and
    * keeping only web URLs means the column holds sources, not markup artifacts.
    */
+  // Cited URLs that are images rather than documents. SVG is the one seen in the wild
+  // (a platform citing a chart it rendered); the rest are filtered for the same reason.
+  const NON_DOCUMENT_PATH =
+    /\.(?:apng|avif|bmp|gif|heic|heif|ico|jfif|jpe?g|png|svgz?|tiff?|webp)$/i;
+
   function webUrl(href) {
     if (!href || href.startsWith("#")) return "";
     try {
-      const { protocol, href: absolute } = new URL(href, document.baseURI);
-      return protocol === "https:" || protocol === "http:" ? absolute : "";
+      const url = new URL(href, document.baseURI);
+      if (url.protocol !== "https:" && url.protocol !== "http:") return "";
+      // An image is not a document: there is no prose in it to ground an answer, and the
+      // retrieval pipeline can only mark it UNSUPPORTED_TYPE. Dropping it here keeps it out
+      // of `retrieved_context` entirely, so it never takes up a rank that
+      // `contextual_precision` scores. Matched on the path so a query string cannot hide it.
+      if (NON_DOCUMENT_PATH.test(url.pathname)) return "";
+      return url.href;
     } catch {
       return ""; // Not a resolvable URL.
     }
@@ -634,8 +687,9 @@
    * is what teaches it tables and strikethrough, neither of which Turndown handles
    * on its own — and these apps answer with tables constantly.
    *
-   * Two rules of our own: elements `markHidden` flagged are dropped, and a link is
-   * kept only when its href is something the stored turn can be followed to.
+   * Three rules of our own: elements `markHidden` flagged are dropped, images are
+   * dropped, and a link is kept only when its href is something the stored turn can
+   * be followed to.
    */
   function createTurndown() {
     const service = new TurndownService({
@@ -657,6 +711,15 @@
         const url = webUrl(node.getAttribute("href"));
         return url ? `[${content}](${url})` : content;
       },
+    });
+    // Turndown's built-in image rule emits `![alt](src)` with whatever the page put in
+    // `src` — usually a `data:` URI or a CDN blob, sometimes kilobytes of base64. None
+    // of it is prose the judge can read, and it would sit in the stored turn as noise,
+    // so the image contributes nothing at all. Same reasoning as `NON_DOCUMENT_PATH`
+    // above, applied to the images the answer renders rather than the ones it cites.
+    service.addRule("image", {
+      filter: "img",
+      replacement: () => "",
     });
     // Added last on purpose: `addRule` puts a rule *in front* of the ones already
     // there, so this is the one consulted first and a hidden link never reaches the

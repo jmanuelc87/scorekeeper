@@ -33,6 +33,9 @@ services:
     env_file: scorekeeper-engine/.env
     environment: &backend-environment
       DATABASE_URL: postgresql+asyncpg://scorekeeper:scorekeeper@database:5432/scorekeeper
+      # Where the extract stage posts documents when RETRIEVAL_EXTRACTOR=unstructured.
+      # Set that in .env to switch the backend on; the URL alone changes nothing.
+      UNSTRUCTURED_API_URL: http://unstructured-api:8000
     depends_on:
       database:
         condition: service_healthy
@@ -66,16 +69,32 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      unstructured-api:
+        condition: service_healthy
 
-  # frontend:
-  #   build:
-  #     context: frontend
-  #     args:
-  #       VITE_API_URL: http://localhost:8001
-  #   depends_on:
-  #     - api
-  #   ports:
-  #     - "8080:80"
+  unstructured-api:
+    image: quay.io/unstructured-io/unstructured-api:latest
+    restart: unless-stopped
+    healthcheck:
+      # The image ships wget, not curl: a curl-based test fails with "executable file
+      # not found" and the service never turns healthy, blocking the worker.
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8000/healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: frontend
+      args:
+        VITE_API_URL: http://localhost:8001
+    depends_on:
+      - api
+    ports:
+      - "8080:80"
 
   # --- Observability: central log aggregation (Grafana Loki) --------------------
 

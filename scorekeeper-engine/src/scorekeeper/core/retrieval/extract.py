@@ -34,10 +34,12 @@ reads, so the assemble stage's blank-markdown rule is unchanged.
 
 from __future__ import annotations
 
+import logging
 import re
 from io import BytesIO
 from typing import TYPE_CHECKING
 
+from scorekeeper.config.settings import get_settings
 from scorekeeper.core.retrieval.types import (
     DocType,
     DocumentLocator,
@@ -49,6 +51,12 @@ from scorekeeper.core.text import split_sentences
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+    from pypdf import PdfReader
+
+    from scorekeeper.core.retrieval.protocols import ContentExtractor
+
+logger = logging.getLogger(__name__)
 
 # Document types this extractor can convert to markdown.
 _SUPPORTED = frozenset({DocType.PDF, DocType.DOCX, DocType.HTML})
@@ -89,6 +97,75 @@ class PageNotFoundError(ExtractError):
     ``RetrievalStatus.LOCATOR_NOT_FOUND``."""
 
 
+def default_content_extractor() -> "ContentExtractor":
+    """The extract stage ``settings.retrieval_extractor`` selects.
+
+    ``"unstructured"`` needs ``unstructured_api_url`` to post to; without it — or for any
+    unrecognised value — the markdown extractor is returned and a warning logged. A typo in
+    ``.env`` must degrade the extraction, not take every retrieval down.
+    """
+    settings = get_settings()
+    if settings.retrieval_extractor == "markdown":
+        return MarkdownContentExtractor()
+    if settings.retrieval_extractor == "unstructured":
+        if settings.unstructured_api_url:
+            # Imported here so the markdown path never loads the HTTP extractor.
+            from scorekeeper.core.retrieval.extract_unstructured import (
+                UnstructuredContentExtractor,
+            )
+
+            return UnstructuredContentExtractor()
+        logger.warning(
+            "retrieval_extractor=unstructured pero falta unstructured_api_url; "
+            "se usa el extractor markdown"
+        )
+        return MarkdownContentExtractor()
+    logger.warning(
+        "Extractor desconocido %r; se usa el extractor markdown",
+        settings.retrieval_extractor,
+    )
+    return MarkdownContentExtractor()
+
+
+def read_pdf(body: bytes) -> "PdfReader":
+    """Parse ``body`` as a PDF, raising :class:`ExtractError` when it is malformed.
+
+    Shared with the unstructured extractor: both need the page count before deciding
+    what to convert, and both report a corrupt file the same way.
+    """
+    from pypdf import PdfReader
+
+    try:
+        reader = PdfReader(BytesIO(body))
+        len(reader.pages)  # the page tree is parsed lazily; force it here
+    except Exception as exc:  # malformed PDF
+        raise ExtractError(f"No se pudo leer el PDF: {exc}") from exc
+    return reader
+
+
+def check_page(page: int, total: int) -> None:
+    """Raise :class:`PageNotFoundError` when ``page`` (1-based) is outside the document."""
+    if not 1 <= page <= total:
+        raise PageNotFoundError(
+            f"La página {page} no existe (el documento tiene {total} página(s))"
+        )
+
+
+def slice_page(reader: "PdfReader", page: int) -> bytes:
+    """The one-page PDF holding ``page`` (1-based) of ``reader``.
+
+    Slicing is what attributes extracted text to a page: neither MarkItDown nor a
+    whole-file partition tells us which page a line came from.
+    """
+    from pypdf import PdfWriter
+
+    writer = PdfWriter()
+    writer.add_page(reader.pages[page - 1])
+    sliced = BytesIO()
+    writer.write(sliced)
+    return sliced.getvalue()
+
+
 class MarkdownContentExtractor:
     """Convert a ``FetchedDocument`` to markdown, selecting the requested PDF page.
 
@@ -124,7 +201,7 @@ class MarkdownContentExtractor:
             raise ExtractError(f"Tipo de documento no soportado: {document.doc_type}")
 
         # Strip images and links before segmenting so no sentence is built out of markup.
-        blocks = [(page, _strip_markup(markdown).strip()) for page, markdown in pages]
+        blocks = [(page, strip_markup(markdown).strip()) for page, markdown in pages]
         sentences: list[Sentence] = []
         for page, block in blocks:
             for sentence in split_sentences(block):
@@ -140,26 +217,15 @@ class MarkdownContentExtractor:
         Each page is sliced into its own one-page document with ``pypdf`` before conversion,
         which is what attributes a sentence to a page. A PDF with no pages yields ``[]``.
         """
-        from pypdf import PdfReader, PdfWriter
-
-        try:
-            reader = PdfReader(BytesIO(body))
-            total = len(reader.pages)
-        except Exception as exc:  # malformed PDF
-            raise ExtractError(f"No se pudo leer el PDF: {exc}") from exc
-        if page is not None and not 1 <= page <= total:
-            raise PageNotFoundError(
-                f"La página {page} no existe (el documento tiene {total} página(s))"
-            )
+        reader = read_pdf(body)
+        total = len(reader.pages)
+        if page is not None:
+            check_page(page, total)
         numbers = [page] if page is not None else range(1, total + 1)
-        converted: list[tuple[int, str]] = []
-        for number in numbers:
-            writer = PdfWriter()
-            writer.add_page(reader.pages[number - 1])
-            sliced = BytesIO()
-            writer.write(sliced)
-            converted.append((number, self._convert(sliced.getvalue(), ".pdf")))
-        return converted
+        return [
+            (number, self._convert(slice_page(reader, number), ".pdf"))
+            for number in numbers
+        ]
 
     def _convert(self, body: bytes, file_extension: str) -> str:
         """Convert ``body`` to markdown via the injected converter or MarkItDown."""
@@ -180,7 +246,7 @@ class MarkdownContentExtractor:
         return result.text_content
 
 
-def _strip_markup(markdown: str) -> str:
+def strip_markup(markdown: str) -> str:
     """Remove image and link markup from ``markdown``.
 
     Images (markdown and raw ``<img>``) go entirely, and so does every link — markdown links,

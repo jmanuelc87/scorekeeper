@@ -28,10 +28,12 @@ from scorekeeper.db.models import (
     UseCase,
 )
 from scorekeeper.db.repositories.embeddings import (
+    _add_neighbors,
     _top_k_stmt,
     chunks_for_turn,
     has_chunks,
 )
+from scorekeeper.core.retrieved_context import Chunk
 
 _QUERY = [0.0, 1.0]
 
@@ -132,6 +134,65 @@ async def test_has_chunks(session: AsyncSession) -> None:
 
     assert await has_chunks(session, chunked.id) is True
     assert await has_chunks(session, bare.id) is False
+
+
+# -- the neighbour window ---------------------------------------------------------------------
+#
+# ``chunks_for_turn`` only widens on the ranked (PostgreSQL) path — outside it every chunk is
+# already returned — but the widening itself is ordinary ``chunk_index`` SQL, so it runs here.
+
+
+async def test_a_hit_is_widened_to_the_chunks_either_side(session: AsyncSession) -> None:
+    _, (doc,) = await _turn_with_chunks(session, [["c0", "c1", "c2", "c3", "c4"]])
+    chunks = {doc.id: [Chunk(index=2, text="c2")]}
+
+    await _add_neighbors(session, chunks, 1)
+
+    assert [(c.index, c.text) for c in chunks[doc.id]] == [(1, "c1"), (2, "c2"), (3, "c3")]
+
+
+async def test_the_window_stops_at_the_documents_edges(session: AsyncSession) -> None:
+    """An index past either end matches no row, so no bounds are needed."""
+    _, (doc,) = await _turn_with_chunks(session, [["c0", "c1", "c2"]])
+    chunks = {doc.id: [Chunk(index=0, text="c0")]}
+
+    await _add_neighbors(session, chunks, 2)
+
+    assert [c.index for c in chunks[doc.id]] == [0, 1, 2]
+
+
+async def test_adjacent_hits_share_their_window_without_duplicating(
+    session: AsyncSession,
+) -> None:
+    _, (doc,) = await _turn_with_chunks(session, [["c0", "c1", "c2", "c3"]])
+    chunks = {doc.id: [Chunk(index=1, text="c1"), Chunk(index=2, text="c2")]}
+
+    await _add_neighbors(session, chunks, 1)
+
+    assert [c.index for c in chunks[doc.id]] == [0, 1, 2, 3]
+
+
+async def test_the_window_never_crosses_into_another_document(
+    session: AsyncSession,
+) -> None:
+    _, (a, b) = await _turn_with_chunks(session, [["a0", "a1"], ["b0", "b1"]])
+    chunks = {a.id: [Chunk(index=0, text="a0")]}
+
+    await _add_neighbors(session, chunks, 1)
+
+    assert [c.text for c in chunks[a.id]] == ["a0", "a1"]
+    assert b.id not in chunks
+
+
+async def test_neighbours_are_ignored_on_the_degraded_path(session: AsyncSession) -> None:
+    """Outside PostgreSQL every chunk is returned already; widening would be a no-op."""
+    turn, (doc,) = await _turn_with_chunks(session, [["uno", "dos", "tres"]])
+
+    chunks = await chunks_for_turn(
+        session, turn_id=turn.id, query_embedding=_QUERY, k=1, neighbors=1
+    )
+
+    assert [c.index for c in chunks[doc.id]] == [0, 1, 2]
 
 
 # -- the PostgreSQL statement ----------------------------------------------------------------
