@@ -13,8 +13,10 @@ How it retrieves depends on what the authorize stage produced for the host:
 
 A public GET also **confirms the document type**: the locator's ``DocType`` is derived from
 the URL alone (and is merely provisional for an extensionless web page), so the response's
-``Content-Type`` overrides it when it names a type we convert. An authenticated download
-surfaces no ``Content-Type``, so a gated document keeps the locator's type.
+``Content-Type`` overrides it when it names a type we convert, and an ``image/*`` response
+(an ``.svg`` chart endpoint, say) downgrades it to ``UNKNOWN`` so it is never converted. An
+authenticated download surfaces no ``Content-Type``, so a gated document keeps the locator's
+type.
 
 Public GETs are restricted to **globally routable** targets: redirects are followed by hand
 so every hop is checked, and a host resolving to a loopback, private, link-local, reserved
@@ -207,10 +209,19 @@ def _confirmed_doc_type(content_type: str | None, provisional: DocType) -> DocTy
     The header wins over the URL — an extensionless page URL arrives here as a provisional
     ``HTML``, and a ``.pdf`` URL that actually served an HTML error page is HTML. An absent
     or unrecognized media type leaves the provisional type alone.
+
+    **An image is the exception, and it is named rather than merely unrecognized.** An
+    extensionless URL is provisionally ``HTML``, so a chart endpoint answering
+    ``image/svg+xml`` (or any other ``image/*``) would otherwise be converted as a web page:
+    an SVG is XML, and a converter would mine it for stray ``<text>`` fragments and store
+    that as retrieved context. There is no text in an image to ground an answer, so the type
+    is downgraded to ``UNKNOWN`` and the reference ends as ``UNSUPPORTED_TYPE``.
     """
     if not content_type:
         return provisional
     media_type = content_type.split(";", 1)[0].strip().lower()
+    if media_type.startswith("image/"):
+        return DocType.UNKNOWN
     return _MEDIA_TYPES.get(media_type, provisional)
 
 

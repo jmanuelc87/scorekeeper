@@ -169,10 +169,25 @@ async def test_unknown_or_absent_content_type_keeps_the_locator_type(tmp_path: P
     )
     assert absent.doc_type is DocType.HTML
 
-    unmapped = await _fetcher(tmp_path, session, _FakeHttp(content_type="image/png")).fetch(
+    unmapped = await _fetcher(tmp_path, session, _FakeHttp(content_type="text/plain")).fetch(
         _loc("https://pub/otra", DocType.HTML), None
     )
     assert unmapped.doc_type is DocType.HTML
+
+
+@pytest.mark.parametrize("content_type", ["image/svg+xml", "image/png", "IMAGE/JPEG"])
+async def test_an_image_response_is_not_treated_as_a_web_page(
+    content_type: str, tmp_path: Path, session: AsyncSession
+) -> None:
+    """An extensionless chart endpoint is provisionally HTML; its bytes are not a page.
+
+    Converting an SVG as HTML would mine it for stray ``<text>`` fragments and store that
+    as retrieved context, so the type is downgraded and the reference ends UNSUPPORTED_TYPE.
+    """
+    fetched = await _fetcher(tmp_path, session, _FakeHttp(content_type=content_type)).fetch(
+        _loc("https://pub/grafico", DocType.HTML), None
+    )
+    assert fetched.doc_type is DocType.UNKNOWN
 
 
 async def test_html_response_overrides_a_pdf_url(tmp_path: Path, session: AsyncSession) -> None:
