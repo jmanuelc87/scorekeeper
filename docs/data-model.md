@@ -399,12 +399,19 @@ is the granularity a chunker groups into embedding rows — see
 [Retrieval pipeline → Sentences](retrieval-pipeline.md#sentences). The cost is that a document's
 text is stored roughly twice (once as `content`, once across `sentences`).
 
+An `atomic` sentence is a rendered table, and under the `unstructured` extractor its `text`
+opens with an LLM-generated caption describing the grid — see
+[Retrieval pipeline → Table descriptions](retrieval-pipeline.md#table-descriptions). It is
+stored inside the sentence rather than in a field of its own precisely so it reaches the chunk
+a judge reads.
+
 ### RetrievedDocumentEmbedding
 
 One chunk of a retrieved document, with its embedding — **the document's only stored
 text**, one row per overlapping sentence window in `chunk_index` order. At scoring time a
-judge is handed only the `embedding_top_k` chunks closest to the turn's prompt, so it
-never sees a whole document.
+judge is handed only the `embedding_top_k` chunks closest to the turn's response — each
+widened to the `embedding_context_neighbors` chunks either side of it — so it never sees a
+whole document.
 
 | Column | Type | Notes |
 | --- | --- | --- |
@@ -425,8 +432,9 @@ page is the *first* sentence's: a window of several sentences can straddle a pag
 and only one page is kept, so such a chunk is filed under the page its head came from.
 
 Read back by `db.repositories.embeddings.chunks_for_turn`, which ranks the chunks of each
-document against the turn's prompt **in SQL** (`ORDER BY embedding <=> :q LIMIT :k`, one
-`LATERAL` per document) and never selects the vector itself. A chunk with a `NULL`
+document against the turn's response **in SQL** (`ORDER BY embedding <=> :q LIMIT :k`, one
+`LATERAL` per document), widens each hit into the `chunk_index` window
+`[n-p … n … n+p]` with a second plain statement, and never selects the vector itself. A chunk with a `NULL`
 embedding sorts last and may fall outside the top-`k`, so a partially embedded document can
 be truncated — see
 [Retrieval pipeline → What the judge reads](retrieval-pipeline.md#what-the-judge-reads) for
@@ -440,7 +448,7 @@ Written by the **embedding phase** (`scorekeeper.core.services.embedding`), whic
 
 **`embedding` is nullable because chunking and embedding are separable.** The chunks are
 the document's only text, so they are written whatever happens; the vector is the
-enrichment that lets scoring narrow them to the turn's prompt. A deployment with no
+enrichment that lets scoring narrow them to the turn's response. A deployment with no
 `openai_api_key` stores chunks with a `NULL` embedding, and a judge still reads the whole
 document — only the narrowing is lost.
 

@@ -49,7 +49,7 @@ is performed inside the `ContentExtractor` (see [Extract](#extract)).
 | locate | `DocumentLocatorResolver` | `SourceRef` → `DocumentLocator` | Derive the document URL (minus fragment), filename, `DocType`, scheme, host, and page/section from a `#page=N` fragment. |
 | authorize | `AuthProvider` | `DocumentLocator` → `AuthDecision` (+ `client`) | Classify the auth requirement, resolve it against available credentials, and expose the generic `AuthClient`. |
 | fetch | `DocumentFetcher` | `DocumentLocator`, `AuthClient \| None` → `FetchedDocument` | Fetch the document bytes through the auth client (gated) or a public GET, cached on disk by `document_url`. |
-| filter + extract | `ContentExtractor` | `FetchedDocument`, `DocumentLocator` → `ExtractedContent` | Convert the document to markdown, selecting the requested page (titles/lists/tables; images and links dropped), and segment it into page-attributed sentences. Two backends: MarkItDown or the `unstructured-api` service. |
+| filter + extract | `ContentExtractor` | `FetchedDocument`, `DocumentLocator` → `ExtractedContent` | Convert the document to markdown, selecting the requested page (titles/lists/tables; images and links dropped), and segment it into page-attributed sentences. Two backends: MarkItDown or the `unstructured-api` service — the latter also describes each table with an LLM. |
 | assemble | `RetrievalReport.to_context` | outcomes → `RetrievedContext` | Collect the successfully-retrieved documents, in rank order; they persist as [`RetrievedDocument`](data-model.md#retrieveddocument) child rows of the turn. |
 | embed | `Embedder` | `Sentence` list → chunk rows | Group the sentences into overlapping chunks and embed each one; see [Embedding](#embedding). A phase of its own, after retrieval and before scoring. |
 
@@ -204,6 +204,9 @@ Three things it buys over MarkItDown:
   sentence**, which the chunker never splits — see [Embedding](#embedding). Under `fast` the
   service often infers no table structure and `text_as_html` is absent; the element's own
   flattened text is then used, so the table win is largely a `hi_res` win.
+- **Tables arrive with their subject.** Each rendered table is described by Claude, and the
+  description is stored as the line above the grid — see
+  [Table descriptions](#table-descriptions).
 - **Pages come from the document.** A PDF referenced without `#page=N` is converted in **one**
   request instead of one per page, and a table straddling a page break is no longer cut at the
   boundary. With `#page=N` the page is still sliced out with `pypdf` first — posting a 300-page
@@ -227,6 +230,47 @@ document.
 
 Every service failure — connection, timeout, HTTP status, unparseable body — surfaces as
 `ExtractError`, which the orchestrator records as `FETCH_FAILED` against that one reference.
+
+### Table descriptions
+
+A grid on its own grounds badly. `| Norte | 10 | 12 |` names no unit, no period and no
+subject: the caption, the scale and the thing being counted live in prose the chunker filed
+somewhere else, and the table is an `atomic` sentence precisely so it never travels with its
+neighbours. So `UnstructuredContentExtractor` asks **Claude Haiku 4.5** for a description of
+each rendered table — *«Crea una descripcion de la siguiente tabla en no mas de 400
+caracteres:»*, followed by the pipe table — and stores the answer **with the table**, as an
+italic caption line above the grid:
+
+```markdown
+*Ingresos trimestrales por región, en millones de pesos, 2024.*
+
+| Región | Q1 | Q2 |
+| --- | --- | --- |
+| Norte | 10 | 12 |
+```
+
+Storing it *inside* the sentence rather than beside it is the whole point: the chunk a judge
+reads is the sentence's text, so a description on a separate field would be written, stored,
+and never seen. Nothing downstream changes — no new column, no migration, no chunker change.
+
+`scorekeeper.core.retrieval.describe` runs the call through the **Claude Agent SDK**, the same
+seam `metrics.judges.agent_judge` drives: no tools, one turn, JSON-schema output, and the
+bundled Claude Code CLI authenticating with the local session or with `CLAUDE_CODE_OAUTH_TOKEN`
+where there is none. Haiku 4.5 is pinned rather than configurable, and no `thinking` parameter
+is sent — that model rejects adaptive thinking with a 400.
+
+Three properties worth knowing before turning `retrieval_extractor=unstructured` on:
+
+- **One call per table, always.** There is no enable switch. A document of fifty tables costs
+  fifty Haiku calls, made sequentially inside the thread `extract` already occupies.
+- **Best-effort in every direction.** A missing SDK, a CLI error, a timeout, or output off the
+  schema logs a warning and leaves that table undescribed — byte-identical to what the stage
+  produced before. There is deliberately **no retry**: a description is enrichment, and a
+  backoff loop inside the extract stage would slow every retrieval to rescue a caption.
+- **It counts against the chunk budget.** A split table repeats the description on *every*
+  piece (each piece is a standalone table a judge may read alone), so `extract_table_max_chars`
+  is reduced by the caption's length before the split — the limit bounds one embedding input,
+  and the caption is part of that input.
 
 ### Sentences
 
@@ -256,8 +300,12 @@ A phase of its own between retrieval and scoring
   stage marked **`atomic`** — a rendered table — is a hard boundary: it becomes a window of
   its own and never shares one with a neighbour, because half a grid grounds nothing and the
   overlap that rescues a straddling claim does not apply to a table. A rendered table longer
-  than `extract_table_max_chars` is split by rows instead, each piece repeating the header,
-  since one chunk is also one embedding input and an oversized one fails the whole batch. The overlap is what keeps
+  than `extract_table_max_chars` is split by rows instead, since one chunk is also one
+  embedding input and an oversized one fails the whole batch — and that split overlaps too:
+  each piece repeats the header *and* the last `extract_table_overlap_rows` rows of the
+  previous piece, so a row that only means something read against the one above it survives
+  in at least one piece. Carried rows are dropped when they would leave no room for a new
+  row, so the split always advances. The overlap is what keeps
   a claim straddling a chunk boundary readable in at least one chunk. An overlap not
   smaller than the window would never advance, and is rejected. Each window carries **where
   it came from**, not just its text — otherwise grouping would throw away the page the
@@ -289,10 +337,36 @@ re-embeds nothing.
 
 ### What the judge reads
 
-At scoring time `EvalRunner` embeds the turn's **prompt** once, and each document keeps
-only its `embedding_top_k` chunks closest to it by cosine, put back in `chunk_index`
+At scoring time `EvalRunner` embeds the turn's **response** once, and each document keeps
+only its `embedding_top_k` chunks closest to it by cosine, **each widened to the
+`embedding_context_neighbors` chunks either side of it**, put back in `chunk_index`
 order — a judge reads a document in its own order, never shuffled by relevance. That is
 the whole point of the phase: a 300-page PDF no longer enters every judge prompt in full.
+
+**Ranking and reading are not the same set.** Similarity picks the chunk a claim resembles
+most, but a claim rarely begins exactly where a chunk does — its subject can sit in the
+chunk before and its qualifier in the one after. So a hit at index `n` is read as the
+window `[n-p … n-1, n, n+1 … n+p]`, `p` = `embedding_context_neighbors`. The neighbours are
+fetched **because they adjoin a hit**, by a second ordinary statement over `chunk_index`
+(never re-ranked, and never touching the vector index), so a window costs one extra
+round-trip and no extra distance computation. Windows that meet are merged and duplicates
+dropped, and an index past either end of the document simply matches no row — so a
+document returns at most `embedding_top_k * (2p + 1)` chunks and usually fewer. That
+ceiling is the cost to weigh: `p` multiplies what enters the judge prompt, so raising it
+trades tokens for the chance that a straddling claim stays checkable.
+
+This is a second, coarser layer of the same idea as the sentence overlap: `chunk_sentences`
+overlaps *stored* windows by `embedding_chunk_overlap` sentences, and this overlaps *read*
+windows by whole chunks. The stored overlap is paid once at embed time and bounded by the
+chunk size; the read overlap is paid per judge call and reaches as far as `p` chunks.
+
+**The answer is the query, not the question.** The chunks are what a judge checks the
+answer against, so the passage a claim actually cites matters more than the one the
+question happened to word — a passage the answer draws on but the question does not
+resemble is no longer narrowed away before `faithfulness` can check it. The cost is that
+the narrowing now depends on the text under evaluation: a hallucinated answer pulls the
+chunks that most resemble *it*, and an answer that cites nothing narrows on nothing in
+particular.
 
 **Documents are never reordered.** Only the chunks *within* a document are narrowed;
 the documents keep their `rank`, which is the *platform's* retriever order and the thing
@@ -310,7 +384,7 @@ CROSS JOIN LATERAL (
     SELECT e.chunk_index, e.content
     FROM retrieved_document_embeddings e
     WHERE e.retrieved_document_id = d.id
-    ORDER BY e.embedding <=> :prompt_embedding
+    ORDER BY e.embedding <=> :response_embedding
     LIMIT :k
 ) s
 WHERE d.turn_id = :turn_id
@@ -339,7 +413,7 @@ follow, and both are worth knowing before claiming the index is doing work:
 **Outside PostgreSQL there is no ranking.** The SQLite fallback has no `<=>`
 (`EmbeddingColumn` degrades to JSON), so every chunk is returned in `chunk_index` order —
 the same degradation `db.connection.run_lock` applies to advisory locks. The same happens
-whenever there is no prompt embedding to rank against: no `openai_api_key`, or an embedding
+whenever there is no response embedding to rank against: no `openai_api_key`, or an embedding
 call that failed. Handing a judge the whole document beats handing it nothing.
 
 ## Assemble
