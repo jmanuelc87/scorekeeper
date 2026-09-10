@@ -85,8 +85,10 @@ metric catalog). A provider turns the row into a backend-agnostic **`AuthClient`
 generic client the fetch stage retrieves through, so the pipeline never names SharePoint.
 The one concrete provider is **SharePoint** (`credentials/catalog/sharepoint.py`), which
 authenticates with an Azure AD **client certificate**:
-`ClientContext(site_url).with_client_certificate(tenant, client_id, thumbprint, private_key)`.
-The certificate private key is stored **encrypted** on the row (a Fernet token plus a per-row
+`ClientContext(site).with_client_certificate(tenant, client_id, thumbprint, private_key)`,
+where `site` is the site collection of the **document's own URL** — the row supplies
+credentials, not a base URL, so a `/personal/…` reference is not fetched against a
+configured `/sites/…` API. The certificate private key is stored **encrypted** on the row (a Fernet token plus a per-row
 salt; see `credentials/secrets.py`) and decrypted with the deployment master secret
 (`AUTH_ENCRYPTION_KEY`) only when a client is built. Without that key (or with no configured
 row), gated documents resolve to `AUTH_MISSING`. The `office365` SDK ships in the optional

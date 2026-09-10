@@ -754,8 +754,8 @@ class AuthProviderConfig(Base):
         tenant_id: str,
         client_id: str,
         thumbprint: str,
-        site_url: str,
         private_key: str,
+        site_url: str | None = None,
         encryption_key: str,
         enabled: bool = True,
     ) -> "AuthProviderConfig":
