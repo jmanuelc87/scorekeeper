@@ -580,7 +580,7 @@ non-secret identifiers. Shipped kinds: `sharepoint` (client certificate) and `oa
 | `provider` | String(64) | Credential-provider *kind* (`sharepoint`, `oauth2`). Unique together with `host`. |
 | `host` | String(256) | Gated host this row authorizes (indexed). Matches a locator host equal to it or a subdomain of it. |
 | `enabled` | Boolean | Whether the row is active (default `true`). Disabled rows are ignored. |
-| `tenant_id` / `client_id` / `thumbprint` / `site_url` | String | Non-secret identifiers. SharePoint uses all four; `oauth2` uses `client_id`. Nullable per kind. |
+| `tenant_id` / `client_id` / `thumbprint` / `site_url` | String | Non-secret identifiers. SharePoint requires the first three; `oauth2` uses `client_id`. `site_url` is descriptive only — the fetch stage roots its `ClientContext` at the document URL's own site. Nullable per kind. |
 | `private_key_encrypted` | Text | The row's encrypted secret (Fernet token) — cert private key or OAuth2 client secret; `NULL` when none stored. |
 | `private_key_salt` | Text | Per-row base64 salt used to derive the encryption key. |
 | `settings` | JSON / JSONB | Kind-specific non-secret config (e.g. OAuth2 `token_url` / `scope`) and overflow for fields that don't map onto the columns above. |

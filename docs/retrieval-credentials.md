@@ -49,7 +49,7 @@ needs. Clients are built lazily and cached per host. The shipped clients are:
 
 | `AuthClient` | `kind` | Backend / `download` |
 | --- | --- | --- |
-| `SharePointClient` | `sharepoint` | office365 `ClientContext`; streams the file by server-relative URL |
+| `SharePointClient` | `sharepoint` | office365 `ClientContext`, rooted at the **document URL's own site**; streams the file by server-relative URL |
 | `OAuth2Client` | `oauth2` | `httpx2` GET with an `Authorization: Bearer` token from the client-credentials grant |
 
 ```mermaid
@@ -111,17 +111,25 @@ A wrong or missing master key raises `SecretError`, which the authorize stage re
 (`kind = "sharepoint"`). It authenticates with an Azure AD app **client certificate**:
 
 ```python
-ClientContext(site_url).with_client_certificate(
+ClientContext(site).with_client_certificate(
     tenant=..., client_id=..., thumbprint=..., private_key=...
 )
 ```
 
-`build_client` validates the required fields (`tenant_id`, `client_id`, `thumbprint`,
-`site_url`), decrypts the private key with `AUTH_ENCRYPTION_KEY`, and returns a
-`SharePointClient` wrapping the authenticated `ClientContext`. Its `download` resolves the
-located document to a server-relative URL and streams the bytes through that context. The
-`office365` SDK is imported **lazily** and ships in the optional `retrieval` extra, so the
-taxonomy stays importable (and testable) without it — a missing SDK raises `CredentialError`.
+`build_client` validates the required fields (`tenant_id`, `client_id`, `thumbprint`),
+decrypts the private key with `AUTH_ENCRYPTION_KEY`, and returns a `SharePointClient` holding
+that certificate. Its `download` resolves the located document to a server-relative URL and
+streams the bytes through that context. The `office365` SDK is imported **lazily** and ships in
+the optional `retrieval` extra, so the taxonomy stays importable (and testable) without it — a
+missing SDK raises `CredentialError`.
+
+**The document URL decides the site; the row decides only the credentials.** SharePoint scopes
+`_api` to a site collection, so `site` above is derived from `locator.document_url` — its
+managed-path prefix (`/sites/x`, `/teams/x`, `/personal/x`) or, failing that, the bare host. The
+row's `site_url` is **not** used: prefixing one configured site collection onto every
+reference's path would send a `/personal/…` document at a `/sites/…` API. It is therefore
+**optional**, kept only as a descriptive field. Contexts are built on first use and cached per
+site root, so the certificate handshake happens once per site rather than once per document.
 
 ## The OAuth2 provider
 
@@ -154,7 +162,6 @@ lazily; injectable in tests), so no extra install is needed.
            tenant_id="<tenant-guid>",
            client_id="<app-client-id>",
            thumbprint="<cert-thumbprint>",
-           site_url="https://cognitactix-my.sharepoint.com/sites/x",
            private_key=open("sp-cert.pem").read(),
            encryption_key=get_settings().auth_encryption_key,
        ))
