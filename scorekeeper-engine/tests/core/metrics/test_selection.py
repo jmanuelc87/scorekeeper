@@ -254,8 +254,8 @@ async def test_sync_prompts_materializes_every_declared_slot(
 
     assert await _slots(db_session) == {
         "contextual_precision": ["verdict"],
-        "faithfulness_deepeval": ["generate_truths", "verify"],
-        "faithfulness_ragas": ["verify"],
+        "faithfulness_deepeval": ["extract_claims", "generate_truths", "verify"],
+        "faithfulness_ragas": ["extract_claims", "verify"],
         "hallucination": ["nli"],
     }
 
@@ -294,7 +294,7 @@ async def test_sync_prompts_is_idempotent(
     await _sync_all(db_session)
 
     count = (await db_session.execute(select(func.count(Prompt.id)))).scalar_one()
-    assert count == 5  # the fixture registry omits AnswerRelevance; production has 6
+    assert count == 7  # the fixture registry omits AnswerRelevance; production has 6
 
 
 async def test_sync_prompts_refreshes_a_changed_contract(
@@ -306,7 +306,7 @@ async def test_sync_prompts_refreshes_a_changed_contract(
         await db_session.execute(
             select(Prompt)
             .join(MetricDefinition, MetricDefinition.id == Prompt.metric_id)
-            .where(MetricDefinition.name == "faithfulness_ragas")
+            .where(MetricDefinition.name == "faithfulness_ragas", Prompt.slug == "verify")
         )
     ).scalars().one()
     row.required_variables = ["obsoleta"]
@@ -363,17 +363,33 @@ async def test_active_templates_returns_the_active_version(
         await db_session.execute(
             select(Prompt)
             .join(MetricDefinition, MetricDefinition.id == Prompt.metric_id)
-            .where(MetricDefinition.name == "faithfulness_ragas")
+            .where(MetricDefinition.name == "faithfulness_ragas", Prompt.slug == "verify")
         )
     ).scalars().one()
-    db_session.add(
-        PromptVersion(
-            prompt_id=prompt.id,
-            version=7,
-            template="Afirmación: {claim}",
-            status="published",
-            is_active=True,
+    extract = (
+        await db_session.execute(
+            select(Prompt)
+            .join(MetricDefinition, MetricDefinition.id == Prompt.metric_id)
+            .where(MetricDefinition.name == "faithfulness_ragas", Prompt.slug == "extract_claims")
         )
+    ).scalars().one()
+    db_session.add_all(
+        [
+            PromptVersion(
+                prompt_id=prompt.id,
+                version=7,
+                template="Afirmación: {claim}",
+                status="published",
+                is_active=True,
+            ),
+            PromptVersion(
+                prompt_id=extract.id,
+                version=1,
+                template="Extrae",
+                status="published",
+                is_active=True,
+            ),
+        ]
     )
     await db_session.flush()
 
@@ -392,7 +408,7 @@ async def test_active_templates_ignores_inactive_versions(
         await db_session.execute(
             select(Prompt)
             .join(MetricDefinition, MetricDefinition.id == Prompt.metric_id)
-            .where(MetricDefinition.name == "faithfulness_ragas")
+            .where(MetricDefinition.name == "faithfulness_ragas", Prompt.slug == "verify")
         )
     ).scalars().one()
     db_session.add(
@@ -415,6 +431,7 @@ async def test_active_templates_lists_every_missing_slot_at_once(
     with pytest.raises(MissingPromptError) as exc:
         await active_templates(db_session, ["faithfulness_deepeval"])
 
+    assert "faithfulness_deepeval.extract_claims" in str(exc.value)
     assert "faithfulness_deepeval.generate_truths" in str(exc.value)
     assert "faithfulness_deepeval.verify" in str(exc.value)
 

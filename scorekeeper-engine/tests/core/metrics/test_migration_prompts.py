@@ -155,7 +155,7 @@ async def test_seed_rejects_a_metric_with_no_row(session: AsyncSession) -> None:
 # d7f2b6c1a840 writes into tables that already hold rows, so unlike the catalog seed
 # it must create the metric rows it needs and skip a slot that is already stored.
 
-_RUBRICS = MODULES[-1]
+_RUBRICS = MODULES[1]
 
 
 async def test_rubric_seed_creates_its_own_metric_rows(session: AsyncSession) -> None:

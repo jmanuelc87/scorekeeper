@@ -23,8 +23,8 @@ It works in two stages:
 Nodes come from the turn's structured ``retrieved_context`` documents, in retriever
 rank order, each rendered to node text (source ``document`` + ``content``) by
 ``RetrievedContext.node_texts`` (the same node convention the hallucination metric
-uses). Labeling is a *classification* step, so it goes through the judge's
-``structured()`` seam rather than ``score()``. With no relevant node the score is
+uses). Labeling is a yes/no decision, so it goes through the judge's ``decide()``
+seam rather than ``score()``. With no relevant node the score is
 ``0.0`` — a real measurement of a failed retrieval; with no retrieved context at
 all there is no ranking to measure, so the metric returns ``NOT_APPLICABLE`` and
 rollup leaves it out of the averages. All prompts and justification output are
@@ -32,8 +32,6 @@ Spanish.
 """
 
 from __future__ import annotations
-
-from pydantic import BaseModel
 
 from scorekeeper.core.metrics.base import (
     NOT_APPLICABLE,
@@ -49,13 +47,6 @@ from scorekeeper.core.metrics.judge import Judge, JudgeStep
 from scorekeeper.core.metrics.prompts import PromptSlot, safe_format
 from scorekeeper.core.metrics.registry import register
 from scorekeeper.core.metrics.scale import Unit
-
-
-class RelevanceVerdict(BaseModel):
-    """The judge's binary relevance verdict for one retrieved node."""
-
-    relevant: bool
-    justification: str  # Spanish rationale
 
 
 @register
@@ -107,24 +98,24 @@ class ContextualPrecision(MultiStepMetric):
         verdicts: list[int] = []
         label_step = TraceStep(label="Relevancia por nodo")
         node_view = TurnView(prompt=turn.prompt, response="")
-        judge_model = judge.model_for(JudgeStep.EXTRACT)
         template = self.prompt("verdict")
         for k, node in enumerate(nodes, start=1):
-            verdict = judge.structured(
+            verdict = judge.decide(
                 instruction=safe_format(
                     template, expected_output=turn.expected_output, node=node
                 ),
                 turn=node_view,
-                schema=RelevanceVerdict,
                 step=JudgeStep.EXTRACT,
-                model=judge_model,
             )
-            r_k = 1 if verdict.relevant else 0
+            # The decision reports the model that answered it (a decision judge may
+            # not be the step-routed one); every node runs on the same.
+            judge_model = verdict.model
+            r_k = 1 if verdict.value else 0
             verdicts.append(r_k)
             label_step.entries.append(
                 TraceEntry(
                     label=f"Nodo {k}",
-                    value=verdict.relevant,
+                    value=verdict.value,
                     justification=verdict.justification,
                     metadata={"rank": k},
                 )

@@ -130,10 +130,9 @@ See [Faithfulness (RAGAS)](./faithfulness-ragas.md).
 Three divergences from the canonical pseudocode, none affecting the score's
 meaning:
 
-1. **Claims are split deterministically.** `generate_claims` is not an LLM call —
-   the implementation uses `split_sentences()` (the `syntok` sentence segmenter),
-   *one sentence of the answer is one claim*. Truths extraction (Step 1) is still
-   a judge call.
+1. **Claims come from a prompt slot.** `generate_claims` is the `extract_claims`
+   slot, run through `judge.structured()`; truths extraction (Step 1) is the
+   `generate_truths` slot.
 2. **Order, not concurrency.** The pseudocode extracts truths and claims
    concurrently. The implementation extracts **claims first** so the no-claims
    case short-circuits *before* paying for the (LLM-based) truths extraction —

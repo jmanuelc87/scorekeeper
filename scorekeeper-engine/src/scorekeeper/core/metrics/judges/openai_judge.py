@@ -15,6 +15,7 @@ from scorekeeper.core.metrics.judge import JudgeStep, JudgeVerdict
 from scorekeeper.core.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
     StepModels,
+    StructuredDecisions,
     _ScoreResponse,
     clamp,
     judge_call,
@@ -47,7 +48,7 @@ KNOWN_EMBEDDING_MODELS = frozenset(
 )
 
 
-class OpenAIJudge:
+class OpenAIJudge(StructuredDecisions):
     """Score turns with an OpenAI chat model via structured (JSON-schema) output.
 
     ``client`` may be injected (tests); otherwise a real ``openai.OpenAI`` is built

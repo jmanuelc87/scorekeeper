@@ -129,17 +129,17 @@ VERIFY_RAGAS = '''\
 Devuelve:
 - entailed: true si la afirmación se deduce del contexto, false si no se deduce o lo \
 contradice.
-- confidence: tu confianza en ese veredicto, un número entre 0.0 y 1.0 (1.0 = certeza total; \
-usa valores bajos si el contexto es ambiguo o insuficiente).
 - justification: una justificación breve en español.
 Contexto recuperado:
 {context}
 Afirmación: {claim}'''
 
 VERIFY_DEEPEVAL = '''\
-¿Las siguientes verdades contradicen la afirmación? Asigna 0 SOLO si las verdades contradicen \
-directamente la afirmación. Asigna 1 si la afirmación concuerda con las verdades o si no se \
-menciona (no verificable). Justifica brevemente en español.
+¿La afirmación concuerda con las verdades o no se menciona en ellas?
+Responde:
+- true si la afirmación concuerda con las verdades o no se menciona (no verificable pero no contradice).
+- false solo si las verdades la contradicen directamente.
+Justifica brevemente en español.
 Verdades:
 {truths}
 Afirmación: {claim}'''

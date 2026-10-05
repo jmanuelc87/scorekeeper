@@ -97,17 +97,17 @@ class Settings(BaseSettings):
     # support the feature, so it is inert while the judge runs on Opus 4.8. The model
     # must be one the Anthropic judge owns. None disables the parameter entirely.
     judge_fallback_model: str | None = "claude-opus-5"
-    # Model pins for the faithfulness_ragas entailment cascade: a cheap high-volume model
-    # decides every claim, and only verdicts it reports below escalation_confidence are
-    # re-judged by the decisive one. Both must be models the Anthropic judge owns.
-    faithfulness_bulk_model: str = "claude-sonnet-5"
-    faithfulness_audit_model: str = "claude-opus-5"
     # Override the judge system prompt at runtime; None uses the built-in default.
     judge_system_prompt: str | None = None
     # Trace every LLM API call the judge makes (op, model, step, turn, sizes,
     # latency, outcome) to the ``scorekeeper.core.metrics.judges.tracing`` logger. Purely
     # observational — wraps the judge in a TracingJudge and never alters scoring.
     judge_trace_enabled: bool = False
+    # TypeSafe's Jev decision model (scorekeeper.core.metrics.judges.typesafe_judge). With a
+    # key set, the provider judge is wrapped so the RAG metrics' yes/no and multiple-choice
+    # decisions run on Jev; without one they stay on the provider judge's own model.
+    typesafe_api_key: str | None = None
+    typesafe_judge_model: str = "jev-latest"
 
     # Local filesystem directory for the retrieval pipeline's fetch cache. Fetched document
     # bytes are stored here (indexed by the ``document_cache`` table) so a document is

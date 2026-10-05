@@ -16,13 +16,13 @@ import threading
 import time
 from collections.abc import Callable, Generator, Mapping
 from contextlib import contextmanager
-from typing import NamedTuple, TypeVar
+from typing import Literal, NamedTuple, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, create_model
 
 from scorekeeper.config.settings import get_settings
 from scorekeeper.core.metrics.base import TurnView
-from scorekeeper.core.metrics.judge import JudgeStep
+from scorekeeper.core.metrics.judge import JudgeChoice, JudgeDecision, JudgeStep
 from scorekeeper.core.metrics.scale import Boolean, Likert, Scale, Unit
 
 logger = logging.getLogger(__name__)
@@ -317,9 +317,13 @@ def _is_capacity_error(exc: Exception) -> bool:
     ``anthropic.APIStatusError`` and ``openai.APIStatusError`` expose it, and this module
     stays SDK-free (importable without the optional extras). Classifying by status and
     not by message text also means an unrelated error that merely *mentions* a rate limit
-    is still treated as permanent.
+    is still treated as permanent. ``typesafe_sdk.TypeSafeAPIError`` names the same
+    field ``status``, so that is read when ``status_code`` is absent.
     """
-    return getattr(exc, "status_code", None) in RETRYABLE_STATUSES
+    status = getattr(exc, "status_code", None)
+    if status is None:
+        status = getattr(exc, "status", None)
+    return status in RETRYABLE_STATUSES
 
 
 def _retry_after_seconds(exc: Exception) -> float | None:
@@ -459,6 +463,92 @@ class _ScoreResponse(BaseModel):
     justification: str  # Spanish rationale
 
 
+# Appended to a decision instruction for an LLM judge: the metric's template poses the
+# question, this fixes which way the boolean points and asks for a confidence.
+DECISION_INSTRUCTION_ES = (
+    "Responde la pregunta anterior con answer=true si la respuesta es sí o answer=false "
+    "si es no, indica tu confianza en ese veredicto entre 0.0 y 1.0 y da una "
+    "justificación breve en español."
+)
+CHOICE_INSTRUCTION_ES = (
+    "Elige exactamente una de las opciones permitidas, indica tu confianza en esa "
+    "elección entre 0.0 y 1.0 y da una justificación breve en español."
+)
+
+
+class _DecisionResponse(BaseModel):
+    """The structured result an LLM judge requests for a yes/no decision."""
+
+    answer: bool
+    confidence: float  # 0..1
+    justification: str  # Spanish rationale
+
+
+class StructuredDecisions:
+    """``decide``/``choose`` for an LLM judge, built on its own ``structured()``.
+
+    Mixed into the provider judges so every judge satisfies the decision half of the
+    seam: the decision is asked as a structured extraction on the model ``step``/
+    ``model`` resolve to, with no change to how that call is routed, recorded or
+    retried. A dedicated decision model replaces this by wrapping the judge (see
+    :class:`~scorekeeper.core.metrics.judges.typesafe_judge.TypesafeJudge`).
+    """
+
+    def decide(
+        self,
+        *,
+        instruction: str,
+        turn: TurnView,
+        step: JudgeStep | None = None,
+        model: str | None = None,
+    ) -> JudgeDecision:
+        model = self.resolve_model(step, model)
+        response = self.structured(
+            instruction=f"{instruction}\n\n{DECISION_INSTRUCTION_ES}",
+            turn=turn,
+            schema=_DecisionResponse,
+            step=step,
+            model=model,
+        )
+        return JudgeDecision(
+            value=response.answer,
+            confidence=min(max(response.confidence, 0.0), 1.0),
+            justification=response.justification,
+            model=model,
+        )
+
+    def choose(
+        self,
+        *,
+        instruction: str,
+        turn: TurnView,
+        options: Mapping[str, str | None],
+        step: JudgeStep | None = None,
+        model: str | None = None,
+    ) -> JudgeChoice:
+        model = self.resolve_model(step, model)
+        # The options become a Literal so structured output cannot leave the set.
+        schema = create_model(
+            "_ChoiceResponse",
+            choice=(Literal[tuple(options)], ...),
+            confidence=(float, ...),
+            justification=(str, ...),
+        )
+        response = self.structured(
+            instruction=f"{instruction}\n\n{CHOICE_INSTRUCTION_ES}",
+            turn=turn,
+            schema=schema,
+            step=step,
+            model=model,
+        )
+        return JudgeChoice(
+            choice=response.choice,
+            confidence=min(max(response.confidence, 0.0), 1.0),
+            justification=response.justification,
+            model=model,
+        )
+
+
 class ScaleSpec(NamedTuple):
     """A scale's numeric bounds plus a Spanish instruction describing its range."""
 
@@ -540,8 +630,16 @@ def render_prompt(instructions: str, turn: TurnView) -> str:
     ``answer_relevance.generate_question``, which must see the answer alone) is not
     handed the whole blob behind its back.
     """
-    parts = [_fill_placeholders(instructions, turn), "", "--- Turno a evaluar ---"]
-    parts.append(f"Número de turno: {turn.turn_number}")
+    return f"{_fill_placeholders(instructions, turn)}\n\n{render_turn(turn)}"
+
+
+def render_turn(turn: TurnView) -> str:
+    """The structured Spanish view of the turn — number, history, prompt, response.
+
+    The tail :func:`render_prompt` appends to every instruction; a decision judge sends
+    it on its own as the state the question is asked about.
+    """
+    parts = ["--- Turno a evaluar ---", f"Número de turno: {turn.turn_number}"]
     if turn.history:
         parts.append("Historial de la conversación:")
         for i, (prompt, response) in enumerate(turn.history, start=1):

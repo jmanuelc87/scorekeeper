@@ -27,9 +27,11 @@ from typing import TYPE_CHECKING, Any, TypeVar
 import structlog
 from pydantic import BaseModel
 
-from scorekeeper.core.metrics.judge import JudgeStep, JudgeVerdict
+from scorekeeper.core.metrics.judge import JudgeChoice, JudgeDecision, JudgeStep, JudgeVerdict
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+
     from scorekeeper.core.metrics.base import TurnView
     from scorekeeper.core.metrics.judge import Judge
     from scorekeeper.core.metrics.scale import Scale
@@ -48,7 +50,7 @@ class LlmCallTrace(BaseModel):
     ``usage`` from the SDK response, which this observational decorator does not do.
     """
 
-    op: str  # "score" | "structured" | "embed"
+    op: str  # "score" | "structured" | "decide" | "choose" | "embed"
     model: str | None = None  # resolved model for the call (None when unresolvable)
     step: str | None = None  # JudgeStep role, when the caller labeled the call
     turn_number: int | None = None
@@ -185,6 +187,61 @@ class TracingJudge:
                 schema=schema,
                 step=step,
                 model=model,
+            ),
+        )
+
+    def _decision_trace(
+        self, op: str, turn: TurnView, step: JudgeStep | None, model: str | None
+    ) -> LlmCallTrace:
+        return LlmCallTrace(
+            op=op,
+            model=self._resolved_model(step, model),
+            step=step.value if step else None,
+            turn_number=turn.turn_number,
+            prompt_chars=len(turn.prompt),
+            response_chars=len(turn.response),
+        )
+
+    def _run_decision(self, trace: LlmCallTrace, call: Callable[[], Any]) -> Any:
+        """Like :meth:`_run`, but trace the model the decision reports it ran on.
+
+        A decision judge may answer on a model other than the one the inner judge
+        resolves (see ``TypesafeJudge``), and the result names the one that ran.
+        """
+
+        def run() -> Any:
+            result = call()
+            trace.model = result.model
+            return result
+
+        return self._run(trace, run)
+
+    def decide(
+        self,
+        *,
+        instruction: str,
+        turn: TurnView,
+        step: JudgeStep | None = None,
+        model: str | None = None,
+    ) -> JudgeDecision:
+        return self._run_decision(
+            self._decision_trace("decide", turn, step, model),
+            lambda: self._inner.decide(instruction=instruction, turn=turn, step=step, model=model),
+        )
+
+    def choose(
+        self,
+        *,
+        instruction: str,
+        turn: TurnView,
+        options: Mapping[str, str | None],
+        step: JudgeStep | None = None,
+        model: str | None = None,
+    ) -> JudgeChoice:
+        return self._run_decision(
+            self._decision_trace("choose", turn, step, model),
+            lambda: self._inner.choose(
+                instruction=instruction, turn=turn, options=options, step=step, model=model
             ),
         )
 

@@ -1,33 +1,33 @@
 """Faithfulness — two groundedness metrics for RAG turns.
 
 Both measure whether the assistant's answer is grounded in the retrieved
-context, but by different published algorithms. In both, the answer is
-decomposed into claims deterministically with :func:`split_sentences` (the
-``syntok`` sentence segmenter) — one sentence of the answer is one claim — rather
-than by an LLM extraction call. Only the per-claim verification is left to the
-judge:
+context, but by different published algorithms. In both, the answer is first
+decomposed into atomic, verifiable claims by an LLM extraction step
+(``extract_claims``, a ``structured()`` call on ``JudgeStep.EXTRACT``); then each
+claim gets one yes/no decision:
 
-* :class:`FaithfulnessRagas` (RAGAS) — take the answer's sentences as statements,
-  then verify each *against the context* by positive entailment. Score is the
-  fraction of statements that can be inferred from the context. The per-claim
-  entailment runs a two-tier cascade: a cheap high-volume model (Haiku 4.5)
-  decides every claim and reports a confidence, and only low-confidence verdicts
-  are escalated to a fixed decisive/audit model (Opus 4.8). The two tiers are
-  pinned model ids, not the judge's step routing.
+* :class:`FaithfulnessRagas` (RAGAS) — verify each claim *against the context* by
+  positive entailment. Score is the fraction of claims that can be inferred from the
+  context.
 * :class:`FaithfulnessDeepeval` (DeepEval) — extract *truths from the context*
-  (still an LLM step) and take the answer's sentences as *claims*, then per claim
-  ask whether the truths *contradict* it. Score is the fraction **not**
-  contradicted — an unverifiable claim (not mentioned in the truths) passes; only
-  a direct contradiction fails. Its two LLM steps are likewise pinned (Sonnet for
-  truths extraction, Opus for the per-claim verdict).
+  (another LLM step), then per claim ask whether it agrees with the truths or is
+  unmentioned. Score is the fraction **not** contradicted — an unverifiable claim (not
+  mentioned in the truths) passes; only a direct contradiction fails. Its two other LLM
+  steps are pinned (Sonnet for claims and truths extraction, Opus for the per-claim
+  verdict).
 
-Because both metrics name Anthropic models explicitly (see the per-call pins
-below), they require a judge that owns those models — the Anthropic judge or the
-Claude Agent one; under another provider the judge raises a Spanish ``ValueError``
-for the unowned model. The pins are nonetheless run through ``judge.resolve_model``
-first (a judge may remap them), so the calls, the trace, and the reported
-``judge_model`` all name the model that actually ran instead of the id the metric
-asked for.
+Every per-claim verdict is a yes/no decision, so it goes through the judge's
+``decide()`` seam: with a decision judge in front (TypeSafe's Jev) both verdicts run
+there. Each decision reports the model that answered it, and that is what ``judge_model``
+names.
+
+DeepEval names Anthropic models explicitly (see the per-call pins below), so it requires
+a judge that owns those models — the Anthropic judge or the Claude Agent one; under
+another provider the judge raises a Spanish ``ValueError`` for the unowned model. The
+pins are nonetheless run through ``judge.resolve_model`` first (a judge may remap them),
+so the calls and the reported ``judge_model`` name the model that actually ran. RAGAS
+pins nothing: its extraction follows the judge's ``EXTRACT`` routing and its verdicts the
+``VERIFY`` one.
 
 Neither metric touches ``retrieved_context`` directly. It is a single Spanish
 text blob on ``TurnView``; the judge layer renders it into the prompts that ask
@@ -41,11 +41,7 @@ All prompts and justification output are Spanish.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
-
 from pydantic import BaseModel
-
-from scorekeeper.config.settings import get_settings
 
 from scorekeeper.core.metrics.base import (
     NOT_APPLICABLE,
@@ -60,13 +56,12 @@ from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
 from scorekeeper.core.metrics.prompts import PromptSlot, safe_format
 from scorekeeper.core.metrics.registry import register
-from scorekeeper.core.metrics.scale import Boolean, Unit
-from scorekeeper.core.text import split_sentences
+from scorekeeper.core.metrics.scale import Unit
 
 
-def _extraction_step(claims: list[str]) -> TraceStep:
-    """Trace step recording the sentences taken as claims (as an array, not joined)."""
-    summary = (
+def _extraction_step(claims: list[str], summary: str = "") -> TraceStep:
+    """Trace step recording the extracted claims (as an array, not joined)."""
+    summary = summary or (
         f"{len(claims)} afirmación(es) extraída(s) de la respuesta"
         if claims
         else "No se extrajo ninguna afirmación de la respuesta."
@@ -78,7 +73,38 @@ def _extraction_step(claims: list[str]) -> TraceStep:
     )
 
 
+EXTRACT_CLAIMS_SLOT = PromptSlot(
+    slug="extract_claims",
+    description=(
+        "Extracción de afirmaciones atómicas y verificables a partir de la respuesta "
+        "del asistente."
+    ),
+)
+
+
+def _extract_claims(
+    template: str, turn: TurnView, judge: Judge, model: str | None = None
+) -> tuple[list[str], TraceStep]:
+    """Extract the answer's claims with the judge; return them and their trace step."""
+    extraction = judge.structured(
+        instruction=template,
+        turn=turn,
+        schema=Claims,
+        step=JudgeStep.EXTRACT,
+        model=model,
+    )
+    claims = [claim for claim in extraction.claims if claim.strip()]
+    return claims, _extraction_step(claims, extraction.summary)
+
+
 # --- Extraction schemas -------------------------------------------------------
+
+
+class Claims(BaseModel):
+    """Atomic, verifiable statements extracted from the assistant's answer."""
+
+    claims: list[str] = []
+    summary: str = ""
 
 
 class Truths(BaseModel):
@@ -86,19 +112,6 @@ class Truths(BaseModel):
 
     truths: list[str] = []
     summary: str = ""
-
-
-class RagasEntailment(BaseModel):
-    """One claim's entailment verdict plus the judge's self-reported confidence.
-
-    Returned by the RAGAS per-claim verification. ``confidence`` (0..1) drives the
-    Haiku→Opus cascade: a low-confidence bulk verdict is re-judged by the audit
-    model. ``justification`` is the Spanish rationale surfaced in the trace.
-    """
-
-    entailed: bool = False
-    confidence: float = 0.0  # 0..1
-    justification: str = ""
 
 
 # --- Metrics ------------------------------------------------------------------
@@ -113,74 +126,17 @@ class FaithfulnessRagas(MultiStepMetric):
     scale = Unit()  # 0-1
     weight = 1.0
     prompts = (
+        EXTRACT_CLAIMS_SLOT,
         PromptSlot(
             slug="verify",
             required_variables=("claim",),
-            description=(
-                "Veredicto de entailment de una afirmación frente al contexto "
-                "recuperado, con confianza para la cascada Haiku→Opus."
-            ),
+            description="Veredicto de entailment de una afirmación frente al contexto recuperado.",
         ),
     )
 
-    # Per-call model pins for the entailment cascade (per-claim, the n× hot loop). A
-    # cheap high-volume model (bulk, Haiku) decides every claim; only verdicts it reports
-    # below ``escalation_confidence`` are re-judged by the decisive/audit model (Opus).
-    # These are explicit model ids, not JudgeStep routing, so the two tiers are fixed
-    # regardless of the judge's step config; both must stay in
-    # ``AnthropicJudge.KNOWN_MODELS`` or the judge will reject the call.
-    #
-    # The class attributes are the fallback for a direct ``FaithfulnessRagas()``; the
-    # configured values come from settings in ``__init__``, and either stays overridable
-    # per instance afterwards.
-    bulk_model: str = "claude-haiku-4-5-20251001"
-    audit_model: str = "claude-opus-4-8"
-    escalation_confidence: float = 0.7
-
-    def __init__(self, templates: Mapping[str, str] | None = None) -> None:
-        super().__init__(templates)
-        settings = get_settings()
-        self.bulk_model = settings.faithfulness_bulk_model
-        self.audit_model = settings.faithfulness_audit_model
-
-    def _verify_claim(
-        self, turn: TurnView, judge: Judge, claim: str, bulk_model: str, audit_model: str
-    ) -> tuple[bool, str, bool]:
-        """Entailment cascade for one claim.
-
-        The cheap bulk model decides first; if it reports confidence below
-        ``self.escalation_confidence`` the claim is re-judged by the audit model and
-        that verdict wins. ``bulk_model``/``audit_model`` are the pins already
-        resolved through the judge. Returns ``(entailed, justification, escalated)``
-        where ``justification`` is from the model whose verdict is used.
-        """
-        # Resolved once so both cascade tiers judge the exact same text.
-        prompt = safe_format(self.prompt("verify"), claim=claim)
-        bulk = judge.structured(
-            instruction=prompt,
-            turn=turn,
-            schema=RagasEntailment,
-            step=JudgeStep.VERIFY,
-            model=bulk_model,
-        )
-        if bulk.confidence >= self.escalation_confidence:
-            return bulk.entailed, bulk.justification, False
-        audit = judge.structured(
-            instruction=prompt,
-            turn=turn,
-            schema=RagasEntailment,
-            step=JudgeStep.SCORE,
-            model=audit_model,
-        )
-        return audit.entailed, audit.justification, True
-
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
-        steps: list[TraceStep] = []
-
-        # Decompose the answer into claims deterministically: one sentence = one
-        # claim (syntok), replacing the former LLM extraction call.
-        claims = split_sentences(turn.response)
-        steps.append(_extraction_step(claims))
+        claims, extraction_step = _extract_claims(self.prompt("extract_claims"), turn, judge)
+        steps = [extraction_step]
 
         # Nothing to verify → nothing to measure; the metric does not apply.
         if not claims:
@@ -193,49 +149,39 @@ class FaithfulnessRagas(MultiStepMetric):
                 rubric_version=self.rubric_version,
             )
 
-        # Per-claim entailment via the Haiku→Opus cascade. Track which models
-        # actually ran so ``judge_model`` reflects the escalations. Each claim is a
-        # typed entry; escalation and the deciding model become metadata, not glue.
-        # The pins are a request: a judge may remap them, so resolve them through the
-        # judge and report what actually ran.
-        bulk_model = judge.resolve_model(JudgeStep.VERIFY, self.bulk_model)
-        audit_model = judge.resolve_model(JudgeStep.SCORE, self.audit_model)
-
-        supported = 0
-        escalated_any = False
-        verify_step = TraceStep(label="Verificación de afirmaciones")
-        for claim in claims:
-            entailed, justification, escalated = self._verify_claim(
-                turn, judge, claim, bulk_model, audit_model
+        # One entailment decision per claim; each is a typed trace entry.
+        verify_template = self.prompt("verify")
+        verdicts = [
+            judge.decide(
+                instruction=safe_format(verify_template, claim=claim),
+                turn=turn,
+                step=JudgeStep.VERIFY,
             )
-            supported += int(entailed)
-            escalated_any = escalated_any or escalated
-            verify_step.entries.append(
-                TraceEntry(
-                    label=claim,
-                    value=entailed,
-                    justification=justification,
-                    metadata={
-                        "escalated": escalated,
-                        "model": audit_model if escalated else bulk_model,
-                    },
-                )
+            for claim in claims
+        ]
+        steps.append(
+            TraceStep(
+                label="Verificación de afirmaciones",
+                entries=[
+                    TraceEntry(
+                        label=claim,
+                        value=verdict.value,
+                        justification=verdict.justification,
+                        metadata={"model": verdict.model},
+                    )
+                    for claim, verdict in zip(claims, verdicts, strict=True)
+                ],
             )
-        steps.append(verify_step)
+        )
 
         # Fraction of statements entailed by the context = supported / n.
-        raw = supported / len(claims)
-        judge_model = (
-            f"{bulk_model} → {audit_model}"
-            if escalated_any and audit_model != bulk_model
-            else bulk_model
-        )
+        raw = sum(v.value for v in verdicts) / len(verdicts)
         return MetricResult(
             metric_name=self.name,
             raw_score=raw,
             normalized_score=self.normalize(raw),
             trace=MetricTrace(steps=steps),
-            judge_model=judge_model,
+            judge_model=verdicts[0].model,
             rubric_version=self.rubric_version,
         )
 
@@ -249,6 +195,7 @@ class FaithfulnessDeepeval(MultiStepMetric):
     scale = Unit()  # 0-1
     weight = 1.0
     prompts = (
+        EXTRACT_CLAIMS_SLOT,
         PromptSlot(
             slug="generate_truths",
             description=(
@@ -266,10 +213,10 @@ class FaithfulnessDeepeval(MultiStepMetric):
         ),
     )
 
-    # Per-call model pins for the two live LLM steps, overridable per instance. Both
-    # are high-impact, so neither runs on a weak model: truths extraction (very high,
-    # indirect — any fact dropped here later reads as "no mencionado" and forces a
-    # pass) runs on Sonnet; the per-claim verdict (direct and dominant — a weak model
+    # Per-call model pins for the live LLM steps, overridable per instance. All
+    # are high-impact, so none runs on a weak model: claims extraction and truths
+    # extraction (very high, indirect — any fact dropped here later reads as "no
+    # mencionado" and forces a pass) run on Sonnet; the per-claim verdict (direct and dominant — a weak model
     # drifts toward "no verificable", which silently passes) runs on Opus. These are
     # explicit model ids, not JudgeStep routing; both must stay in
     # ``AnthropicJudge.KNOWN_MODELS`` or the judge will reject the call.
@@ -279,10 +226,15 @@ class FaithfulnessDeepeval(MultiStepMetric):
     def evaluate(self, turn: TurnView, judge: Judge) -> MetricResult:
         steps: list[TraceStep] = []
 
-        # Split claims first so the "no claims" case short-circuits before we pay
-        # for the (still LLM-based) truths extraction. One sentence = one claim.
-        claims = split_sentences(turn.response)
-        steps.append(_extraction_step(claims))
+        # Extract claims first so the "no claims" case short-circuits before we pay
+        # for the truths extraction.
+        claims, extraction_step = _extract_claims(
+            self.prompt("extract_claims"),
+            turn,
+            judge,
+            model=judge.resolve_model(JudgeStep.EXTRACT, self.truths_model),
+        )
+        steps.append(extraction_step)
         if not claims:
             return MetricResult(
                 metric_name=self.name,
@@ -332,12 +284,12 @@ class FaithfulnessDeepeval(MultiStepMetric):
 
         truths_text = "\n".join(truths.truths)
         verify_template = self.prompt("verify")
+        # The template asks whether the claim agrees with the truths or is unmentioned,
+        # so true = not contradicted, false = contradicted. No inversion needed.
         verdicts = [
-            judge.score(
-                rubric=safe_format(verify_template, truths=truths_text, claim=claim),
+            judge.decide(
+                instruction=safe_format(verify_template, truths=truths_text, claim=claim),
                 turn=turn,
-                scale=Boolean(),
-                rubric_version=self.rubric_version,
                 step=JudgeStep.VERIFY,
                 model=judge.resolve_model(JudgeStep.VERIFY, self.verdict_model),
             )
@@ -348,7 +300,7 @@ class FaithfulnessDeepeval(MultiStepMetric):
             entries=[
                 TraceEntry(
                     label=claim,
-                    value=bool(verdict.score),
+                    value=verdict.value,
                     justification=verdict.justification,
                 )
                 for claim, verdict in zip(claims, verdicts, strict=True)
@@ -356,8 +308,9 @@ class FaithfulnessDeepeval(MultiStepMetric):
         )
         steps.append(verify_step)
 
-        # Boolean scale → contradicted=0, otherwise 1; mean = not_contradicted / n.
-        raw = sum(v.score for v in verdicts) / len(verdicts)
+        # true = not contradicted (agrees or unmentioned) = 1, false = contradicted = 0.
+        # mean = not_contradicted / n.
+        raw = sum(v.value for v in verdicts) / len(verdicts)
         return MetricResult(
             metric_name=self.name,
             raw_score=raw,

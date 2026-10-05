@@ -7,10 +7,10 @@ import re
 from scorekeeper.core.metrics.base import NOT_APPLICABLE, TurnView
 from scorekeeper.core.metrics.catalog.hallucination import (
     Hallucination,
-    NLIJudgment,
     NLILabel,
     split_context_docs,
 )
+from scorekeeper.core.metrics.judge import JudgeChoice
 from scorekeeper.core.retrieved_context import (
     Chunk,
     RetrievedContext,
@@ -33,6 +33,10 @@ def _context(blob: str) -> RetrievedContext:
             if b
         ]
     )
+
+
+def _choice(label: NLILabel, justification: str) -> JudgeChoice:
+    return JudgeChoice(choice=label.value, confidence=1.0, justification=justification)
 
 
 def _turn(context: str) -> TurnView:
@@ -76,9 +80,9 @@ def test_split_context_docs_json_like_but_invalid_falls_back_to_text() -> None:
 
 def test_no_contradictions_is_zero_hallucination(make_judge) -> None:
     judge = make_judge(
-        extractions=[
-            NLIJudgment(label=NLILabel.ENTAILMENT, justification="Respalda"),
-            NLIJudgment(label=NLILabel.NEUTRAL, justification="Ni respalda ni contradice"),
+        decisions=[
+            _choice(NLILabel.ENTAILMENT, "Respalda"),
+            _choice(NLILabel.NEUTRAL, "Ni respalda ni contradice"),
         ]
     )
     result = build(Hallucination).evaluate(_turn("doc A\n\ndoc B"), judge)
@@ -86,15 +90,15 @@ def test_no_contradictions_is_zero_hallucination(make_judge) -> None:
     assert result.raw_score == 0.0  # no contradictions
     # Inverted scale: raw 0.0 hallucination → 1.0 faithfulness (higher-is-better).
     assert result.normalized_score == 1.0
-    # One structured (NLI) classification per document, no scoring calls.
-    assert [kind for kind, _ in judge.calls] == ["structured", "structured"]
+    # One NLI choice per document, no scoring calls.
+    assert [kind for kind, _ in judge.calls] == ["choose", "choose"]
 
 
 def test_contradiction_raises_score(make_judge) -> None:
     judge = make_judge(
-        extractions=[
-            NLIJudgment(label=NLILabel.CONTRADICTION, justification="Contradice el plazo"),
-            NLIJudgment(label=NLILabel.ENTAILMENT, justification="Respalda"),
+        decisions=[
+            _choice(NLILabel.CONTRADICTION, "Contradice el plazo"),
+            _choice(NLILabel.ENTAILMENT, "Respalda"),
         ]
     )
     result = build(Hallucination).evaluate(_turn("doc A\n\ndoc B"), judge)

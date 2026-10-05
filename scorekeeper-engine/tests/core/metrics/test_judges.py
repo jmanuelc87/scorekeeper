@@ -26,12 +26,14 @@ from scorekeeper.core.metrics.judges import (
 )
 from scorekeeper.core.metrics.judges import base as judges_base
 from scorekeeper.core.metrics.judges.base import (
+    DECISION_INSTRUCTION_ES,
     DEFAULT_SYSTEM_PROMPT,
     CallRecorder,
     JudgeError,
     RetryPolicy,
     StepModels,
     UsageAccumulator,
+    _DecisionResponse,
     _ScoreResponse,
     clamp,
     collect_calls,
@@ -445,6 +447,57 @@ def test_anthropic_structured_returns_schema(turn: TurnView) -> None:
     assert isinstance(result, Claims)
     assert result.claims == ["a", "b"]
     assert client.messages.calls[0]["output_format"] is Claims
+
+
+# --- Decisions on an LLM judge ------------------------------------------------
+
+
+def test_llm_decide_is_a_structured_call_on_the_routed_model(turn: TurnView) -> None:
+    client = FakeAnthropicClient(
+        _DecisionResponse(answer=True, confidence=1.4, justification="Se deduce.")
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    decision = judge.decide(instruction="¿Se deduce?", turn=turn, model="claude-sonnet-5")
+
+    assert decision.value is True
+    assert decision.confidence == 1.0  # clamped into [0, 1]
+    assert decision.justification == "Se deduce."
+    assert decision.model == "claude-sonnet-5"
+    call = client.messages.calls[0]
+    assert call["model"] == "claude-sonnet-5"
+    assert call["output_format"] is _DecisionResponse
+    # The template's question, then the instruction fixing the boolean's polarity.
+    content = call["messages"][0]["content"]
+    assert content.startswith(f"¿Se deduce?\n\n{DECISION_INSTRUCTION_ES}")
+
+
+def test_llm_choose_constrains_the_answer_to_the_options(turn: TurnView) -> None:
+    client = FakeAnthropicClient(
+        SimpleNamespace(choice="neutral", confidence=0.7, justification="Ni sí ni no.")
+    )
+    judge = AnthropicJudge(model="claude-opus-4-8", client=client)
+
+    choice = judge.choose(
+        instruction="Clasifica", turn=turn, options={"entailment": None, "neutral": None}
+    )
+
+    assert (choice.choice, choice.confidence, choice.model) == (
+        "neutral",
+        0.7,
+        "claude-opus-4-8",
+    )
+    schema = client.messages.calls[0]["output_format"]
+    schema.model_validate({"choice": "entailment", "confidence": 1, "justification": ""})
+    with pytest.raises(ValueError):
+        schema.model_validate({"choice": "otra", "confidence": 1, "justification": ""})
+
+
+def test_capacity_error_is_read_from_a_status_attribute() -> None:
+    exc = RuntimeError("HTTP 429")
+    exc.status = 429  # type: ignore[attr-defined]  # typesafe_sdk's spelling
+
+    assert judges_base._is_capacity_error(exc)
 
 
 # --- Per-step model routing ---------------------------------------------------
@@ -1002,7 +1055,13 @@ def test_make_judge_agent_needs_no_key_and_wires_an_embedder(
     # No API key of any kind: the agent judge authenticates through the Claude Code
     # session, so the factory must not gate on one — and with no OpenAI key there is
     # no embeddings backend to attach.
-    make_judge(Settings(judge_provider="agent", agent_judge_model="claude-opus-4-8"))
+    make_judge(
+        Settings(
+            judge_provider="agent",
+            agent_judge_model="claude-opus-4-8",
+            claude_code_oauth_token=None,
+        )
+    )
     assert built["model"] == "claude-opus-4-8"
     assert built["embedder"] is None
     assert built["oauth_token"] is None
@@ -1018,7 +1077,13 @@ def test_make_judge_agent_needs_no_key_and_wires_an_embedder(
     assert built["oauth_token"] is None
 
     built.clear()
-    make_judge(Settings(judge_provider="agent", openai_api_key="sk-o"))
+    make_judge(
+        Settings(
+            judge_provider="agent",
+            openai_api_key="sk-o",
+            openai_base_url=None,
+        )
+    )
     assert isinstance(built["embedder"], DummyOpenAI)
     assert built["embedder"].kwargs["base_url"] is None
 
