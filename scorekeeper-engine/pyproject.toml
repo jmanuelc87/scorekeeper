@@ -50,6 +50,7 @@ judges = [
   "anthropic>=0.116,<1",
   "claude-agent-sdk>=0.2.144",
   "openai>=1.60,<3",
+  "typesafe-sdk>=0.7.2,<1",
 ]
 # SharePoint client for the retrieval pipeline's certificate-based AuthProvider
 # (scorekeeper.retrieval.credentials). Optional so the retrieval taxonomy and its

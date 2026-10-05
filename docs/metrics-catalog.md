@@ -168,9 +168,8 @@ contextual_precision = ( Σ_k precision@k · r_k ) / total_relevant
 This is a `MultiStepMetric`: one judge call per node, no single rubric.
 
 1. Split `retrieved_context` into ordered nodes.
-2. For each node, in rank order, call `judge.structured(..., schema=RelevanceVerdict)`
-   — a relevance **classification**, so it goes through the `structured()` seam
-   rather than `score()`. The node is judged in an isolated
+2. For each node, in rank order, call `judge.decide(...)` — a yes/no relevance
+   **decision**, so it goes through the `decide()` seam rather than `score()`. The node is judged in an isolated
    `TurnView(prompt=…, response="")`, so the judge sees the question and the node
    but never the assistant's actual answer or the other nodes.
 3. Turn the verdicts into binary `r_k` in rank order, then compute Average
@@ -205,8 +204,9 @@ selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 
 ### Notes
 
-- `judge_model` is read best-effort via `getattr(judge, "model", None)`, since the
-  `structured()` seam does not itself surface the model name.
+- `judge_model` is the model the decisions report they ran on — TypeSafe's Jev when a
+  decision judge is configured (see [Evaluation metrics → The Judge
+  seam](evaluation-metrics.md#the-judge-seam)).
 - The reference lives on both `TurnView.expected_output` and `Turn.expected_output`
   (Alembic migration `a3f1c2b4d5e6`), mirroring how `retrieved_context` is carried.
 
@@ -216,8 +216,8 @@ selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 (relevant-first `1.0` vs relevant-last `0.5`), interleaved Average Precision, the
 no-relevant and no-context short-circuits, both `strict_mode` branches, and a spy
 test proving nodes are judged against `expected_output` and never against the
-response. No database and no live LLM: a stub judge scripts `RelevanceVerdict`
-values through `structured()`.
+response. No database and no live LLM: a stub judge scripts `JudgeDecision`
+values through `decide()`.
 
 ## `faithfulness_ragas`
 
@@ -246,22 +246,21 @@ Raw score is already in `[0, 1]` (`Unit()`), **higher is better**.
 
 ### Scoring steps
 
-1. **Extract claims** from the answer via `judge.structured(EXTRACT_CLAIMS,
-   schema=Claims)`.
+1. **Extract claims** from the answer via
+   `judge.structured(self.prompt("extract_claims"), schema=Claims, step=EXTRACT)`.
 2. If **no claims** were extracted there is nothing to verify → short-circuit to
    `raw_score = NOT_APPLICABLE` with no verification calls, excluded from the
    averages rather than counted as perfect faithfulness.
 3. **Verify** each claim with
-   `judge.structured(safe_format(self.prompt("verify"), claim=...), schema=RagasEntailment)`:
-   `entailed` is true if the claim is inferable from the context, false if it is
-   not entailed or is contradicted.
-4. `raw_score = mean(verdicts)` — on the `Boolean` scale each verdict is `0`/`1`,
+   `judge.decide(safe_format(self.prompt("verify"), claim=...))`: *yes* if the claim is
+   inferable from the context, *no* if it is not entailed or is contradicted.
+4. `raw_score = mean(verdicts)` — each verdict counts `1` for *yes* and `0` for *no*,
    so the mean is exactly `supported / n`.
 
 ### The prompts
 
-- `EXTRACT_CLAIMS` turns each sentence of the answer into verifiable, independent
-  statements (may reference `{prompt}`/`{response}`).
+- `faithfulness_ragas.extract_claims` turns each sentence of the answer into atomic,
+  verifiable, independent statements (references `{prompt}`/`{response}`).
 - `faithfulness_ragas.verify` asks whether a single `{claim}` can be inferred from the
   `{context}` it interpolates. The judge appends the turn itself (prompt, response,
   history) automatically; the retrieved context is *not* appended — it reaches the judge
@@ -308,7 +307,8 @@ rendering.
 
 ### Scoring steps
 
-1. **Extract claims** from the answer (`EXTRACT_CLAIMS` → `Claims`). Claims are
+1. **Extract claims** from the answer (`faithfulness_deepeval.extract_claims` → `Claims`,
+   pinned to Sonnet like the truths step). Claims are
    extracted *first* so the no-claims case short-circuits before paying for
    truths extraction; the reference pseudocode runs the two extractions
    concurrently, so leading with claims is equivalent.
@@ -316,17 +316,19 @@ rendering.
    measure, excluded from the averages).
 3. **Extract truths** from the context (`faithfulness_deepeval.generate_truths` → `Truths`).
 4. **Verify** each claim against the joined truths with
-   `judge.score(safe_format(self.prompt("verify"), truths=..., claim=...), scale=Boolean())`:
-   `0` **only** if the truths directly contradict the claim, else `1` (agrees or
-   not mentioned).
+   `judge.decide(safe_format(self.prompt("verify"), truths=..., claim=...))`: the
+   template asks whether the claim agrees with the truths or is not mentioned, so a
+   *yes* counts `1` and a *no* (directly contradicted) `0`.
 5. `raw_score = mean(verdicts) = not_contradicted / n`.
 
 ### The prompts
 
-- `EXTRACT_CLAIMS` — shared with the RAGAS variant.
+- `faithfulness_deepeval.extract_claims` — same text as the RAGAS variant's, seeded for
+  each metric by migration `a6d2f8c4b1e7`.
 - `faithfulness_deepeval.generate_truths` extracts atomic, verifiable facts from the retrieved context
   (references `{context}`).
-- `faithfulness_deepeval.verify` asks whether the `{truths}` contradict the `{claim}`. It
+- `faithfulness_deepeval.verify` asks whether the `{claim}` agrees with the `{truths}` or is
+  not mentioned in them. It
   deliberately omits `{context}`: the truths already extracted from it are what the claim is
   judged against.
 
@@ -390,10 +392,10 @@ turn therefore pulls the weighted turn-score down, as intended.
 This is a `MultiStepMetric`: one judge call per document, no single rubric.
 
 1. Split `retrieved_context` into documents.
-2. For each document, call `judge.structured(..., schema=NLIJudgment)` — an NLI
-   **classification**, so it goes through the judge's `structured()` seam rather
-   than `score()`. `NLIJudgment` carries the `NLILabel` and a Spanish
-   justification.
+2. For each document, call `judge.choose(..., options=<the three NLILabel values>)`
+   — an NLI label is a **multiple-choice decision**, so it goes through the judge's
+   `choose()` seam rather than `score()`. The `JudgeChoice` carries the label and,
+   from an LLM judge, a Spanish justification.
 3. Count `contradiction` labels; `raw_score = contradicted / len(docs)`.
 4. Each document's verdict is a typed `TraceEntry` (`value` = the NLI label,
    `justification` = the Spanish rationale), with a summary `TraceStep` for the rate.
@@ -425,9 +427,8 @@ selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 
 ### Notes
 
-- `judge_model` is `None` on the result: the `Judge.structured()` seam does not
-  surface the model name (unlike `score()`), so there is no model to record
-  without extending the protocol.
+- `judge_model` is the model the choices report they ran on — TypeSafe's Jev when a
+  decision judge is configured.
 - The raw score is higher-is-worse, but the `Inverted(Unit())` scale normalizes
   it to the faithfulness complement, so at rollup it points the same way as the
   "higher is better" metrics like `correccion`/`utilidad`. The stored `raw_score`
@@ -438,7 +439,7 @@ selection](evaluation-metrics.md#per-use-case-selection-in-the-database)).
 `tests/metrics/test_hallucination.py` — document splitting, the
 no-contradiction / partial-contradiction / no-context cases, and the
 one-`structured`-call-per-document contract. No database and no live LLM: a stub
-judge serves scripted `NLIJudgment` values through `structured()`.
+judge serves scripted `JudgeChoice` values through `choose()`.
 
 ## `calidad` — the ten rubric metrics
 

@@ -103,10 +103,9 @@ therefore the stricter of the two. See
 
 The pseudocode above is the canonical RAGAS algorithm, where **Step 1 is an LLM
 extraction call** (`LLM.extract_statements`). The Scorekeeper implementation
-diverges in one place: it decomposes the answer into statements
-**deterministically** with `split_sentences()` (the `syntok` sentence segmenter)
-— *one sentence of the answer is one statement* — rather than with a judge call.
-Only Step 2 (per-statement verification) is left to the judge. The scoring
+diverges in one place: the extraction is the `extract_claims` prompt slot run
+through `judge.structured()` (atomic, verifiable statements), and Step 2
+(per-statement verification) is one `judge.decide()` call per statement. The scoring
 (Steps 2–3) and the positive-entailment requirement are otherwise identical to the
 pseudocode; the no-statements case also short-circuits, but returns
 `NOT_APPLICABLE` (excluded from the rollups) where the reference returns `1.0`.

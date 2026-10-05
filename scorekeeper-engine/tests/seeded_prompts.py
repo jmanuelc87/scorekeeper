@@ -27,6 +27,7 @@ _VERSIONS = Path(__file__).resolve().parents[1] / "migrations" / "versions"
 _MIGRATIONS = (
     "c1a5e7d3f0b6_add_prompt_catalog.py",
     "d7f2b6c1a840_add_quality_metric_rubrics.py",
+    "a6d2f8c4b1e7_add_faithfulness_extract_claims.py",
 )
 
 
@@ -78,7 +79,7 @@ def build(metric_cls, **overrides):
     """Construct ``metric_cls`` with its shipped templates bound, applying ``overrides``.
 
     ``overrides`` set the per-instance knobs metrics expose as class attributes
-    (``n_questions``, ``strict_mode``, ``bulk_model``…).
+    (``n_questions``, ``strict_mode``, ``truths_model``…).
     """
     metric = metric_cls(templates_for(metric_cls.name))
     for key, value in overrides.items():

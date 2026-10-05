@@ -97,6 +97,17 @@ def compose_use_case(session: AsyncSession):
     return _compose
 
 
+@pytest.fixture(autouse=True)
+def _no_typesafe_key(monkeypatch) -> None:
+    """Keep a developer's exported ``TYPESAFE_API_KEY`` out of every ``Settings()``.
+
+    It is the variable the TypeSafe SDK itself reads, so it is commonly exported; left
+    in place it would make ``make_judge`` wrap every judge a test builds in a
+    ``TypesafeJudge``. Tests that want the wrapper pass the key explicitly.
+    """
+    monkeypatch.delenv("TYPESAFE_API_KEY", raising=False)
+
+
 #: The genuine pacing seams, captured before ``_no_turn_delay`` ever patches them.
 _REAL_PACE_BETWEEN_TURNS = EvalRunner._pace_between_turns
 _REAL_TURN_DELAY_SECONDS = runner.turn_delay_seconds

@@ -17,6 +17,7 @@ from scorekeeper.core.metrics.judges.anthropic_judge import AnthropicJudge
 from scorekeeper.core.metrics.judges.base import JudgeError, StepModels
 from scorekeeper.core.metrics.judges.openai_judge import OpenAIJudge
 from scorekeeper.core.metrics.judges.tracing import TracingJudge
+from scorekeeper.core.metrics.judges.typesafe_judge import TypesafeJudge
 
 if TYPE_CHECKING:
     from scorekeeper.config.settings import Settings
@@ -28,6 +29,7 @@ __all__ = [
     "JudgeError",
     "OpenAIJudge",
     "TracingJudge",
+    "TypesafeJudge",
     "make_judge",
 ]
 
@@ -70,6 +72,22 @@ def _embedder(settings: Settings) -> Judge | None:
     )
 
 
+def _decisions(judge: Judge, settings: Settings) -> Judge:
+    """Wrap ``judge`` in a ``TypesafeJudge`` when ``typesafe_api_key`` is set.
+
+    Binary and multiple-choice decisions then run on TypeSafe's Jev; every other call
+    still reaches ``judge``. Without a key the provider judge answers them itself.
+    """
+    if not settings.typesafe_api_key:
+        return judge
+    return TypesafeJudge(
+        judge,
+        model=settings.typesafe_judge_model,
+        api_key=settings.typesafe_api_key,
+        timeout=settings.judge_timeout_seconds,
+    )
+
+
 def _traced(judge: Judge, settings: Settings) -> Judge:
     """Wrap ``judge`` in a ``TracingJudge`` when ``judge_trace_enabled`` is set.
 
@@ -81,12 +99,19 @@ def _traced(judge: Judge, settings: Settings) -> Judge:
     return judge
 
 
+def _wrapped(judge: Judge, settings: Settings) -> Judge:
+    """Apply the optional decorators: Jev decisions inside, tracing outermost."""
+    return _traced(_decisions(judge, settings), settings)
+
+
 def make_judge(settings: Settings | None = None) -> Judge:
     """Build the judge configured by ``settings`` (defaults to ``get_settings()``).
 
     Reads ``judge_provider`` and the matching model/API-key settings. Raises a
     Spanish ``ValueError`` when the provider is unknown or its API key is missing.
-    When ``judge_trace_enabled`` is set, the built judge is wrapped so every LLM
+    When ``typesafe_api_key`` is set, decisions are answered by TypeSafe's Jev (see
+    :class:`~scorekeeper.core.metrics.judges.typesafe_judge.TypesafeJudge`). When
+    ``judge_trace_enabled`` is set, the built judge is wrapped so every LLM
     API call is traced (see :class:`~scorekeeper.core.metrics.judges.tracing.TracingJudge`).
     """
     settings = settings or get_settings()
@@ -100,7 +125,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
         # Anthropic has no embeddings endpoint: attach an OpenAI-backed embedder
         # when a key is available so similarity metrics still work.
         embedder = _embedder(settings)
-        return _traced(
+        return _wrapped(
             AnthropicJudge(
                 model=settings.anthropic_judge_model,
                 api_key=settings.anthropic_api_key,
@@ -117,7 +142,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
     if provider == "openai":
         if not settings.openai_api_key:
             raise ValueError("Falta OPENAI_API_KEY para el juez de OpenAI.")
-        return _traced(
+        return _wrapped(
             OpenAIJudge(
                 model=settings.openai_judge_model,
                 api_key=settings.openai_api_key,
@@ -137,7 +162,7 @@ def make_judge(settings: Settings | None = None) -> Judge:
         # no embeddings endpoint, so an OpenAI-backed embedder is attached when a key
         # is available.
         embedder = _embedder(settings)
-        return _traced(
+        return _wrapped(
             AgentJudge(
                 model=settings.agent_judge_model,
                 system_prompt=settings.judge_system_prompt,

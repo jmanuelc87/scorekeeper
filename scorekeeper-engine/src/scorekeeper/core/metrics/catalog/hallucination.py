@@ -17,15 +17,13 @@ metrics. When a turn has no retrieved context there is nothing to contradict and
 nothing to measure, so the metric returns ``NOT_APPLICABLE`` with no judge calls
 and rollup leaves it out of the averages.
 
-The NLI judgment is a *classification* step, so it goes through the judge's
-``structured()`` seam rather than ``score()``.
+The NLI judgment is a multiple-choice decision over the three labels, so it goes
+through the judge's ``choose()`` seam rather than ``score()``.
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
-
-from pydantic import BaseModel
 
 from scorekeeper.core.metrics.base import (
     NOT_APPLICABLE,
@@ -50,13 +48,6 @@ class NLILabel(StrEnum):
     ENTAILMENT = "entailment"
     NEUTRAL = "neutral"
     CONTRADICTION = "contradiction"
-
-
-class NLIJudgment(BaseModel):
-    """The judge's NLI verdict for one (context document, answer) pair."""
-
-    label: NLILabel
-    justification: str  # Spanish rationale
 
 
 def split_context_docs(context: str) -> list[str]:
@@ -112,23 +103,25 @@ class Hallucination(MultiStepMetric):
 
         # One NLI classification per document; the label is a typed entry value.
         contradicted = 0
-        judge_model = judge.model_for(JudgeStep.EXTRACT)
         template = self.prompt("nli")
+        # The template defines each label, so the options carry no descriptions.
+        options = {label.value: None for label in NLILabel}
         nli_step = TraceStep(label="Clasificación NLI por documento")
         for i, doc in enumerate(docs, start=1):
-            judgment = judge.structured(
+            judgment = judge.choose(
                 instruction=safe_format(template, documento=doc, response=turn.response),
                 turn=turn,
-                schema=NLIJudgment,
+                options=options,
                 step=JudgeStep.EXTRACT,
-                model=judge_model,
             )
-            if judgment.label == NLILabel.CONTRADICTION:
+            # The model that answered (a decision judge may not be the step-routed one).
+            judge_model = judgment.model
+            if judgment.choice == NLILabel.CONTRADICTION:
                 contradicted += 1
             nli_step.entries.append(
                 TraceEntry(
                     label=f"Documento {i}",
-                    value=judgment.label.value,
+                    value=judgment.choice,
                     justification=judgment.justification,
                 )
             )

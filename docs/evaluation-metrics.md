@@ -208,12 +208,23 @@ Metrics never import an LLM SDK. They depend on the `Judge` **Protocol**
 class Judge(Protocol):
     def score(self, *, rubric, turn, scale, rubric_version=None) -> JudgeVerdict: ...
     def structured(self, *, instruction, turn, schema: type[T]) -> T: ...
+    def decide(self, *, instruction, turn) -> JudgeDecision: ...
+    def choose(self, *, instruction, turn, options) -> JudgeChoice: ...
 ```
 
 - `score()` runs a Spanish rubric prompt and returns a `JudgeVerdict`
   (`score`, `justification`, `model`).
-- `structured()` runs a non-scoring step (extraction/classification) and returns
+- `structured()` runs a non-scoring step (extraction) and returns
   an instance of the given Pydantic `schema`.
+- `decide()` answers the yes/no question an instruction poses (`JudgeDecision`:
+  `value`, `confidence`, `justification`, `model`); `choose()` picks one of a fixed
+  set of `options` (`JudgeChoice`: `choice`, `confidence`, …). The provider judges
+  answer both through their own `structured()`. With `TYPESAFE_API_KEY` set,
+  `make_judge` wraps the provider judge in a `TypesafeJudge` that sends them to
+  TypeSafe's **Jev** decision model instead — a `Noul` for `decide()`, a `Choice` for
+  `choose()` — and delegates every other call. Jev returns no justification, and a
+  `Noul`'s confidence is derived as `|2p − 1|`. `contextual_precision`, `faithfulness_ragas`,
+  `faithfulness_deepeval` and `hallucination` decide this way.
 
 Tests inject a stub that satisfies this Protocol (see
 [Testing](#testing)). The real implementation is added later (see

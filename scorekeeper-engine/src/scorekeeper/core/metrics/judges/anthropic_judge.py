@@ -16,6 +16,7 @@ from scorekeeper.core.metrics.judge import JudgeStep, JudgeVerdict
 from scorekeeper.core.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
     StepModels,
+    StructuredDecisions,
     _ScoreResponse,
     clamp,
     judge_call,
@@ -74,7 +75,7 @@ REFUSAL_FALLBACK_MODELS = frozenset({"claude-fable-5", "claude-opus-5"})
 REFUSAL_FALLBACK_BETA = "server-side-fallback-2026-06-01"
 
 
-class AnthropicJudge:
+class AnthropicJudge(StructuredDecisions):
     """Score turns with Claude via structured (JSON-schema) output.
 
     ``client`` may be injected (tests); otherwise a real ``anthropic.Anthropic``

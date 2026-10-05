@@ -9,6 +9,7 @@ tests inject a stub that satisfies the same interface.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import Enum
 from typing import TYPE_CHECKING, Protocol, TypeVar
 
@@ -35,8 +36,8 @@ class JudgeStep(str, Enum):
 
     * ``EXTRACT`` — non-scoring extraction/classification (:meth:`Judge.structured`):
       truths from context, NLI labels, node relevance, reverse-generated questions.
-    * ``VERIFY`` — per-item boolean checks looped inside a multi-step metric
-      (:meth:`Judge.score` on a ``Boolean`` scale), e.g. faithfulness claim checks.
+    * ``VERIFY`` — per-item yes/no checks looped inside a multi-step metric
+      (:meth:`Judge.decide`), e.g. faithfulness claim checks.
     * ``SCORE`` — the primary/decisive rubric score (:meth:`Judge.score`), as used
       by every :class:`~scorekeeper.core.metrics.base.SingleRubricMetric`.
     * ``EMBED`` — the embedding step (:meth:`Judge.embed`); embeddings already run
@@ -54,6 +55,29 @@ class JudgeVerdict(BaseModel):
 
     score: float
     justification: str  # Spanish rationale
+    model: str | None = None
+
+
+class JudgeDecision(BaseModel):
+    """The result of a binary (yes/no) decision call.
+
+    ``value`` answers the question the instruction poses — ``True`` is *sí* — and
+    ``confidence`` (0..1) is how sure the judge is of it, so a metric can escalate an
+    uncertain verdict. ``justification`` is empty when the model gives none.
+    """
+
+    value: bool
+    confidence: float
+    justification: str = ""  # Spanish rationale
+    model: str | None = None
+
+
+class JudgeChoice(BaseModel):
+    """The result of a multiple-choice decision call: one of the offered options."""
+
+    choice: str
+    confidence: float
+    justification: str = ""  # Spanish rationale
     model: str | None = None
 
 
@@ -117,6 +141,37 @@ class Judge(Protocol):
         An explicit ``model`` is used verbatim and wins over ``step`` routing; when
         omitted, ``step`` selects the model (``None`` → the judge's default). A model
         not belonging to the judge's provider raises a Spanish ``ValueError``.
+        """
+        ...
+
+    def decide(
+        self,
+        *,
+        instruction: str,
+        turn: TurnView,
+        step: JudgeStep | None = None,
+        model: str | None = None,
+    ) -> JudgeDecision:
+        """Answer the yes/no question ``instruction`` poses about ``turn``.
+
+        Same ``step``/``model`` precedence as :meth:`structured`, but a judge may hand
+        the decision to a dedicated decision model; the result's ``model`` names the
+        one that actually ran.
+        """
+        ...
+
+    def choose(
+        self,
+        *,
+        instruction: str,
+        turn: TurnView,
+        options: Mapping[str, str | None],
+        step: JudgeStep | None = None,
+        model: str | None = None,
+    ) -> JudgeChoice:
+        """Pick exactly one of ``options`` (label → optional description) for ``turn``.
+
+        Same routing and ``model`` reporting as :meth:`decide`.
         """
         ...
 

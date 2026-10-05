@@ -17,12 +17,12 @@ from scorekeeper.core.metrics.catalog.faithfulness import (
 )
 from scorekeeper.core.metrics.catalog.contextual_precision import ContextualPrecision
 from scorekeeper.core.metrics.catalog.hallucination import Hallucination
-from scorekeeper.core.metrics.judge import JudgeStep, JudgeVerdict
+from scorekeeper.core.metrics.judge import JudgeChoice, JudgeDecision, JudgeStep, JudgeVerdict
 from scorekeeper.core.metrics.registry import MetricRegistry
 
 
 class StubJudge:
-    """A Judge that returns scripted verdicts/extractions and records its calls."""
+    """A Judge that returns scripted verdicts/extractions/decisions and records its calls."""
 
     def __init__(
         self,
@@ -30,17 +30,19 @@ class StubJudge:
         extractions: list[BaseModel] | None = None,
         embeddings: dict[str, list[float]] | None = None,
         model: str | None = None,
+        decisions: list[JudgeDecision | JudgeChoice] | None = None,
     ) -> None:
         self._verdicts = list(verdicts or [])
         self._extractions = list(extractions or [])
+        self._decisions = list(decisions or [])
         # Map text -> vector; embed() returns one vector per requested text.
         self._embeddings = dict(embeddings or {})
         self.model = model
         self.calls: list[tuple[str, str | None]] = []
-        # The JudgeStep each score()/structured() call was labeled with, in order,
+        # The JudgeStep each judge call was labeled with, in order,
         # so tests can assert metrics route work to the right per-step model.
         self.steps: list[JudgeStep | None] = []
-        # The explicit model= each score()/structured() call passed, in order, so
+        # The explicit model= each judge call passed, in order, so
         # tests can assert metrics pin specific models (e.g. faithfulness).
         self.models: list[str | None] = []
 
@@ -66,6 +68,23 @@ class StubJudge:
         self.steps.append(step)
         self.models.append(model)
         return self._extractions.pop(0)
+
+    def decide(self, *, instruction, turn, step=None, model=None) -> JudgeDecision:
+        return self._decision("decide", step, model)
+
+    def choose(self, *, instruction, turn, options, step=None, model=None) -> JudgeChoice:
+        return self._decision("choose", step, model)
+
+    def _decision(self, kind, step, model):
+        self.calls.append((kind, None))
+        self.steps.append(step)
+        self.models.append(model)
+        decision = self._decisions.pop(0)
+        # Like the real judges, report the model the call resolved to unless the
+        # script names one (a decision judge answering on its own model).
+        if decision.model is None:
+            decision = decision.model_copy(update={"model": self.resolve_model(step, model)})
+        return decision
 
     def embed(self, *, texts, model=None):
         self.calls.append(("embed", str(len(texts))))
@@ -102,16 +121,21 @@ def registered_metrics():
 
 @pytest.fixture
 def make_judge():
-    """Factory for a StubJudge with scripted verdicts/extractions."""
+    """Factory for a StubJudge with scripted verdicts/extractions/decisions."""
 
     def _make(
         verdicts: list[JudgeVerdict] | None = None,
         extractions: list[BaseModel] | None = None,
         embeddings: dict[str, list[float]] | None = None,
         model: str | None = None,
+        decisions: list[JudgeDecision | JudgeChoice] | None = None,
     ) -> StubJudge:
         return StubJudge(
-            verdicts=verdicts, extractions=extractions, embeddings=embeddings, model=model
+            verdicts=verdicts,
+            extractions=extractions,
+            embeddings=embeddings,
+            model=model,
+            decisions=decisions,
         )
 
     return _make

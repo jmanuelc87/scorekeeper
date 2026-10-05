@@ -22,7 +22,7 @@ from typing import TypeVar
 from scorekeeper.core.metrics.base import Metric
 
 # Preserve the concrete metric subclass through the decorator so callers (and type
-# checkers) still see class-specific attributes, e.g. FaithfulnessRagas.bulk_model,
+# checkers) still see class-specific attributes, e.g. FaithfulnessDeepeval.truths_model,
 # rather than an erased ``type[Metric]``.
 _M = TypeVar("_M", bound=Metric)
 

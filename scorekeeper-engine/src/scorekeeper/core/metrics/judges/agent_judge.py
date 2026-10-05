@@ -43,6 +43,7 @@ from scorekeeper.core.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
     JudgeError,
     StepModels,
+    StructuredDecisions,
     _ScoreResponse,
     clamp,
     judge_call,
@@ -80,7 +81,7 @@ class _AgentCallError(RuntimeError):
         self.status_code = status_code
 
 
-class AgentJudge:
+class AgentJudge(StructuredDecisions):
     """Score turns with Claude through the Agent SDK, via JSON-schema output.
 
     ``client`` may be injected (tests); otherwise the ``claude_agent_sdk`` module
