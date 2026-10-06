@@ -51,6 +51,7 @@ from scorekeeper.core.metrics.base import (
     TraceEntry,
     TraceStep,
     TurnView,
+    decision_metadata,
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
@@ -167,7 +168,7 @@ class FaithfulnessRagas(MultiStepMetric):
                         label=claim,
                         value=verdict.value,
                         justification=verdict.justification,
-                        metadata={"model": verdict.model},
+                        metadata=decision_metadata(verdict),
                     )
                     for claim, verdict in zip(claims, verdicts, strict=True)
                 ],
@@ -302,6 +303,7 @@ class FaithfulnessDeepeval(MultiStepMetric):
                     label=claim,
                     value=verdict.value,
                     justification=verdict.justification,
+                    metadata=decision_metadata(verdict),
                 )
                 for claim, verdict in zip(claims, verdicts, strict=True)
             ],

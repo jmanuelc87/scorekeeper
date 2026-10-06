@@ -171,3 +171,31 @@ def test_judges_against_expected_output_not_response(make_judge) -> None:
     assert "VERDAD_DE_REFERENCIA" in instruction
     assert "Puedes devolver en 30 días" not in instruction
     assert node_response == ""  # the per-node view hides the response
+
+
+def test_trace_entries_carry_decision_metadata_with_rank(make_judge) -> None:
+    # Decision trace entries must include model, value, confidence, and rank in metadata.
+    judge = make_judge(
+        decisions=[
+            JudgeDecision(value=True, confidence=0.92, justification="relevante", model="jev-latest"),
+            JudgeDecision(value=False, confidence=0.88, justification="no relevante", model="jev-latest"),
+        ]
+    )
+
+    result = build(ContextualPrecision).evaluate(_turn("nodo A\n\nnodo B"), judge)
+
+    label_step = result.trace.steps[0]
+    assert label_step.label == "Relevancia por nodo"
+    # Each entry must carry model, value, confidence, AND rank in metadata.
+    for i, (entry, expected_value, expected_confidence, expected_rank) in enumerate(
+        zip(
+            label_step.entries,
+            [True, False],
+            [0.92, 0.88],
+            [1, 2],
+        )
+    ):
+        assert entry.metadata["model"] == "jev-latest", f"Entry {i} missing model"
+        assert entry.metadata["value"] == expected_value, f"Entry {i} wrong value"
+        assert entry.metadata["confidence"] == expected_confidence, f"Entry {i} wrong confidence"
+        assert entry.metadata["rank"] == expected_rank, f"Entry {i} wrong rank"

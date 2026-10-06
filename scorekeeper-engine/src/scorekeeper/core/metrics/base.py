@@ -28,7 +28,7 @@ from typing import Any, ClassVar
 from pydantic import BaseModel, Field
 
 from scorekeeper.core.metrics.category import MetricCategory
-from scorekeeper.core.metrics.judge import Judge, JudgeStep
+from scorekeeper.core.metrics.judge import Judge, JudgeChoice, JudgeDecision, JudgeStep
 from scorekeeper.core.metrics.prompts import PromptSlot
 from scorekeeper.core.metrics.scale import Scale
 from scorekeeper.core.retrieved_context import RetrievedContext
@@ -174,6 +174,21 @@ class MetricResult(BaseModel):
     trace: MetricTrace = MetricTrace()  # structured record, persisted as JSON
     judge_model: str | None = None
     rubric_version: str | None = None
+
+
+def decision_metadata(decision: JudgeDecision | JudgeChoice) -> dict[str, Any]:
+    """Extract model, value/choice, and confidence from a decision for ``TraceEntry.metadata``.
+
+    TypeSafe's Jev model returns structured decisions with ``model``, ``value``/``choice``,
+    and ``confidence``. This helper captures all three for audit trails in the trace.
+    Justification is omitted here — Jev provides none, so it stays empty on the entry.
+    """
+    base: dict[str, Any] = {"model": decision.model, "confidence": decision.confidence}
+    if isinstance(decision, JudgeDecision):
+        base["value"] = decision.value
+    else:  # JudgeChoice
+        base["choice"] = decision.choice
+    return base
 
 
 class Metric(ABC):

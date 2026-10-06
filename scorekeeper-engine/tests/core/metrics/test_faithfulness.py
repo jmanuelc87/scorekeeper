@@ -227,3 +227,62 @@ def test_deepeval_pins_models_per_call(make_judge) -> None:
     # claim; models are the explicit per-call pins, not judge.model_for's default.
     assert [kind for kind, _ in judge.calls] == ["structured", "structured", "decide", "decide"]
     assert judge.models == [truths_model, truths_model, verdict_model, verdict_model]
+
+
+def test_ragas_trace_entries_carry_decision_metadata(make_judge) -> None:
+    # Decision trace entries must include model, value, and confidence in metadata.
+    turn = TurnView(
+        prompt="¿Cómo reinicio el router?",
+        response="Afirmación A. Afirmación B.",
+    )
+    judge = make_judge(
+        extractions=[Claims(claims=["Afirmación A.", "Afirmación B."], summary="Dos")],
+        decisions=[
+            JudgeDecision(value=True, confidence=0.95, justification="Se deduce", model="jev-latest"),
+            JudgeDecision(value=False, confidence=0.85, justification="", model="jev-latest"),
+        ],
+    )
+    result = build(FaithfulnessRagas).evaluate(turn, judge)
+
+    verify_step = result.trace.steps[1]
+    assert verify_step.label == "Verificación de afirmaciones"
+    # Each decision entry must carry model, value, and confidence in metadata.
+    for entry, expected_value, expected_confidence in zip(
+        verify_step.entries,
+        [True, False],
+        [0.95, 0.85],
+    ):
+        assert entry.metadata["model"] == "jev-latest"
+        assert entry.metadata["value"] == expected_value
+        assert entry.metadata["confidence"] == expected_confidence
+
+
+def test_deepeval_trace_entries_carry_decision_metadata(make_judge) -> None:
+    # Decision trace entries must include model, value, and confidence in metadata.
+    turn = TurnView(
+        prompt="¿Cómo reinicio el router?",
+        response="Concuerda. Contradice.",
+    )
+    judge = make_judge(
+        extractions=[
+            Claims(claims=["Concuerda.", "Contradice."], summary="Dos"),
+            Truths(truths=["Verdad 1"], summary="Una"),
+        ],
+        decisions=[
+            JudgeDecision(value=True, confidence=0.9, justification="Concuerda", model="jev-latest"),
+            JudgeDecision(value=False, confidence=0.88, justification="Contradice", model="jev-latest"),
+        ],
+    )
+    result = build(FaithfulnessDeepeval).evaluate(turn, judge)
+
+    verdict_step = result.trace.steps[2]
+    assert verdict_step.label == "Veredicto por afirmación"
+    # Each decision entry must carry model, value, and confidence in metadata.
+    for entry, expected_value, expected_confidence in zip(
+        verdict_step.entries,
+        [True, False],
+        [0.9, 0.88],
+    ):
+        assert entry.metadata["model"] == "jev-latest"
+        assert entry.metadata["value"] == expected_value
+        assert entry.metadata["confidence"] == expected_confidence

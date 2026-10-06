@@ -124,3 +124,28 @@ def test_no_context_is_not_applicable_without_judge_calls(make_judge) -> None:
     assert judge.calls == []
     assert len(result.trace.steps) == 1
     assert "No hay contexto recuperado" in result.trace.steps[0].summary
+
+
+def test_trace_entries_carry_choice_metadata(make_judge) -> None:
+    # Choice trace entries must include model, choice, and confidence in metadata.
+    judge = make_judge(
+        decisions=[
+            JudgeChoice(choice=NLILabel.ENTAILMENT.value, confidence=0.95, justification="Respalda", model="jev-latest"),
+            JudgeChoice(choice=NLILabel.CONTRADICTION.value, confidence=0.92, justification="Contradice", model="jev-latest"),
+        ]
+    )
+    result = build(Hallucination).evaluate(_turn("doc A\n\ndoc B"), judge)
+
+    nli_step = result.trace.steps[0]
+    assert nli_step.label == "Clasificación NLI por documento"
+    # Each entry must carry model, choice, and confidence in metadata.
+    for i, (entry, expected_choice, expected_confidence) in enumerate(
+        zip(
+            nli_step.entries,
+            [NLILabel.ENTAILMENT.value, NLILabel.CONTRADICTION.value],
+            [0.95, 0.92],
+        )
+    ):
+        assert entry.metadata["model"] == "jev-latest", f"Entry {i} missing model"
+        assert entry.metadata["choice"] == expected_choice, f"Entry {i} wrong choice"
+        assert entry.metadata["confidence"] == expected_confidence, f"Entry {i} wrong confidence"
