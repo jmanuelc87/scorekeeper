@@ -209,6 +209,7 @@ class ScenarioTurn(BaseModel):
     expected_output: str | None = None
     retrieved_context_source: str | None = None
     turn_score: float | None = None
+    is_selected: bool = True
     metric_scores: list[ScenarioTurnMetric]
 
 

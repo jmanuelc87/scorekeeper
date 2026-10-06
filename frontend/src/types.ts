@@ -53,6 +53,7 @@ export interface Turn {
   turn_id: string;
   turn_number: number;
   turn_score: number | null;
+  is_selected?: boolean;
   metric_scores: MetricScore[];
 }
 
@@ -69,6 +70,7 @@ export interface ScenarioTurn {
   expected_output: string | null;
   retrieved_context_source: string | null;
   turn_score: number | null;
+  is_selected?: boolean;
   metric_scores: MetricScore[];
 }
 
