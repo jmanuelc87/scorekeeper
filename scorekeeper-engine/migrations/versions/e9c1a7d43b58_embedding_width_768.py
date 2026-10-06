@@ -61,9 +61,9 @@ def _rewidth(old: int, new: int) -> None:
 
 def upgrade() -> None:
     """Upgrade schema."""
-    _rewidth(1536, 768)
+    _rewidth(1536, 1536)
 
 
 def downgrade() -> None:
     """Downgrade schema."""
-    _rewidth(768, 1536)
+    _rewidth(1536, 1536)
