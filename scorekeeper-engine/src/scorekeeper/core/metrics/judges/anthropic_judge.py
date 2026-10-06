@@ -27,6 +27,7 @@ from scorekeeper.core.metrics.judges.base import (
     require_parsed,
     scale_spec,
 )
+from scorekeeper.core.metrics.judges.claude_models import listed_models
 
 if TYPE_CHECKING:
     from scorekeeper.core.metrics.base import TurnView
@@ -39,21 +40,25 @@ PROVIDER = "Anthropic"
 # Per-request timeout (seconds) for the provider client; see Settings.judge_timeout_seconds.
 DEFAULT_TIMEOUT_SECONDS = 900.0
 DEFAULT_MODEL = "claude-opus-4-8"
-# Models this judge is allowed to call. An exact-match allow-list (the provider's
-# model space is small and Anthropic-owned); extend it as new Claude models ship.
+# Seed allow-list of models this judge may call. It is only used until the live list
+# from Anthropic's List Models API has been fetched (see ``claude_models``), and as the
+# fallback when that fetch fails.
 KNOWN_MODELS = frozenset(
     {
         "claude-fable-5",
         "claude-opus-5",
         "claude-opus-4-8",
         "claude-sonnet-5",
+        "claude-sonnet-5-5",
         "claude-haiku-4-5-20251001",
     }
 )
 # Models that support adaptive thinking (a 4.6+ feature). Others — e.g.
 # Haiku 4.5 — reject ``thinking={"type": "adaptive"}`` with a 400, so those calls
 # omit the ``thinking`` parameter entirely (no thinking). Keep in sync as new
-# adaptive-capable models are added to KNOWN_MODELS.
+# adaptive-capable models are added to KNOWN_MODELS. A model that is listed by the API
+# but absent here (e.g. one released after this list) runs without ``thinking`` and
+# without the refusal fallback: omitting either is always accepted, sending it is not.
 #
 # Every Claude 5 model belongs here, and for two of them it is not optional: on
 # Opus 5 thinking is on by default, and on Fable 5 it is always on — ``disabled``
@@ -73,6 +78,12 @@ REFUSAL_FALLBACK_MODELS = frozenset({"claude-fable-5", "claude-opus-5"})
 # form pairs with ``server-side-fallback-2026-07-01`` instead and returns a 400 with this
 # header — and the installed SDK types accept only the array form anyway.
 REFUSAL_FALLBACK_BETA = "server-side-fallback-2026-06-01"
+
+
+def claude_owns(model: str) -> bool:
+    """Whether ``model`` is a Claude model: the fetched list, else the seed."""
+    listed = listed_models()
+    return model in (KNOWN_MODELS if listed is None else listed)
 
 
 class AnthropicJudge(StructuredDecisions):
@@ -127,7 +138,7 @@ class AnthropicJudge(StructuredDecisions):
 
     def _owns(self, model: str) -> bool:
         """Whether ``model`` is an Anthropic model this judge may call."""
-        return model in KNOWN_MODELS
+        return claude_owns(model)
 
     def model_for(self, step: JudgeStep | None = None) -> str:
         """Resolve (and validate) the model for ``step`` via the step router."""

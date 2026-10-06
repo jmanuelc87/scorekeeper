@@ -37,7 +37,7 @@ from scorekeeper.core.metrics.judge import JudgeStep, JudgeVerdict
 from scorekeeper.core.metrics.judges.anthropic_judge import (
     ADAPTIVE_THINKING_MODELS,
     DEFAULT_MODEL,
-    KNOWN_MODELS,
+    claude_owns,
 )
 from scorekeeper.core.metrics.judges.base import (
     DEFAULT_SYSTEM_PROMPT,
@@ -123,7 +123,7 @@ class AgentJudge(StructuredDecisions):
 
     def _owns(self, model: str) -> bool:
         """Whether ``model`` is a Claude model this judge may call."""
-        return model in KNOWN_MODELS
+        return claude_owns(model)
 
     def model_for(self, step: JudgeStep | None = None) -> str:
         """Resolve (and validate) the model for ``step`` via the step router."""

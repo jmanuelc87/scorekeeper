@@ -1556,7 +1556,7 @@ def test_agent_judge_shares_the_anthropic_allow_list() -> None:
     """One list, two judges: the Agent judge calls the same Claude models."""
     from scorekeeper.core.metrics.judges import agent_judge, anthropic_judge
 
-    assert agent_judge.KNOWN_MODELS is anthropic_judge.KNOWN_MODELS
+    assert agent_judge.claude_owns is anthropic_judge.claude_owns
     assert agent_judge.ADAPTIVE_THINKING_MODELS is anthropic_judge.ADAPTIVE_THINKING_MODELS
 
 
