@@ -5,7 +5,8 @@ export type Page =
   | "metrics"
   | "use-cases"
   | "auth-providers"
-  | "metric-prompt";
+  | "metric-prompt"
+  | "run";
 
 interface LayoutProps {
   currentPage: Page;
@@ -27,13 +28,20 @@ const PAGE_TITLES: Record<Page, string> = {
   "use-cases": "Use Cases",
   "auth-providers": "Auth Providers",
   "metric-prompt": "Metric Prompt",
+  run: "Run Details",
+};
+
+/** The sidebar item a page the sidebar does not list sits under. */
+const PARENT_PAGE: Partial<Record<Page, Page>> = {
+  "metric-prompt": "metrics",
+  run: "dashboard",
 };
 
 /**
  * App shell with a lateral sidebar menu and a top header bar.
  */
 export function Layout({ currentPage, onNavigate, children }: LayoutProps) {
-  const activePage = currentPage === "metric-prompt" ? "metrics" : currentPage;
+  const activePage = PARENT_PAGE[currentPage] ?? currentPage;
 
   return (
     <div className="app-layout">

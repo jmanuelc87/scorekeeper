@@ -2,19 +2,38 @@ import React, { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { Layout, type Page } from "./components/Layout";
 import { RunsDashboard } from "./components/RunsDashboard";
+import { RunDetail } from "./components/RunDetail";
 import { Metrics } from "./components/Metrics";
 import { MetricPrompt } from "./components/MetricPrompt";
 import { UseCases } from "./components/UseCases";
 import { AuthProviders } from "./components/AuthProviders";
+import type { RunsQueryParams } from "./types";
 import "./styles.css";
 
 function App() {
   const [page, setPage] = useState<Page>("dashboard");
   const [promptId, setPromptId] = useState<string | null>(null);
+  const [runId, setRunId] = useState<string | null>(null);
+  // Held here rather than in the dashboard so its filters survive a trip into a run.
+  const [runsParams, setRunsParams] = useState<RunsQueryParams>({
+    granularity: "scenario_results",
+  });
 
   return (
     <Layout currentPage={page} onNavigate={setPage}>
-      {page === "dashboard" && <RunsDashboard />}
+      {page === "dashboard" && (
+        <RunsDashboard
+          params={runsParams}
+          onParamsChange={setRunsParams}
+          onOpenRun={(id) => {
+            setRunId(id);
+            setPage("run");
+          }}
+        />
+      )}
+      {page === "run" && runId && (
+        <RunDetail key={runId} runId={runId} onBack={() => setPage("dashboard")} />
+      )}
       {page === "metrics" && (
         <Metrics
           onOpenPrompt={(id) => {

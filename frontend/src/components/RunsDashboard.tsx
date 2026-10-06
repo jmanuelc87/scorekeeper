@@ -5,7 +5,6 @@ import { StatusBadge } from "./StatusBadge";
 import { ProgressBar } from "./ProgressBar";
 import { PlatformScoreList } from "./PlatformScoreList";
 import { Filters } from "./Filters";
-import { RunDetailModal } from "./RunDetailModal";
 
 /** Polling interval for in-progress runs (ms). */
 const POLL_INTERVAL = 600_000;
@@ -18,13 +17,18 @@ const MAX_CARD_COLUMNS = 3;
  * Fetches from GET /api/v1/runs and displays cards with status, progress, and platform scores.
  * Deeper granularity levels show scenario results and metric scores.
  */
-export function RunsDashboard() {
+export function RunsDashboard({
+  params,
+  onParamsChange,
+  onOpenRun,
+}: {
+  params: RunsQueryParams;
+  onParamsChange: (params: RunsQueryParams) => void;
+  onOpenRun: (runId: string) => void;
+}) {
   const [runs, setRuns] = useState<Run[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  const [params, setParams] = useState<RunsQueryParams>({
-    granularity: "scenario_results",
-  });
 
   const loadRuns = useCallback(async (queryParams?: RunsQueryParams) => {
     setLoading(true);
@@ -80,7 +84,7 @@ export function RunsDashboard() {
 
       <Filters
         params={params}
-        onChange={setParams}
+        onChange={onParamsChange}
         onApply={handleApplyFilters}
         loading={loading}
       />
@@ -101,6 +105,7 @@ export function RunsDashboard() {
             run={run}
             granularity={granularity}
             onStarted={() => void loadRuns()}
+            onOpenDetail={() => onOpenRun(run.run_id)}
           />
         ))}
       </div>
@@ -113,14 +118,15 @@ function RunCard({
   run,
   granularity,
   onStarted,
+  onOpenDetail,
 }: {
   run: Run;
   granularity: Granularity;
   onStarted: () => void;
+  onOpenDetail: () => void;
 }) {
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState("");
-  const [showDetail, setShowDetail] = useState(false);
   const [resuming, setResuming] = useState(false);
   const [resumeError, setResumeError] = useState("");
   const [rerunning, setRerunning] = useState(false);
@@ -184,7 +190,6 @@ function RunCard({
   };
 
   return (
-    <>
       <article className="run-card" style={{ gridColumn: `span ${columns}` }}>
         <div className="run-card-header">
           <code className="run-id" title={run.run_id}>
@@ -226,7 +231,7 @@ function RunCard({
             )}
             <button
               className="btn-detail"
-              onClick={() => setShowDetail(true)}
+              onClick={onOpenDetail}
               aria-label="View run details"
               title="View details"
             >
@@ -267,16 +272,11 @@ function RunCard({
         </div>
       ) : null}
     </article>
-
-    {showDetail && (
-      <RunDetailModal run={run} onClose={() => setShowDetail(false)} />
-    )}
-    </>
   );
 }
 
 /** A single scenario rendered within a run card, one block per platform it ran on. */
-function ScenarioCard({
+export function ScenarioCard({
   scenario,
   showMetrics,
 }: {
@@ -312,7 +312,7 @@ function ScenarioCard({
 }
 
 /** One platform's answer to a scenario: its score and, optionally, its turns. */
-function ExecutionRow({
+export function ExecutionRow({
   execution,
   showMetrics,
 }: {
@@ -372,7 +372,7 @@ function TurnRow({ turn }: { turn: Turn }) {
 }
 
 /** A single metric score badge. */
-function MetricScoreItem({ metric }: { metric: MetricScore }) {
+export function MetricScoreItem({ metric }: { metric: MetricScore }) {
   return (
     <li className="metric-score-item">
       <span className="metric-name">{metric.metric_name}</span>
