@@ -312,11 +312,21 @@ button:hover:not(:disabled) { opacity: .85; }
 /* === Use cases === */
 .use-case-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(280px, 1fr)); gap: 16px; }
 .use-case-card { background: white; border: 1px solid #dfe6ee; border-radius: var(--radius); padding: 16px 18px; box-shadow: 0 8px 24px #25344a08; display: flex; flex-direction: column; gap: 10px; }
+.use-case-card.editing { border-color: var(--blue); background: #f0f8ff; }
 .use-case-header { display: flex; align-items: center; gap: 8px; }
 .use-case-name { font-weight: 700; font-size: .95rem; }
 .use-case-metrics { display: flex; flex-wrap: wrap; gap: 6px; }
 .use-case-note { margin: 0; font-size: .75rem; color: var(--gray); }
 .use-case-id { margin-top: auto; font-size: .68rem; color: var(--gray); font-family: ui-monospace, monospace; }
+.metric-slot-var { position: relative; padding: 4px 8px; background: #f0f5fa; border: 1px solid #dfe6ee; border-radius: 4px; font-size: .75rem; }
+.use-case-card.editing .metric-slot-var { padding: 4px 4px 4px 8px; }
+.metric-remove { position: absolute; right: 2px; top: 50%; transform: translateY(-50%); background: none; border: none; color: var(--gray); cursor: pointer; padding: 0 2px; font-size: .85rem; }
+.metric-remove:hover { color: var(--red); }
+.metric-picker { display: flex; flex-direction: column; gap: 6px; font-size: .75rem; }
+.metric-picker label { color: var(--gray); font-weight: 600; }
+.metric-picker select { padding: 6px 8px; border: 1px solid #dfe6ee; border-radius: 4px; font-size: .75rem; }
+.use-case-actions { display: flex; gap: 8px; }
+.use-case-actions .btn-clear { flex: 1; padding: 8px 12px; font-size: .75rem; }
 
 /* === Auth providers === */
 .auth-provider-list { list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fill, minmax(320px, 1fr)); gap: 16px; }

@@ -90,3 +90,28 @@ async def list_with_metrics(session: AsyncSession) -> list[tuple[UseCase, list[s
         if metric_name is not None:
             names.append(metric_name)
     return list(grouped.values())
+
+
+async def get_by_id(session: AsyncSession, use_case_id: uuid.UUID) -> UseCase | None:
+    """One use case by its id, or ``None``."""
+    stmt = select(UseCase).where(UseCase.id == use_case_id)
+    return (await session.execute(stmt)).scalars().one_or_none()
+
+
+async def replace_metrics(
+    session: AsyncSession, use_case_id: uuid.UUID, metric_ids: list[uuid.UUID]
+) -> None:
+    """Replace the metrics linked to a use case.
+
+    Deletes all ``use_case_metrics`` rows for ``use_case_id`` and inserts new ones for
+    each ``metric_ids``. No-op if ``metric_ids`` is empty. Caller commits.
+    """
+    # Delete all existing links.
+    from sqlalchemy import delete
+
+    stmt = delete(UseCaseMetric).where(UseCaseMetric.use_case_id == use_case_id)
+    await session.execute(stmt)
+
+    # Insert new links.
+    for metric_id in metric_ids:
+        session.add(UseCaseMetric(use_case_id=use_case_id, metric_id=metric_id))
