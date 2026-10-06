@@ -24,6 +24,7 @@ scored, see [Evaluation metrics](evaluation-metrics.md); for the credential stor
 | `GET /api/v1/metrics`               | List the registered metrics a use case can be composed from. |
 | `POST /api/v1/use-cases`            | Create a use case: a name plus the set of metrics it is scored with. |
 | `GET /api/v1/use-cases`             | List every use case with its metric names. |
+| `PUT /api/v1/use-cases/{id}`        | Update a use case's metrics (not allowed for `default`). |
 | `GET /api/v1/prompts`               | List every prompt slot the metrics render, with the version currently active. |
 | `GET /api/v1/prompts/{prompt_id}`   | Fetch one prompt slot with its full version history. |
 | `POST /api/v1/prompts/{prompt_id}/versions` | Open a new draft of a slot's text (replaces any open draft). |

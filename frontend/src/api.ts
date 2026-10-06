@@ -213,6 +213,33 @@ export async function createUseCase(name: string, metrics: string[]): Promise<Us
 }
 
 /**
+ * Update a use case's metrics via PUT /api/v1/use-cases/{id}.
+ */
+export async function updateUseCase(id: string, metrics: string[]): Promise<UseCase> {
+  const response = await fetch(`${API_URL}/api/v1/use-cases/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ metrics }),
+  });
+
+  if (!response.ok) {
+    const detail = await errorMessage(response);
+    if (response.status === 404) {
+      throw new Error("Use case not found");
+    }
+    if (response.status === 409) {
+      throw new Error(detail || "Cannot edit this use case");
+    }
+    if (response.status === 422) {
+      throw new Error(detail || "At least one metric must be picked");
+    }
+    throw new Error(`Request failed (${response.status})`);
+  }
+
+  return response.json() as Promise<UseCase>;
+}
+
+/**
  * List every use case with its metric names via GET /api/v1/use-cases.
  * `default` comes back with an empty `metrics` list — it scores every
  * registered metric rather than a composed subset.

@@ -281,6 +281,14 @@ class UseCaseCreate(BaseModel):
     )
 
 
+class UseCaseUpdate(BaseModel):
+    """Body for ``PUT /use-cases/{id}`` — replace the metrics it scores."""
+
+    metrics: list[str] = Field(
+        ..., min_length=1, description="Nombres de métricas, tal como los lista GET /metrics."
+    )
+
+
 class UseCaseRead(BaseModel):
     """A use case and the metric names linked to it."""
 

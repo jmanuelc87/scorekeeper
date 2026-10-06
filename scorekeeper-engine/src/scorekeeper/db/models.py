@@ -52,7 +52,7 @@ JsonColumn = JSON().with_variant(JSONB, "postgresql")
 # ``text-embedding-3-small`` is 1536) cannot populate the table, and
 # ``retrieval.embed.OpenAIEmbedder`` rejects its vectors before the INSERT.
 # Changing it takes a migration *and* a re-embed; the stored vectors cannot be cast.
-EMBEDDING_DIMENSIONS = 768
+EMBEDDING_DIMENSIONS = 1536
 
 # A real ``vector`` on PostgreSQL; JSON on the SQLite fallback, which has no such type.
 # Same escape hatch as ``JsonColumn``, and it is what keeps ``Base.metadata.create_all``

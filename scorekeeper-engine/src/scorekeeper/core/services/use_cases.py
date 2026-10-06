@@ -5,14 +5,13 @@ the metrics it scores, and every uploaded conversation is ingested under exactly
 of them. The set lives in ``use_case_metrics``, so a metric is named once per use case
 rather than repeated on every row.
 
-Two invariants live here, not in the API:
+Invariants:
 
 * **Only registered metrics.** A set may reference metrics that exist in the code
   registry and nothing else — the scoring runner instantiates them by name, so an
   unknown one would be a run-time ``KeyError`` in the worker instead of a 422 here.
-* **Nothing is ever removed.** There is no update or delete: every ``ScenarioResult``
-  foreign-keys the use case it was scored under, so mutating a set would silently
-  rewrite what a finished run means.
+* **``default`` is locked.** The implicit use case that scores all registered metrics
+  cannot be edited, to preserve the meaning of an upload that specifies no use case.
 """
 
 from __future__ import annotations
@@ -37,7 +36,11 @@ class UseCaseValidationError(UseCaseError):
 
 
 class UseCaseConflictError(UseCaseError):
-    """A use case with this name already exists. → HTTP 409."""
+    """A use case with this name already exists, or an edit targets ``default``. → HTTP 409."""
+
+
+class UseCaseNotFoundError(UseCaseError):
+    """The use case id does not exist. → HTTP 404."""
 
 
 def _serialize(use_case: UseCase, metric_names: list[str]) -> dict[str, Any]:
@@ -116,6 +119,56 @@ async def create_use_case(
         ids = await repo.metric_ids(db, requested)
         for metric_name in requested:
             db.add(UseCaseMetric(use_case_id=use_case.id, metric_id=ids[metric_name]))
+
+        await db.commit()
+        return _serialize(use_case, sorted(requested))
+
+
+async def update_use_case_metrics(
+    use_case_id: str,
+    metric_names: list[str],
+    *,
+    session: AsyncSession | None = None,
+) -> dict[str, Any]:
+    """Update the metrics linked to a use case; return its read view.
+
+    Raises ``UseCaseNotFoundError`` when the id does not exist, ``UseCaseConflictError``
+    when trying to edit ``default``, and ``UseCaseValidationError`` for an empty set or
+    a metric the registry does not know.
+    """
+    import uuid
+
+    try:
+        use_case_id_uuid = uuid.UUID(use_case_id)
+    except ValueError:
+        raise UseCaseNotFoundError(f"El id {use_case_id!r} no es un UUID válido.")
+
+    # Deduplicate but keep the caller's order, so a repeated name is not a constraint error.
+    requested = list(dict.fromkeys(metric_names))
+    if not requested:
+        raise UseCaseValidationError("Se requiere al menos una métrica.")
+
+    registered = {metric_cls.name for metric_cls in MetricRegistry.all()}
+    unknown = sorted(metric for metric in requested if metric not in registered)
+    if unknown:
+        raise UseCaseValidationError("Métrica(s) desconocida(s): " + ", ".join(unknown) + ".")
+
+    async with session_scope(session) as db:
+        use_case = await repo.get_by_id(db, use_case_id_uuid)
+        if use_case is None:
+            raise UseCaseNotFoundError(f"El caso de uso con id {use_case_id!r} no existe.")
+
+        if use_case.name == "default":
+            raise UseCaseConflictError("No se puede editar el caso de uso 'default'.")
+
+        # Materialize the catalog first, same as in create.
+        await sync_metrics(db)
+        await db.flush()
+        await sync_prompts(db)
+        await db.flush()
+
+        ids = await repo.metric_ids(db, requested)
+        await repo.replace_metrics(db, use_case_id_uuid, list(ids[name] for name in requested))
 
         await db.commit()
         return _serialize(use_case, sorted(requested))

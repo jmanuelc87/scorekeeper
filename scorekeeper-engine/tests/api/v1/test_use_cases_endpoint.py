@@ -103,3 +103,72 @@ async def test_post_unknown_metric_is_422(client: httpx.AsyncClient, registry) -
 
     assert response.status_code == 422
     assert "desconocida" in response.json()["detail"]
+
+
+async def test_put_updates_metrics(client: httpx.AsyncClient, registry) -> None:
+    # Create a use case with one metric.
+    post_response = await client.post(
+        "/api/v1/use-cases", json={"name": "soporte", "metrics": ["utilidad"]}
+    )
+    use_case_id = post_response.json()["id"]
+
+    # Update it to have the same metric (no change).
+    response = await client.put(
+        f"/api/v1/use-cases/{use_case_id}", json={"metrics": ["utilidad"]}
+    )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["id"] == use_case_id
+    assert body["metrics"] == ["utilidad"]
+
+
+async def test_put_default_is_409(client: httpx.AsyncClient, registry) -> None:
+    # Get the default use case id.
+    list_response = await client.get("/api/v1/use-cases")
+    default_id = next(
+        entry["id"] for entry in list_response.json() if entry["name"] == "default"
+    )
+
+    response = await client.put(
+        f"/api/v1/use-cases/{default_id}", json={"metrics": ["utilidad"]}
+    )
+
+    assert response.status_code == 409
+    assert "default" in response.json()["detail"]
+
+
+async def test_put_unknown_id_is_404(client: httpx.AsyncClient, registry) -> None:
+    response = await client.put(
+        "/api/v1/use-cases/00000000-0000-0000-0000-000000000000",
+        json={"metrics": ["utilidad"]},
+    )
+
+    assert response.status_code == 404
+    assert "no existe" in response.json()["detail"]
+
+
+async def test_put_unknown_metric_is_422(client: httpx.AsyncClient, registry) -> None:
+    post_response = await client.post(
+        "/api/v1/use-cases", json={"name": "soporte", "metrics": ["utilidad"]}
+    )
+    use_case_id = post_response.json()["id"]
+
+    response = await client.put(
+        f"/api/v1/use-cases/{use_case_id}", json={"metrics": ["fantasma"]}
+    )
+
+    assert response.status_code == 422
+    assert "desconocida" in response.json()["detail"]
+
+
+async def test_put_empty_metrics_is_422(client: httpx.AsyncClient, registry) -> None:
+    post_response = await client.post(
+        "/api/v1/use-cases", json={"name": "soporte", "metrics": ["utilidad"]}
+    )
+    use_case_id = post_response.json()["id"]
+
+    response = await client.put(f"/api/v1/use-cases/{use_case_id}", json={"metrics": []})
+
+    assert response.status_code == 422
+    assert "al menos una" in response.json()["detail"]
