@@ -46,6 +46,8 @@ def _run_progress(run: BenchmarkRun) -> dict[str, Any]:
     still queued/running the ratio climbs live; once it reaches a terminal status it
     is pinned to 1.0 — a turn whose every metric failed keeps ``turn_score = None``
     (skip-metric-continue), so a finished run must not read < 100% forever.
+
+    Only selected turns are counted; deselected turns do not contribute to progress.
     """
     turns = [
         turn
@@ -53,11 +55,12 @@ def _run_progress(run: BenchmarkRun) -> dict[str, Any]:
         for platform_exec in scenario.platform_executions
         for turn in platform_exec.turns
     ]
-    total = len(turns)
+    selected_turns = [turn for turn in turns if turn.is_selected]
+    total = len(selected_turns)
     if run.status in _TERMINAL_STATUSES:
         done = total
     else:
-        done = sum(turn.turn_score is not None for turn in turns)
+        done = sum(turn.turn_score is not None for turn in selected_turns)
     return {"done": done, "total": total, "ratio": round(done / total, 4) if total else 0.0}
 
 
@@ -274,6 +277,7 @@ def serialize_scenario_turn(turn: Turn) -> dict[str, Any]:
         "expected_output": turn.expected_output,
         "retrieved_context_source": turn.retrieved_context_source,
         "turn_score": turn.turn_score,
+        "is_selected": turn.is_selected,
         "metric_scores": [_serialize_metric_score(score) for score in turn.metric_scores],
     }
 
@@ -286,5 +290,6 @@ def _serialize_turn(turn: Turn) -> dict[str, Any]:
         "turn_id": str(turn.id),
         "turn_number": turn.turn_number,
         "turn_score": turn.turn_score,
+        "is_selected": turn.is_selected,
         "metric_scores": [_serialize_metric_score(score) for score in turn.metric_scores],
     }

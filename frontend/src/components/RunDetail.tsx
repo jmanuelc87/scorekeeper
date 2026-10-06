@@ -46,12 +46,12 @@ export function RunDetail({ runId, onBack }: { runId: string; onBack: () => void
           setError("Run not found");
           return;
         }
-        // Every turn starts selected: the API does not report the stored flag.
+        // Initialize selection from the API's is_selected flag, defaulting to true for backward compatibility.
         const all: Record<string, boolean> = {};
         for (const scenario of found.scenario_results ?? []) {
           for (const execution of scenario.platform_executions) {
             for (const turn of execution.turns ?? []) {
-              all[turn.turn_id] = true;
+              all[turn.turn_id] = turn.is_selected !== false;
             }
           }
         }
@@ -214,6 +214,7 @@ export function RunDetail({ runId, onBack }: { runId: string; onBack: () => void
             <ExecutionView
               execution={execution}
               selection={selection}
+              displaySelection={initialSelection}
               canEdit={canEditSelection}
               onToggle={toggleTurn}
               onOpen={(turnId) =>
@@ -337,18 +338,21 @@ function ScenarioView({
 function ExecutionView({
   execution,
   selection,
+  displaySelection,
   canEdit,
   onToggle,
   onOpen,
 }: {
   execution: ScenarioPlatformExecution;
   selection: Record<string, boolean>;
+  displaySelection: Record<string, boolean>;
   canEdit: boolean;
   onToggle: (turnId: string) => void;
   onOpen: (turnId: string) => void;
 }) {
   const turns = execution.turns ?? [];
-  const scored = turns.filter((turn) => turn.turn_score !== null).length;
+  const selectedCount = turns.filter((turn) => displaySelection[turn.turn_id] !== false).length;
+  const selectedScored = turns.filter((turn) => displaySelection[turn.turn_id] !== false && turn.turn_score !== null).length;
 
   return (
     <>
@@ -359,7 +363,7 @@ function ExecutionView({
             <strong>Average:</strong> {formatScore(execution.average_score)}
           </span>
           <span>
-            <strong>Turns scored:</strong> {scored}/{turns.length}
+            <strong>Turns scored:</strong> {selectedScored}/{selectedCount}
           </span>
           {execution.model_name && (
             <span>
@@ -377,7 +381,7 @@ function ExecutionView({
                 {metric.average !== null ? formatScore(metric.average) : "N/A"}
               </span>
               <span className="metric-meta">
-                {metric.scored}/{turns.length} turns
+                {metric.scored}/{selectedCount} turns
               </span>
             </li>
           ))}
@@ -386,7 +390,7 @@ function ExecutionView({
 
       <section className="metric-category">
         <h3 className="section-title">
-          Turns <span className="metric-count">{turns.length}</span>
+          Turns <span className="metric-count">{selectedCount}</span>
         </h3>
         {turns.length === 0 && <p className="detail-loading">No turns recorded.</p>}
         <ul className="metric-list">
