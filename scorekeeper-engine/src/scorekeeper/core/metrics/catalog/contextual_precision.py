@@ -41,6 +41,7 @@ from scorekeeper.core.metrics.base import (
     TraceEntry,
     TraceStep,
     TurnView,
+    decision_metadata,
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
@@ -117,7 +118,7 @@ class ContextualPrecision(MultiStepMetric):
                     label=f"Nodo {k}",
                     value=verdict.value,
                     justification=verdict.justification,
-                    metadata={"rank": k},
+                    metadata={**decision_metadata(verdict), "rank": k},
                 )
             )
 

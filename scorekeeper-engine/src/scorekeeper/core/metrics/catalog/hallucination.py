@@ -34,6 +34,7 @@ from scorekeeper.core.metrics.base import (
     TraceStep,
     TurnView,
     context_documents,
+    decision_metadata,
 )
 from scorekeeper.core.metrics.category import MetricCategory
 from scorekeeper.core.metrics.judge import Judge, JudgeStep
@@ -123,6 +124,7 @@ class Hallucination(MultiStepMetric):
                     label=f"Documento {i}",
                     value=judgment.choice,
                     justification=judgment.justification,
+                    metadata=decision_metadata(judgment),
                 )
             )
 
