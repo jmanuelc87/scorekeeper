@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     # LLM-as-a-judge configuration (see scorekeeper.core.metrics.judges).
     judge_provider: str = "anthropic"  # "anthropic" | "openai" | "agent"
     anthropic_api_key: str | None = None
+    # How often the worker refreshes the list of Claude models the judges may call from
+    # Anthropic's List Models API (also once at startup). Default: 4 weeks.
+    claude_models_refresh_interval_seconds: float = 4 * 7 * 24 * 3600.0
     openai_api_key: str | None = None
     # Override the OpenAI API base URL (e.g. an OpenAI-compatible gateway or a local
     # server such as LM Studio). None uses the SDK default (https://api.openai.com/v1).

@@ -17,9 +17,10 @@ safe to import from the API process and from tests.
 from __future__ import annotations
 
 from celery import Celery
-from celery.signals import after_setup_logger, after_setup_task_logger
+from celery.signals import after_setup_logger, after_setup_task_logger, worker_process_init
 
 from scorekeeper.config.settings import get_settings
+from scorekeeper.core.metrics.judges.claude_models import start_periodic_refresh
 from scorekeeper.utils.logging_config import configure_logging
 
 celery_app = Celery(
@@ -57,3 +58,13 @@ def _on_after_setup_logger(**_kwargs: object) -> None:
 @after_setup_task_logger.connect
 def _on_after_setup_task_logger(**_kwargs: object) -> None:
     configure_logging(get_settings().log_level, force=True)
+
+
+# Judging runs in the prefork children, so each one keeps its own Claude model list
+# fresh (once now, then every ``claude_models_refresh_interval_seconds``).
+@worker_process_init.connect
+def _on_worker_process_init(**_kwargs: object) -> None:
+    settings = get_settings()
+    start_periodic_refresh(
+        settings.anthropic_api_key, settings.claude_models_refresh_interval_seconds
+    )
